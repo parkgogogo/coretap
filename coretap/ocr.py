@@ -91,6 +91,36 @@ def find_text(tokens: list[OcrToken], expected: str, *, case_sensitive: bool = F
     return None
 
 
+def find_exact_text_candidates(
+    tokens: list[OcrToken],
+    expected: str,
+    *,
+    case_sensitive: bool = False,
+    min_confidence: float = 50.0,
+) -> list[dict[str, Any]]:
+    if not expected:
+        return []
+    needle = expected if case_sensitive else normalize_text(expected)
+    normalized = [t.text if case_sensitive else normalize_text(t.text) for t in tokens]
+    candidates: list[dict[str, Any]] = []
+    seen: set[tuple[int, int]] = set()
+    for start in range(len(tokens)):
+        acc = ""
+        for end in range(start, len(tokens)):
+            acc = (acc + " " + normalized[end]).strip()
+            if acc == needle:
+                match = token_match(tokens[start : end + 1], start, end + 1)
+                if match["matchedTokenMinimumConfidence"] >= min_confidence:
+                    key = (match["matchedTokenRange"]["start"], match["matchedTokenRange"]["endExclusive"])
+                    if key not in seen:
+                        candidates.append(match)
+                        seen.add(key)
+                break
+            if len(acc) > len(needle) + 40:
+                break
+    return candidates
+
+
 def token_match(tokens: list[OcrToken], start: int, end: int) -> dict[str, Any]:
     left = min(t.left for t in tokens)
     top = min(t.top for t in tokens)

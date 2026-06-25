@@ -4,6 +4,8 @@ import json
 import subprocess
 import sys
 
+from coretap.daemon import handle_argv
+
 
 def run_coretap(*args: str) -> dict:
     proc = subprocess.run(
@@ -37,3 +39,13 @@ def test_internal_fixture_profile_is_not_default() -> None:
 
     assert data["ok"] is True
     assert data["result"]["implementation"] == "internal-ocr-fixture-grounder"
+
+
+def test_daemon_handle_argv_reuses_cli_dispatch(tmp_path) -> None:
+    data = handle_argv(["--format", "json", "status"], cwd=str(tmp_path))
+
+    assert data["schema"] == "coretap.response.v1"
+    assert data["ok"] is True
+    assert data["exitCode"] == 0
+    assert data["daemon"]["pid"] > 0
+    assert data["result"]["version"] == "0.1.0"

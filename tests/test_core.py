@@ -7,7 +7,7 @@ import pytest
 from coretap.backends import DeviceBackend, _check_coredevice_result, _coredevice_screenshot_rotation, parse_usbmux_devices
 from coretap.cli import point_to_hid
 from coretap.model_pack import parse_grounding_output
-from coretap.ocr import find_text, parse_tsv
+from coretap.ocr import find_exact_text_candidates, find_text, parse_tsv
 from coretap.runtime import Completed, CoretapError, png_size
 
 
@@ -64,6 +64,35 @@ def test_parse_tsv_and_find_text() -> None:
     assert match is not None
     assert match["matchedText"] == "General"
     assert match["matchedBoxPx"] == {"x": 10, "y": 20, "width": 30, "height": 12}
+
+
+def test_find_exact_text_candidates_requires_exact_normalized_match() -> None:
+    tsv = """level\tpage_num\tblock_num\tpar_num\tline_num\tword_num\tleft\ttop\twidth\theight\tconf\ttext
+5\t1\t1\t1\t1\t1\t10\t20\t30\t12\t95\tChatGPT
+5\t1\t1\t1\t1\t2\t50\t20\t40\t12\t95\tChatGPTX
+5\t1\t1\t1\t1\t3\t100\t20\t30\t12\t40\tChatGPT
+"""
+
+    tokens = parse_tsv(tsv)
+    matches = find_exact_text_candidates(tokens, "chatgpt", min_confidence=50)
+
+    assert len(matches) == 1
+    assert matches[0]["matchedText"] == "ChatGPT"
+    assert matches[0]["matchedBoxPx"] == {"x": 10, "y": 20, "width": 30, "height": 12}
+
+
+def test_find_exact_text_candidates_can_match_phrase() -> None:
+    tsv = """level\tpage_num\tblock_num\tpar_num\tline_num\tword_num\tleft\ttop\twidth\theight\tconf\ttext
+5\t1\t1\t1\t1\t1\t10\t20\t30\t12\t95\tApp
+5\t1\t1\t1\t1\t2\t50\t20\t40\t12\t90\tStore
+"""
+
+    tokens = parse_tsv(tsv)
+    matches = find_exact_text_candidates(tokens, "App Store")
+
+    assert len(matches) == 1
+    assert matches[0]["matchedText"] == "App Store"
+    assert matches[0]["matchedBoxPx"] == {"x": 10, "y": 20, "width": 80, "height": 12}
 
 
 def test_parse_usbmux_json_devices() -> None:

@@ -65,10 +65,10 @@ CoreDevice screenshots are normalized to the primary display size reported by
 frame pixel coordinates aligned with the HID coordinate space even when the raw
 CoreDevice screenshot service returns a rotated PNG.
 
-On userspace CoreDevice HID, `pymobiledevice3` can dispatch the touch but hang
-while closing its media stream. Coretap treats that as an attempted tap with
-`completionStatus: "timeout"` and `deliveryStatus: "unknown"` so test flows can
-continue to the next screenshot or assertion for confirmation.
+For userspace CoreDevice HID, Coretap uses the `pymobiledevice3` Python API
+directly and returns after the touch dispatch is sent. This avoids the
+long-running CLI teardown path that can otherwise hide a successful tap behind a
+process timeout.
 
 Prerequisites:
 
@@ -114,6 +114,31 @@ For development from a checkout:
 uv tool install --force --editable .
 coretap setup --format json
 ```
+
+Tap has two target modes:
+
+```bash
+coretap --format json --backend device --device "$UDID" tap text "ChatGPT"
+coretap --format json --backend device --device "$UDID" tap target --target "the ChatGPT app icon"
+```
+
+Use `tap text` for exact visible text. It captures a frame, runs OCR, uses the
+matched text bounding box center, and does not invoke the VLM grounding model.
+Use `tap target` for semantic descriptions, icons, relative position, or cases
+where exact OCR text is absent or ambiguous.
+
+For repeated automation runs, start the local daemon and route CLI calls through
+it so the grounding model stays loaded between commands:
+
+```bash
+coretap daemon start
+coretap --daemon on --format json --backend device --device "$UDID" tap target --target "the ChatGPT app icon"
+coretap daemon status
+coretap daemon stop
+```
+
+Use `--daemon auto` to try the daemon and fall back to single-process execution
+when it is not running.
 
 `coretap assert text` and `coretap wait text` currently use the local
 `tesseract` CLI. Install it separately, for example:

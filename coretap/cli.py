@@ -22,7 +22,7 @@ from coretap.grounding import (
     warm_model,
 )
 from coretap.model_pack import INTERNAL_FIXTURE_PROFILE, PUBLIC_MODEL_PROFILE
-from coretap.ocr import find_text, run_tesseract, tesseract_status
+from coretap.ocr import find_exact_text_candidates, find_text, run_tesseract, tesseract_status
 from coretap.runtime import (
     CoretapError,
     artifact_dir,
@@ -61,11 +61,17 @@ EXIT_CODES = {
     "MODEL_LOAD_FAILED": 60,
     "MODEL_RUN_FAILED": 60,
     "TARGET_ABSENT": 30,
+    "TEXT_TARGET_NOT_FOUND": 30,
+    "TEXT_TARGET_AMBIGUOUS": 30,
     "GROUNDING_NOT_FOUND": 30,
     "GROUNDING_AMBIGUOUS": 30,
     "GROUNDING_SCHEMA_INVALID": 30,
     "INVALID_POINT": 31,
     "FLOW_FAILED": 50,
+    "DAEMON_UNAVAILABLE": 14,
+    "DAEMON_START_FAILED": 14,
+    "DAEMON_ALREADY_RUNNING": 14,
+    "DAEMON_REQUEST_FAILED": 14,
 }
 
 
@@ -364,6 +370,73 @@ def command_tap_target(args: argparse.Namespace) -> dict[str, Any]:
     return result
 
 
+def _text_query(args: argparse.Namespace) -> str:
+    text = getattr(args, "text", None) or getattr(args, "text_query", None)
+    if not text:
+        raise CoretapError("INVALID_ARGUMENT", "tap text requires text", category="usage", stage="tap-text")
+    return str(text)
+
+
+def command_tap_text(args: argparse.Namespace) -> dict[str, Any]:
+    text = _text_query(args)
+    frame, run_dir, image = capture(args, label="text-source")
+    tokens, raw = run_tesseract(image, lang=args.lang, psm=args.psm)
+    (run_dir / "ocr.tsv").write_text(raw, encoding="utf-8")
+    candidates = find_exact_text_candidates(
+        tokens,
+        text,
+        case_sensitive=args.case_sensitive,
+        min_confidence=args.min_confidence,
+    )
+    if not candidates:
+        raise CoretapError(
+            "TEXT_TARGET_NOT_FOUND",
+            f"Text target was not found: {text}",
+            stage="tap-text",
+            category="grounding",
+            details={"artifactDir": str(run_dir), "text": text, "tokenCount": len(tokens)},
+        )
+    if len(candidates) > 1:
+        raise CoretapError(
+            "TEXT_TARGET_AMBIGUOUS",
+            f"Text target matched multiple regions: {text}",
+            stage="tap-text",
+            category="grounding",
+            details={"artifactDir": str(run_dir), "text": text, "candidateCount": len(candidates), "candidates": candidates},
+        )
+    match = candidates[0]
+    box = match["matchedBoxPx"]
+    x = box["x"] + box["width"] / 2
+    y = box["y"] + box["height"] / 2
+    point = point_to_hid(x, y, width=frame.width, height=frame.height, space="px")
+    backend = backend_for(args.backend, developer_dir=args.developer_dir, coredevice_tunnel_mode=args.coredevice_tunnel_mode)
+    tap = backend.tap_normalized(
+        args.device,
+        point["normalized"]["x"],
+        point["normalized"]["y"],
+        dry_run=args.dry_run,
+        hid_u16=point["hidU16"],
+    )
+    result = {
+        "artifactDir": str(run_dir),
+        "text": text,
+        "strategy": "ocr_exact",
+        "frame": {"path": str(image), "widthPx": frame.width, "heightPx": frame.height},
+        "ocr": {
+            "tokenCount": len(tokens),
+            "candidateCount": len(candidates),
+            "lang": args.lang,
+            "psm": args.psm,
+            "minConfidence": args.min_confidence,
+            "match": match,
+        },
+        "point": point,
+        "tap": tap,
+    }
+    write_json(run_dir / "tap-text.result.json", result)
+    return result
+
+
 def command_assert_text(args: argparse.Namespace) -> dict[str, Any]:
     if args.image:
         image = Path(args.image)
@@ -439,6 +512,15 @@ def command_run(args: argparse.Namespace) -> dict[str, Any]:
             ns.profile = step["tapTarget"].get("profile", args.profile)
             ns.dry_run = bool(step["tapTarget"].get("dryRun", args.dry_run))
             results.append({"tapTarget": command_tap_target(ns)})
+        elif "tapText" in step:
+            ns = argparse.Namespace(**vars(args))
+            ns.text = step["tapText"]["text"]
+            ns.lang = step["tapText"].get("lang", "eng")
+            ns.psm = int(step["tapText"].get("psm", 11))
+            ns.min_confidence = float(step["tapText"].get("minConfidence", 50.0))
+            ns.case_sensitive = bool(step["tapText"].get("caseSensitive", False))
+            ns.dry_run = bool(step["tapText"].get("dryRun", args.dry_run))
+            results.append({"tapText": command_tap_text(ns)})
         elif "locate" in step:
             ns = argparse.Namespace(**vars(args))
             ns.target = step["locate"]["target"]
@@ -523,6 +605,27 @@ def command_test(args: argparse.Namespace) -> dict[str, Any]:
     return result
 
 
+def command_daemon(args: argparse.Namespace) -> dict[str, Any]:
+    from coretap.daemon import default_socket_path, ping_daemon, start_daemon, stop_daemon
+
+    socket_path = Path(args.socket).expanduser() if args.socket else None
+    socket_text = str(socket_path or default_socket_path())
+    if args.daemon_command == "start":
+        return start_daemon(socket_path=socket_path, timeout=args.timeout_ms / 1000)
+    if args.daemon_command == "status":
+        try:
+            data = ping_daemon(socket_path=socket_path, timeout=args.timeout_ms / 1000)
+            return {"running": True, "socket": socket_text, "response": data.get("result")}
+        except CoretapError as exc:
+            if exc.code != "DAEMON_UNAVAILABLE":
+                raise
+            return {"running": False, "socket": socket_text, "error": exc.details}
+    if args.daemon_command == "stop":
+        data = stop_daemon(socket_path=socket_path, timeout=args.timeout_ms / 1000)
+        return data.get("result", data)
+    raise CoretapError("UNKNOWN_COMMAND", args.daemon_command, category="usage", stage="daemon")
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="coretap")
     parser.add_argument("--format", choices=["text", "json", "ndjson"], default="text")
@@ -532,6 +635,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--coredevice-tunnel-mode", choices=["userspace", "tunneld"], default=None)
     parser.add_argument("--artifact-root", default=None)
     parser.add_argument("--profile", default=PUBLIC_MODEL_PROFILE)
+    parser.add_argument("--daemon", choices=["off", "auto", "on"], default="off")
 
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("setup")
@@ -540,6 +644,11 @@ def build_parser() -> argparse.ArgumentParser:
     config.add_argument("config_command", choices=["check"])
     sub.add_parser("discover")
     sub.add_parser("doctor")
+
+    daemon = sub.add_parser("daemon")
+    daemon.add_argument("daemon_command", choices=["start", "status", "stop"])
+    daemon.add_argument("--socket", default=None)
+    daemon.add_argument("--timeout-ms", type=int, default=5000)
 
     model = sub.add_parser("model")
     model.add_argument("model_command", choices=["install", "check", "warm", "run", "status", "stop", "cache", "gc"])
@@ -573,6 +682,15 @@ def build_parser() -> argparse.ArgumentParser:
     target = tap_sub.add_parser("target")
     target.add_argument("--target", required=True)
     target.add_argument("--dry-run", action="store_true")
+
+    tap_text = tap_sub.add_parser("text")
+    tap_text.add_argument("text_query", nargs="?")
+    tap_text.add_argument("--text", dest="text", default=None)
+    tap_text.add_argument("--dry-run", action="store_true")
+    tap_text.add_argument("--lang", default="eng")
+    tap_text.add_argument("--psm", type=int, default=11)
+    tap_text.add_argument("--min-confidence", type=float, default=50.0)
+    tap_text.add_argument("--case-sensitive", action="store_true")
 
     assert_text = sub.add_parser("assert")
     assert_sub = assert_text.add_subparsers(dest="assert_command", required=True)
@@ -615,6 +733,7 @@ COMMON_OPTIONS_WITH_VALUES = {
     "--coredevice-tunnel-mode",
     "--artifact-root",
     "--profile",
+    "--daemon",
 }
 
 
@@ -649,6 +768,8 @@ def dispatch(args: argparse.Namespace) -> dict[str, Any]:
         return command_discover(args)
     if args.command == "doctor":
         return command_doctor(args)
+    if args.command == "daemon":
+        return command_daemon(args)
     if args.command == "model":
         return command_model(args)
     if args.command == "ocr":
@@ -662,6 +783,8 @@ def dispatch(args: argparse.Namespace) -> dict[str, Any]:
             return command_tap_point(args)
         if args.tap_command == "target":
             return command_tap_target(args)
+        if args.tap_command == "text":
+            return command_tap_text(args)
     if args.command == "assert" and args.assert_command == "text":
         return command_assert_text(args)
     if args.command == "wait":
@@ -683,6 +806,20 @@ def main(argv: list[str] | None = None) -> None:
     parser = build_parser()
     normalized = normalize_global_args(list(argv if argv is not None else sys.argv[1:]))
     args = parser.parse_args(normalized)
+    if args.command != "daemon" and args.daemon != "off":
+        from coretap.daemon import request_daemon
+
+        try:
+            data = request_daemon(normalized, cwd=str(Path.cwd()))
+            emit(data, args.format)
+            raise SystemExit(int(data.get("exitCode", 0 if data.get("ok") else 70)))
+        except CoretapError as exc:
+            if args.daemon == "auto":
+                pass
+            else:
+                data = response_error(args.command, exc)
+                emit(data, args.format)
+                raise SystemExit(EXIT_CODES.get(exc.code, 70))
     started = time.monotonic()
     try:
         result = dispatch(args)

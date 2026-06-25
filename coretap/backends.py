@@ -2,6 +2,10 @@ from __future__ import annotations
 
 import json
 import os
+import selectors
+import subprocess
+import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -363,6 +367,91 @@ class DeviceBackend:
                 "hidU16": {"x": hx, "y": hy},
                 "coredeviceTunnelMode": self.coredevice_tunnel_mode,
             }
+        if self.coredevice_tunnel_mode == "userspace":
+            return self._tap_userspace_direct(device, x, y, hx, hy)
+        return self._tap_cli(device, x, y, hx, hy)
+
+    def _tap_userspace_direct(self, device: str, x: float, y: float, hx: int, hy: int) -> dict[str, Any]:
+        timeout = 15.0
+        cleanup_grace = 1.0
+        started = time.monotonic()
+        proc = subprocess.Popen(
+            [
+                sys.executable,
+                "-m",
+                "coretap.device_hid_helper",
+                "--mode",
+                "userspace",
+                "--device",
+                device,
+                "--x",
+                str(hx),
+                "--y",
+                str(hy),
+            ],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=self.coredevice_env(device),
+        )
+        assert proc.stdout is not None
+        selector = selectors.DefaultSelector()
+        selector.register(proc.stdout, selectors.EVENT_READ)
+        dispatch: dict[str, Any] | None = None
+        try:
+            while time.monotonic() - started < timeout:
+                remaining = max(0.0, timeout - (time.monotonic() - started))
+                events = selector.select(timeout=remaining)
+                if not events:
+                    break
+                line = proc.stdout.readline()
+                if not line:
+                    break
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if event.get("event") == "dispatch_sent":
+                    dispatch = event
+                    break
+                if event.get("event") == "error":
+                    stderr = _terminate_process(proc)
+                    raise CoretapError(
+                        "COREDEVICE_TAP_FAILED",
+                        "Direct CoreDevice HID helper failed before dispatch",
+                        stage="tap",
+                        details={"helperEvent": event, "stderr": stderr},
+                    )
+            if dispatch is None:
+                stderr = _terminate_process(proc)
+                raise CoretapError(
+                    "COREDEVICE_TAP_FAILED",
+                    "Timed out waiting for direct CoreDevice HID dispatch",
+                    stage="tap",
+                    retryable=True,
+                    details={"timeoutMs": round(timeout * 1000), "stderr": stderr},
+                )
+            session_status = "exited"
+            try:
+                proc.wait(timeout=cleanup_grace)
+            except subprocess.TimeoutExpired:
+                _terminate_process(proc)
+                session_status = "terminated_after_dispatch"
+            return {
+                "attempted": True,
+                "dryRun": False,
+                "normalized": {"x": x, "y": y},
+                "hidU16": {"x": hx, "y": hy},
+                "coredeviceTunnelMode": self.coredevice_tunnel_mode,
+                "dispatchStatus": "sent",
+                "confirmationStatus": "not_requested",
+                "sessionStatus": session_status,
+                "durationMs": round((time.monotonic() - started) * 1000),
+            }
+        finally:
+            selector.close()
+
+    def _tap_cli(self, device: str, x: float, y: float, hx: int, hy: int) -> dict[str, Any]:
         timeout = 20
         try:
             done = _check_coredevice_result(
@@ -531,6 +620,23 @@ def _parse_simple_usbmux_lines(stdout: str) -> list[Device]:
             continue
         devices.append(Device(udid=udid, name=udid, backend=DeviceBackend.name, eligible=True, details={"line": line}))
     return devices
+
+
+def _terminate_process(proc: subprocess.Popen[str]) -> str:
+    if proc.poll() is None:
+        proc.terminate()
+        try:
+            proc.wait(timeout=1)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=1)
+    stderr = ""
+    if proc.stderr is not None:
+        try:
+            stderr = proc.stderr.read()
+        except ValueError:
+            stderr = ""
+    return stderr
 
 
 def _check_coredevice_result(done: Completed, *, code: str, stage: str) -> Completed:

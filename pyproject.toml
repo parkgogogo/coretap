@@ -8,6 +8,7 @@ dependencies = [
     "huggingface-hub>=0.36.0",
     "mlx-vlm>=0.3.12",
     "pillow>=11.0.0",
+    "pymobiledevice3>=9.30.1,<10",
 ]
 
 [project.optional-dependencies]
@@ -17,6 +18,7 @@ dev = [
 
 [project.scripts]
 coretap = "coretap.cli:main"
+coretapd = "coretap.daemon:main"
 
 [build-system]
 requires = ["hatchling"]
@@ -25,4 +27,3 @@ build-backend = "hatchling.build"
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]
-
