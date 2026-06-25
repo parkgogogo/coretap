@@ -1,0 +1,28 @@
+[project]
+name = "coretap"
+version = "0.1.0"
+description = "Local visual UI automation runtime for iOS CoreDevice and Simulator workflows."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "huggingface-hub>=0.36.0",
+    "mlx-vlm>=0.3.12",
+    "pillow>=11.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+]
+
+[project.scripts]
+coretap = "coretap.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+

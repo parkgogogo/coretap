@@ -1,0 +1,10 @@
+{
+  "name": "@coretap/test",
+  "version": "0.1.0",
+  "description": "Node test client for Coretap visual iOS automation.",
+  "main": "index.js",
+  "types": "index.d.ts",
+  "license": "UNLICENSED",
+  "type": "commonjs"
+}
+

@@ -1,0 +1,24 @@
+{
+  "version": 1,
+  "name": "settings-dry-run",
+  "steps": [
+    {
+      "screenshot": {
+        "label": "home"
+      }
+    },
+    {
+      "tapTarget": {
+        "target": "Settings",
+        "dryRun": true
+      }
+    },
+    {
+      "assertText": {
+        "text": "Settings",
+        "timeoutMs": 3000
+      }
+    }
+  ]
+}
+
