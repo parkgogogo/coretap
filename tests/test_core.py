@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from coretap.backends import _check_coredevice_result, parse_usbmux_devices
+from coretap.backends import DeviceBackend, _check_coredevice_result, parse_usbmux_devices
 from coretap.cli import point_to_hid
 from coretap.model_pack import parse_grounding_output
 from coretap.ocr import find_text, parse_tsv
@@ -107,6 +107,19 @@ def test_coredevice_tunneld_error_is_detected_on_zero_exit() -> None:
     assert exc.value.code == "COREDEVICE_TUNNELD_UNAVAILABLE"
     assert exc.value.retryable is True
     assert exc.value.details["suggestedCommand"] == "sudo pymobiledevice3 remote tunneld --daemonize"
+
+
+def test_coredevice_default_tunnel_mode_uses_userspace() -> None:
+    backend = DeviceBackend()
+
+    assert backend.coredevice_tunnel_mode == "userspace"
+    assert backend.coredevice_device_options("device-udid") == ["--userspace", "--tunnel", "device-udid"]
+
+
+def test_coredevice_tunneld_mode_omits_userspace() -> None:
+    backend = DeviceBackend(coredevice_tunnel_mode="tunneld")
+
+    assert backend.coredevice_device_options("device-udid") == ["--tunnel", "device-udid"]
 
 
 def test_png_size(tmp_path: Path) -> None:

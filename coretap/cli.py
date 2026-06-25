@@ -173,7 +173,7 @@ def command_config(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def command_discover(args: argparse.Namespace) -> dict[str, Any]:
-    backend = backend_for(args.backend, developer_dir=args.developer_dir)
+    backend = backend_for(args.backend, developer_dir=args.developer_dir, coredevice_tunnel_mode=args.coredevice_tunnel_mode)
     devices = backend.discover()
     return {
         "backend": args.backend,
@@ -247,7 +247,7 @@ def command_ocr(args: argparse.Namespace) -> dict[str, Any]:
 def capture(args: argparse.Namespace, *, label: str = "screenshot") -> tuple[Any, Path, Path]:
     run_dir = artifact_dir(Path(args.artifact_root) if args.artifact_root else None)
     out = Path(args.out) if getattr(args, "out", None) else run_dir / f"{label}.png"
-    backend = backend_for(args.backend, developer_dir=args.developer_dir)
+    backend = backend_for(args.backend, developer_dir=args.developer_dir, coredevice_tunnel_mode=args.coredevice_tunnel_mode)
     frame = backend.screenshot(args.device, out)
     frame_json = {
         "frameId": frame.frame_id,
@@ -284,7 +284,7 @@ def command_tap_point(args: argparse.Namespace) -> dict[str, Any]:
         width = args.width or 1
         height = args.height or 1
     point = point_to_hid(args.x, args.y, width=width, height=height, space=args.space)
-    backend = backend_for(args.backend, developer_dir=args.developer_dir)
+    backend = backend_for(args.backend, developer_dir=args.developer_dir, coredevice_tunnel_mode=args.coredevice_tunnel_mode)
     tap = backend.tap_normalized(
         args.device,
         point["normalized"]["x"],
@@ -343,7 +343,7 @@ def command_tap_target(args: argparse.Namespace) -> dict[str, Any]:
     frame = located["frame"]
     p = grounded["point"]["framePx"]
     point = point_to_hid(p["x"], p["y"], width=frame["widthPx"], height=frame["heightPx"], space="px")
-    backend = backend_for(args.backend, developer_dir=args.developer_dir)
+    backend = backend_for(args.backend, developer_dir=args.developer_dir, coredevice_tunnel_mode=args.coredevice_tunnel_mode)
     tap = backend.tap_normalized(
         args.device,
         point["normalized"]["x"],
@@ -529,6 +529,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--backend", choices=["simulator", "device"], default="simulator")
     parser.add_argument("--device", default="booted")
     parser.add_argument("--developer-dir", default=None)
+    parser.add_argument("--coredevice-tunnel-mode", choices=["userspace", "tunneld"], default=None)
     parser.add_argument("--artifact-root", default=None)
     parser.add_argument("--profile", default=PUBLIC_MODEL_PROFILE)
 
@@ -611,6 +612,7 @@ COMMON_OPTIONS_WITH_VALUES = {
     "--backend",
     "--device",
     "--developer-dir",
+    "--coredevice-tunnel-mode",
     "--artifact-root",
     "--profile",
 }

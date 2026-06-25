@@ -50,22 +50,32 @@ U16, while Simulator converts normalized points to IDB logical points.
 ## Real Device CoreDevice Support
 
 Real-device automation uses `pymobiledevice3 developer core-device` and does
-not use WDA. On current `pymobiledevice3`, Coretap uses the CoreDevice
-`--tunnel <udid>` device selector for screenshots and Universal HID taps.
+not use WDA. On current `pymobiledevice3`, Coretap defaults to the CoreDevice
+userspace tunnel path:
+
+```text
+--userspace --tunnel <udid>
+```
+
+This is the default because it does not require root/admin privileges, which is
+important for agent-driven CLI runs.
 
 Prerequisites:
 
 - Pair/trust the iPhone and enable Developer Mode.
 - Mount DDI or perform any device-specific developer setup required by
   `pymobiledevice3` for that iOS version.
-- For iOS 17+ CoreDevice access, start tunneld when required:
+
+If you prefer a long-running tunneld service, opt in explicitly:
 
 ```bash
 sudo pymobiledevice3 remote tunneld --daemonize
+coretap --coredevice-tunnel-mode tunneld --backend device --device "$UDID" screenshot
 ```
 
-If tunneld is missing, Coretap reports `COREDEVICE_TUNNELD_UNAVAILABLE` with the
-same suggested command instead of trying to parse a broken or empty screenshot.
+You can also set `CORETAP_COREDEVICE_TUNNEL_MODE=tunneld`. If tunneld is missing
+in that mode, Coretap reports `COREDEVICE_TUNNELD_UNAVAILABLE` with the
+suggested daemon command instead of trying to parse a broken or empty screenshot.
 
 ## Quick Start
 

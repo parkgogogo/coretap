@@ -190,6 +190,29 @@ class SimulatorBackend:
 class DeviceBackend:
     name = "device"
 
+    def __init__(self, *, coredevice_tunnel_mode: str | None = None) -> None:
+        self.coredevice_tunnel_mode = self._resolve_coredevice_tunnel_mode(coredevice_tunnel_mode)
+
+    @staticmethod
+    def _resolve_coredevice_tunnel_mode(mode: str | None) -> str:
+        resolved = mode or os.environ.get("CORETAP_COREDEVICE_TUNNEL_MODE") or "userspace"
+        if resolved not in {"userspace", "tunneld"}:
+            raise CoretapError(
+                "INVALID_ARGUMENT",
+                f"Unsupported CoreDevice tunnel mode: {resolved}",
+                category="usage",
+                stage="config",
+                details={"validModes": ["userspace", "tunneld"]},
+            )
+        return resolved
+
+    def coredevice_device_options(self, device: str) -> list[str]:
+        options: list[str] = []
+        if self.coredevice_tunnel_mode == "userspace":
+            options.append("--userspace")
+        options.extend(["--tunnel", device])
+        return options
+
     def discover(self) -> list[Device]:
         done = run_command(["pymobiledevice3", "usbmux", "list"], timeout=10)
         if done.returncode != 0:
@@ -211,8 +234,7 @@ class DeviceBackend:
                     "core-device",
                     "screen-capture",
                     "screenshot",
-                    "--tunnel",
-                    device,
+                    *self.coredevice_device_options(device),
                     str(out),
                 ],
                 timeout=20,
@@ -246,7 +268,13 @@ class DeviceBackend:
         hx = int(round(x * 65535)) if hid_u16 is None else hid_u16["x"]
         hy = int(round(y * 65535)) if hid_u16 is None else hid_u16["y"]
         if dry_run:
-            return {"attempted": False, "dryRun": True, "normalized": {"x": x, "y": y}, "hidU16": {"x": hx, "y": hy}}
+            return {
+                "attempted": False,
+                "dryRun": True,
+                "normalized": {"x": x, "y": y},
+                "hidU16": {"x": hx, "y": hy},
+                "coredeviceTunnelMode": self.coredevice_tunnel_mode,
+            }
         done = _check_coredevice_result(
             run_command(
                 [
@@ -255,8 +283,7 @@ class DeviceBackend:
                     "core-device",
                     "universal-hid-service",
                     "tap",
-                    "--tunnel",
-                    device,
+                    *self.coredevice_device_options(device),
                     str(hx),
                     str(hy),
                 ],
@@ -271,6 +298,7 @@ class DeviceBackend:
             "dryRun": False,
             "normalized": {"x": x, "y": y},
             "hidU16": {"x": hx, "y": hy},
+            "coredeviceTunnelMode": self.coredevice_tunnel_mode,
             "durationMs": done.duration_ms,
         }
 
@@ -347,9 +375,14 @@ def _check_coredevice_result(done: Completed, *, code: str, stage: str) -> Compl
     return done
 
 
-def backend_for(name: str, *, developer_dir: str | None = None) -> SimulatorBackend | DeviceBackend:
+def backend_for(
+    name: str,
+    *,
+    developer_dir: str | None = None,
+    coredevice_tunnel_mode: str | None = None,
+) -> SimulatorBackend | DeviceBackend:
     if name == "simulator":
         return SimulatorBackend(developer_dir=developer_dir)
     if name == "device":
-        return DeviceBackend()
+        return DeviceBackend(coredevice_tunnel_mode=coredevice_tunnel_mode)
     raise CoretapError("UNKNOWN_BACKEND", f"Unsupported backend: {name}", category="usage", stage="config")
