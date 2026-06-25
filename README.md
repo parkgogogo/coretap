@@ -49,12 +49,11 @@ U16, while Simulator converts normalized points to IDB logical points.
 
 ## Real Device CoreDevice Support
 
-Real-device automation uses `pymobiledevice3 developer core-device` and does
-not use WDA. On current `pymobiledevice3`, Coretap defaults to the CoreDevice
-userspace tunnel path:
+Real-device automation uses CoreDevice and does not use WDA. On current
+`pymobiledevice3`, Coretap defaults to the CoreDevice userspace tunnel path:
 
 ```bash
-PYMOBILEDEVICE3_UDID="$UDID" pymobiledevice3 developer core-device ... --userspace
+coretap --coredevice-tunnel-mode userspace --backend device --device "$UDID" screenshot
 ```
 
 This is the default because it does not require root/admin privileges, which is
@@ -65,12 +64,13 @@ CoreDevice screenshots are normalized to the primary display size reported by
 frame pixel coordinates aligned with the HID coordinate space even when the raw
 CoreDevice screenshot service returns a rotated PNG.
 
-In daemon mode, Coretap uses the `pymobiledevice3` Python API directly for
-userspace CoreDevice screenshot, display-info, and HID tap work. The daemon
-keeps a CoreDevice worker thread alive and reuses per-device RSD/touch sessions
-instead of spawning `pymobiledevice3` CLI subprocesses for the interactive path.
-This avoids the long-running CLI teardown path that can otherwise hide a
-successful tap behind a process timeout.
+In daemon mode, which is the default for non-daemon commands, Coretap uses the
+`pymobiledevice3` Python API directly for userspace CoreDevice screenshot,
+display-info, and HID tap work. The daemon keeps a CoreDevice worker thread
+alive and reuses per-device RSD/touch sessions instead of spawning
+`pymobiledevice3` CLI subprocesses for the interactive path. This avoids the
+long-running CLI teardown path that can otherwise hide a successful tap behind a
+process timeout.
 
 Prerequisites:
 

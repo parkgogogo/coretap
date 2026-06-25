@@ -474,43 +474,25 @@ class DeviceBackend:
 
     def _tap_cli(self, device: str, x: float, y: float, hx: int, hy: int) -> dict[str, Any]:
         timeout = 20
-        try:
-            done = _check_coredevice_result(
-                run_command(
-                    [
-                        "pymobiledevice3",
-                        "developer",
-                        "core-device",
-                        "universal-hid-service",
-                        "tap",
-                        *self.coredevice_device_options(device),
-                        str(hx),
-                        str(hy),
-                    ],
-                    env=self.coredevice_env(device),
-                    timeout=timeout,
-                ),
-                code="COREDEVICE_TAP_FAILED",
-                stage="tap",
-            )
-            require_success(done, code="COREDEVICE_TAP_FAILED", stage="tap")
-        except CoretapError as exc:
-            if exc.code != "COMMAND_TIMEOUT" or self.coredevice_tunnel_mode != "userspace":
-                raise
-            return {
-                "attempted": True,
-                "dryRun": False,
-                "normalized": {"x": x, "y": y},
-                "hidU16": {"x": hx, "y": hy},
-                "coredeviceTunnelMode": self.coredevice_tunnel_mode,
-                "completionStatus": "timeout",
-                "deliveryStatus": "unknown",
-                "timeoutMs": timeout * 1000,
-                "reason": (
-                    "pymobiledevice3 userspace HID tap can hang while closing the media stream; "
-                    "continue with a screenshot or assertion to confirm the UI state"
-                ),
-            }
+        done = _check_coredevice_result(
+            run_command(
+                [
+                    "pymobiledevice3",
+                    "developer",
+                    "core-device",
+                    "universal-hid-service",
+                    "tap",
+                    *self.coredevice_device_options(device),
+                    str(hx),
+                    str(hy),
+                ],
+                env=self.coredevice_env(device),
+                timeout=timeout,
+            ),
+            code="COREDEVICE_TAP_FAILED",
+            stage="tap",
+        )
+        require_success(done, code="COREDEVICE_TAP_FAILED", stage="tap")
         return {
             "attempted": True,
             "dryRun": False,
