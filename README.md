@@ -80,14 +80,29 @@ suggested daemon command instead of trying to parse a broken or empty screenshot
 ## Quick Start
 
 ```bash
+curl -fsSL https://raw.githubusercontent.com/parkgogogo/coretap/main/install.sh | bash
+```
+
+The installer sets up the wrapper CLI, `pymobiledevice3`, Simulator tap support,
+OCR when Homebrew is available, the built-in MAI-UI model pack, and then runs
+`coretap doctor`.
+
+Useful installer options:
+
+```bash
+./install.sh --skip-model
+./install.sh --skip-ocr
+./install.sh --skip-simulator
+./install.sh --skip-device
+./install.sh --no-brew-install
+./install.sh --no-warm
+```
+
+For development from a checkout:
+
+```bash
 uv tool install --force --editable .
-coretap setup
-coretap status --format json
-coretap discover --backend simulator --format json
-coretap model install --format json
-coretap model check --deep --format json
-coretap model warm --format json
-coretap ocr check --format json
+coretap setup --format json
 ```
 
 `coretap assert text` and `coretap wait text` currently use the local

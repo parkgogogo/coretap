@@ -158,6 +158,20 @@ class SimulatorBackend:
             path = Path(configured)
             if path.exists():
                 return path
+        managed = (
+            Path.home()
+            / "Library"
+            / "Application Support"
+            / "Coretap"
+            / "tools"
+            / "idb-companion"
+            / "1.1.8"
+            / "idb-companion.universal"
+            / "bin"
+            / "idb_companion"
+        )
+        if managed.exists():
+            return managed
         local = Path(__file__).resolve().parents[1] / ".tools" / "idb-companion.universal" / "bin" / "idb_companion"
         if local.exists():
             return local
