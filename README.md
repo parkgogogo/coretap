@@ -47,6 +47,26 @@ Coretap records frame pixel, normalized, and executor coordinates. The shared
 coordinate is normalized `[0,1]`; real devices convert normalized points to HID
 U16, while Simulator converts normalized points to IDB logical points.
 
+## Real Device CoreDevice Support
+
+Real-device automation uses `pymobiledevice3 developer core-device` and does
+not use WDA. On current `pymobiledevice3`, Coretap uses the CoreDevice
+`--tunnel <udid>` device selector for screenshots and Universal HID taps.
+
+Prerequisites:
+
+- Pair/trust the iPhone and enable Developer Mode.
+- Mount DDI or perform any device-specific developer setup required by
+  `pymobiledevice3` for that iOS version.
+- For iOS 17+ CoreDevice access, start tunneld when required:
+
+```bash
+sudo pymobiledevice3 remote tunneld --daemonize
+```
+
+If tunneld is missing, Coretap reports `COREDEVICE_TUNNELD_UNAVAILABLE` with the
+same suggested command instead of trying to parse a broken or empty screenshot.
+
 ## Quick Start
 
 ```bash
@@ -58,6 +78,13 @@ coretap model install --format json
 coretap model check --deep --format json
 coretap model warm --format json
 coretap ocr check --format json
+```
+
+`coretap assert text` and `coretap wait text` currently use the local
+`tesseract` CLI. Install it separately, for example:
+
+```bash
+brew install tesseract
 ```
 
 If Xcode is installed but `xcode-select` points at CommandLineTools, set:

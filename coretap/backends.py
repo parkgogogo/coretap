@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from coretap.runtime import (
+    Completed,
     CoretapError,
     command_env,
     png_size,
@@ -198,20 +199,11 @@ class DeviceBackend:
                 stage="discover",
                 details={"stdout": done.stdout, "stderr": done.stderr},
             )
-        return [
-            Device(
-                udid="unknown",
-                name="pymobiledevice3 usbmux list",
-                backend=self.name,
-                state=None,
-                eligible=True,
-                details={"stdout": done.stdout},
-            )
-        ]
+        return parse_usbmux_devices(done.stdout)
 
     def screenshot(self, device: str, out: Path) -> Frame:
         out.parent.mkdir(parents=True, exist_ok=True)
-        require_success(
+        done = _check_coredevice_result(
             run_command(
                 [
                     "pymobiledevice3",
@@ -219,15 +211,23 @@ class DeviceBackend:
                     "core-device",
                     "screen-capture",
                     "screenshot",
-                    str(out),
-                    "--udid",
+                    "--tunnel",
                     device,
+                    str(out),
                 ],
                 timeout=20,
             ),
             code="COREDEVICE_SCREENSHOT_FAILED",
             stage="screenshot",
         )
+        require_success(done, code="COREDEVICE_SCREENSHOT_FAILED", stage="screenshot")
+        if not out.exists() or out.stat().st_size == 0:
+            raise CoretapError(
+                "COREDEVICE_SCREENSHOT_EMPTY",
+                "CoreDevice screenshot did not produce a valid PNG",
+                stage="screenshot",
+                details={"path": str(out), "stdout": done.stdout, "stderr": done.stderr},
+            )
         width, height = png_size(out)
         return Frame(f"frame_{out.stem}", out, width, height, self.name, device)
 
@@ -247,7 +247,7 @@ class DeviceBackend:
         hy = int(round(y * 65535)) if hid_u16 is None else hid_u16["y"]
         if dry_run:
             return {"attempted": False, "dryRun": True, "normalized": {"x": x, "y": y}, "hidU16": {"x": hx, "y": hy}}
-        done = require_success(
+        done = _check_coredevice_result(
             run_command(
                 [
                     "pymobiledevice3",
@@ -255,9 +255,8 @@ class DeviceBackend:
                     "core-device",
                     "universal-hid-service",
                     "tap",
-                    "--udid",
+                    "--tunnel",
                     device,
-                    "--",
                     str(hx),
                     str(hy),
                 ],
@@ -266,6 +265,7 @@ class DeviceBackend:
             code="COREDEVICE_TAP_FAILED",
             stage="tap",
         )
+        require_success(done, code="COREDEVICE_TAP_FAILED", stage="tap")
         return {
             "attempted": True,
             "dryRun": False,
@@ -273,6 +273,78 @@ class DeviceBackend:
             "hidU16": {"x": hx, "y": hy},
             "durationMs": done.duration_ms,
         }
+
+
+def parse_usbmux_devices(stdout: str) -> list[Device]:
+    try:
+        data = json.loads(stdout or "[]")
+    except json.JSONDecodeError:
+        return _parse_simple_usbmux_lines(stdout)
+
+    entries: list[Any]
+    if isinstance(data, list):
+        entries = data
+    elif isinstance(data, dict):
+        entries = data.get("DeviceList") or data.get("devices") or [data]
+    else:
+        entries = []
+
+    devices: list[Device] = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        udid = (
+            entry.get("Identifier")
+            or entry.get("UniqueDeviceID")
+            or entry.get("UDID")
+            or entry.get("SerialNumber")
+            or entry.get("udid")
+        )
+        if not udid:
+            continue
+        product_type = entry.get("ProductType")
+        product_version = entry.get("ProductVersion")
+        name = entry.get("DeviceName") or entry.get("Name") or product_type or str(udid)
+        devices.append(
+            Device(
+                udid=str(udid),
+                name=str(name) if name is not None else None,
+                backend=DeviceBackend.name,
+                runtime=str(product_version) if product_version is not None else None,
+                eligible=True,
+                details=entry,
+            )
+        )
+    return devices
+
+
+def _parse_simple_usbmux_lines(stdout: str) -> list[Device]:
+    devices: list[Device] = []
+    for line in stdout.splitlines():
+        udid = line.strip()
+        if not udid:
+            continue
+        devices.append(Device(udid=udid, name=udid, backend=DeviceBackend.name, eligible=True, details={"line": line}))
+    return devices
+
+
+def _check_coredevice_result(done: Completed, *, code: str, stage: str) -> Completed:
+    combined = f"{done.stdout}\n{done.stderr}"
+    if "Unable to connect to Tunneld" in combined or "start one using" in combined and "tunneld" in combined:
+        raise CoretapError(
+            "COREDEVICE_TUNNELD_UNAVAILABLE",
+            "pymobiledevice3 could not connect to tunneld for CoreDevice access",
+            category="environment",
+            stage=stage,
+            retryable=True,
+            details={
+                "argv": done.argv,
+                "stdout": done.stdout,
+                "stderr": done.stderr,
+                "suggestedCommand": "sudo pymobiledevice3 remote tunneld --daemonize",
+            },
+        )
+    return done
 
 
 def backend_for(name: str, *, developer_dir: str | None = None) -> SimulatorBackend | DeviceBackend:

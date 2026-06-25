@@ -4,10 +4,11 @@ from pathlib import Path
 
 import pytest
 
+from coretap.backends import _check_coredevice_result, parse_usbmux_devices
 from coretap.cli import point_to_hid
 from coretap.model_pack import parse_grounding_output
 from coretap.ocr import find_text, parse_tsv
-from coretap.runtime import CoretapError, png_size
+from coretap.runtime import Completed, CoretapError, png_size
 
 
 def test_point_to_hid_from_normalized() -> None:
@@ -63,6 +64,49 @@ def test_parse_tsv_and_find_text() -> None:
     assert match is not None
     assert match["matchedText"] == "General"
     assert match["matchedBoxPx"] == {"x": 10, "y": 20, "width": 30, "height": 12}
+
+
+def test_parse_usbmux_json_devices() -> None:
+    devices = parse_usbmux_devices(
+        """[
+  {
+    "Identifier": "00008110-001234",
+    "UniqueDeviceID": "00008110-001234",
+    "ProductType": "iPhone13,1",
+    "ProductVersion": "27.0",
+    "DeviceName": "Park iPhone"
+  }
+]"""
+    )
+
+    assert len(devices) == 1
+    assert devices[0].udid == "00008110-001234"
+    assert devices[0].name == "Park iPhone"
+    assert devices[0].runtime == "27.0"
+    assert devices[0].details["ProductType"] == "iPhone13,1"
+
+
+def test_parse_usbmux_simple_lines() -> None:
+    devices = parse_usbmux_devices("udid-one\nudid-two\n")
+
+    assert [d.udid for d in devices] == ["udid-one", "udid-two"]
+
+
+def test_coredevice_tunneld_error_is_detected_on_zero_exit() -> None:
+    done = Completed(
+        argv=["pymobiledevice3", "developer", "core-device", "screen-capture", "screenshot"],
+        returncode=0,
+        stdout="",
+        stderr="ERROR Unable to connect to Tunneld. You can start one using: sudo python3 -m pymobiledevice3 remote tunneld",
+        duration_ms=10,
+    )
+
+    with pytest.raises(CoretapError) as exc:
+        _check_coredevice_result(done, code="COREDEVICE_SCREENSHOT_FAILED", stage="screenshot")
+
+    assert exc.value.code == "COREDEVICE_TUNNELD_UNAVAILABLE"
+    assert exc.value.retryable is True
+    assert exc.value.details["suggestedCommand"] == "sudo pymobiledevice3 remote tunneld --daemonize"
 
 
 def test_png_size(tmp_path: Path) -> None:
