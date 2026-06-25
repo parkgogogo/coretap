@@ -4,7 +4,10 @@ import json
 import subprocess
 import sys
 
+import pytest
+
 from coretap.daemon import handle_argv
+from coretap.runtime import CoretapError
 
 
 def run_coretap(*args: str) -> dict:
@@ -51,3 +54,77 @@ def test_daemon_handle_argv_reuses_cli_dispatch(tmp_path) -> None:
     assert data["daemon"]["workers"]["model"]["kind"] == "mlx-vlm-process-resident"
     assert data["daemon"]["workers"]["coredevice"]["kind"] == "coredevice-userspace-persistent"
     assert data["result"]["version"] == "0.1.0"
+
+
+def test_default_cli_auto_starts_daemon_and_forwards(monkeypatch, capsys) -> None:
+    import coretap.daemon
+    from coretap.cli import main
+
+    calls = []
+    starts = []
+
+    def fake_request_daemon(argv, *, cwd=None, socket_path=None, timeout=300.0):
+        calls.append({"argv": argv, "cwd": cwd, "socket_path": socket_path, "timeout": timeout})
+        if len(calls) == 1:
+            raise CoretapError("DAEMON_UNAVAILABLE", "not running", stage="daemon")
+        return {
+            "schema": "coretap.response.v1",
+            "ok": True,
+            "command": "status",
+            "requestId": "req_test",
+            "durationMs": 1,
+            "result": {"version": "0.1.0"},
+            "artifacts": [],
+            "warnings": [],
+            "daemon": {
+                "pid": 123,
+                "workers": {
+                    "model": {"kind": "mlx-vlm-process-resident", "loaded": False},
+                    "coredevice": {"kind": "coredevice-userspace-persistent", "running": True},
+                },
+            },
+            "exitCode": 0,
+        }
+
+    def fake_start_daemon(*, socket_path=None, timeout=5.0):
+        starts.append({"socket_path": socket_path, "timeout": timeout})
+        return {"started": True}
+
+    monkeypatch.setattr(coretap.daemon, "request_daemon", fake_request_daemon)
+    monkeypatch.setattr(coretap.daemon, "start_daemon", fake_start_daemon)
+
+    with pytest.raises(SystemExit) as exc:
+        main(["--format", "json", "status"])
+
+    assert exc.value.code == 0
+    assert starts == [{"socket_path": None, "timeout": 5.0}]
+    assert [call["argv"] for call in calls] == [["--format", "json", "status"], ["--format", "json", "status"]]
+    data = json.loads(capsys.readouterr().out)
+    assert data["daemon"]["workers"]["model"]["kind"] == "mlx-vlm-process-resident"
+    assert data["daemon"]["workers"]["coredevice"]["running"] is True
+
+
+def test_daemon_on_requires_existing_daemon(monkeypatch, capsys) -> None:
+    import coretap.daemon
+    from coretap.cli import main
+
+    starts = []
+
+    def fake_request_daemon(argv, *, cwd=None, socket_path=None, timeout=300.0):
+        raise CoretapError("DAEMON_UNAVAILABLE", "not running", stage="daemon")
+
+    def fake_start_daemon(*, socket_path=None, timeout=5.0):
+        starts.append({"socket_path": socket_path, "timeout": timeout})
+        return {"started": True}
+
+    monkeypatch.setattr(coretap.daemon, "request_daemon", fake_request_daemon)
+    monkeypatch.setattr(coretap.daemon, "start_daemon", fake_start_daemon)
+
+    with pytest.raises(SystemExit) as exc:
+        main(["--daemon", "on", "--format", "json", "status"])
+
+    assert exc.value.code == 14
+    assert starts == []
+    data = json.loads(capsys.readouterr().out)
+    assert data["ok"] is False
+    assert data["error"]["code"] == "DAEMON_UNAVAILABLE"
