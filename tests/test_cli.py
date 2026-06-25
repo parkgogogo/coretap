@@ -9,7 +9,7 @@ from coretap.daemon import handle_argv
 
 def run_coretap(*args: str) -> dict:
     proc = subprocess.run(
-        [sys.executable, "-m", "coretap", "--format", "json", *args],
+        [sys.executable, "-m", "coretap", "--daemon", "off", "--format", "json", *args],
         text=True,
         capture_output=True,
         check=False,
@@ -48,4 +48,6 @@ def test_daemon_handle_argv_reuses_cli_dispatch(tmp_path) -> None:
     assert data["ok"] is True
     assert data["exitCode"] == 0
     assert data["daemon"]["pid"] > 0
+    assert data["daemon"]["workers"]["model"]["kind"] == "mlx-vlm-process-resident"
+    assert data["daemon"]["workers"]["coredevice"]["kind"] == "coredevice-userspace-persistent"
     assert data["result"]["version"] == "0.1.0"

@@ -247,6 +247,15 @@ def stop_model() -> dict[str, Any]:
     return {"stopped": stopped, "profile": PUBLIC_MODEL_PROFILE, "worker": {"kind": "process-local"}}
 
 
+def model_worker_status() -> dict[str, Any]:
+    return {
+        "kind": "mlx-vlm-process-resident",
+        "runtime": PUBLIC_RUNTIME_ID,
+        "loaded": bool(_MODEL_CACHE),
+        "loadedProfiles": sorted(_MODEL_CACHE),
+    }
+
+
 def warm_model(profile: str = PUBLIC_MODEL_PROFILE) -> dict[str, Any]:
     _require_public_profile(profile)
     status = check_model(profile)

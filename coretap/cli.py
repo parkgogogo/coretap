@@ -47,8 +47,12 @@ EXIT_CODES = {
     "PYMOBILEDEVICE3_DISCOVER_FAILED": 20,
     "COREDEVICE_SCREENSHOT_FAILED": 21,
     "COREDEVICE_SCREENSHOT_EMPTY": 21,
+    "COREDEVICE_DISPLAY_INFO_FAILED": 21,
+    "COREDEVICE_DISPLAY_INFO_INVALID": 21,
     "COREDEVICE_TUNNELD_UNAVAILABLE": 10,
     "COREDEVICE_TAP_FAILED": 32,
+    "COREDEVICE_WORKER_FAILED": 32,
+    "COREDEVICE_WORKER_TIMEOUT": 32,
     "SIMULATOR_TAP_UNSUPPORTED": 32,
     "SIMULATOR_TAP_FAILED": 32,
     "SIMULATOR_DESCRIBE_FAILED": 32,
@@ -635,7 +639,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--coredevice-tunnel-mode", choices=["userspace", "tunneld"], default=None)
     parser.add_argument("--artifact-root", default=None)
     parser.add_argument("--profile", default=PUBLIC_MODEL_PROFILE)
-    parser.add_argument("--daemon", choices=["off", "auto", "on"], default="off")
+    parser.add_argument("--daemon", choices=["off", "auto", "on"], default="auto")
 
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("setup")
@@ -807,19 +811,25 @@ def main(argv: list[str] | None = None) -> None:
     normalized = normalize_global_args(list(argv if argv is not None else sys.argv[1:]))
     args = parser.parse_args(normalized)
     if args.command != "daemon" and args.daemon != "off":
-        from coretap.daemon import request_daemon
+        from coretap.daemon import request_daemon, start_daemon
 
         try:
             data = request_daemon(normalized, cwd=str(Path.cwd()))
             emit(data, args.format)
             raise SystemExit(int(data.get("exitCode", 0 if data.get("ok") else 70)))
         except CoretapError as exc:
-            if args.daemon == "auto":
-                pass
-            else:
+            if args.daemon == "auto" and exc.code == "DAEMON_UNAVAILABLE":
+                start_daemon()
+                data = request_daemon(normalized, cwd=str(Path.cwd()))
+                emit(data, args.format)
+                raise SystemExit(int(data.get("exitCode", 0 if data.get("ok") else 70)))
+            if args.daemon == "on":
                 data = response_error(args.command, exc)
                 emit(data, args.format)
                 raise SystemExit(EXIT_CODES.get(exc.code, 70))
+            data = response_error(args.command, exc)
+            emit(data, args.format)
+            raise SystemExit(EXIT_CODES.get(exc.code, 70))
     started = time.monotonic()
     try:
         result = dispatch(args)

@@ -6,9 +6,20 @@ import pytest
 
 from coretap.backends import DeviceBackend, _check_coredevice_result, _coredevice_screenshot_rotation, parse_usbmux_devices
 from coretap.cli import point_to_hid
+from coretap.device_worker import set_default_device_worker_pool
 from coretap.model_pack import parse_grounding_output
 from coretap.ocr import find_exact_text_candidates, find_text, parse_tsv
 from coretap.runtime import Completed, CoretapError, png_size
+
+
+TINY_PNG = (
+    b"\x89PNG\r\n\x1a\n"
+    b"\x00\x00\x00\rIHDR"
+    b"\x00\x00\x00\x03"
+    b"\x00\x00\x00\x05"
+    b"\x08\x02\x00\x00\x00"
+    b"\x00\x00\x00\x00"
+)
 
 
 def test_point_to_hid_from_normalized() -> None:
@@ -159,15 +170,70 @@ def test_coredevice_screenshot_rotation_matches_display_orientation() -> None:
     assert _coredevice_screenshot_rotation((1260, 2736), (1260, 2736), "portrait") is None
 
 
+def test_device_backend_uses_registered_persistent_worker_for_userspace_tap() -> None:
+    class FakePool:
+        def __init__(self) -> None:
+            self.calls = []
+
+        def tap_userspace(self, device: str, x: float, y: float, hx: int, hy: int) -> dict:
+            self.calls.append((device, x, y, hx, hy))
+            return {"workerKind": "fake-persistent-worker", "dispatchStatus": "sent"}
+
+    pool = FakePool()
+    set_default_device_worker_pool(pool)  # type: ignore[arg-type]
+    try:
+        result = DeviceBackend().tap_normalized(
+            "device-udid",
+            0.25,
+            0.5,
+            dry_run=False,
+            hid_u16={"x": 100, "y": 200},
+        )
+    finally:
+        set_default_device_worker_pool(None)
+
+    assert pool.calls == [("device-udid", 0.25, 0.5, 100, 200)]
+    assert result == {"workerKind": "fake-persistent-worker", "dispatchStatus": "sent"}
+
+
+def test_device_backend_uses_registered_persistent_worker_for_screenshot(tmp_path: Path) -> None:
+    class FakePool:
+        def __init__(self) -> None:
+            self.calls = []
+
+        def capture_screenshot_userspace(self, device: str) -> dict:
+            self.calls.append(("screenshot", device))
+            return {"image": TINY_PNG, "workerKind": "fake-persistent-worker"}
+
+        def display_info_userspace(self, device: str) -> dict:
+            self.calls.append(("display-info", device))
+            return {
+                "displays": [
+                    {
+                        "primary": True,
+                        "currentMode": {"size": [3, 5]},
+                        "deviceOrientation": "portrait",
+                    }
+                ]
+            }
+
+    pool = FakePool()
+    out = tmp_path / "screen.png"
+    set_default_device_worker_pool(pool)  # type: ignore[arg-type]
+    try:
+        frame = DeviceBackend().screenshot("device-udid", out)
+    finally:
+        set_default_device_worker_pool(None)
+
+    assert pool.calls == [("screenshot", "device-udid"), ("display-info", "device-udid")]
+    assert frame.width == 3
+    assert frame.height == 5
+    assert frame.path == out
+    assert out.read_bytes() == TINY_PNG
+
+
 def test_png_size(tmp_path: Path) -> None:
     png = tmp_path / "tiny.png"
-    png.write_bytes(
-        b"\x89PNG\r\n\x1a\n"
-        b"\x00\x00\x00\rIHDR"
-        b"\x00\x00\x00\x03"
-        b"\x00\x00\x00\x05"
-        b"\x08\x02\x00\x00\x00"
-        b"\x00\x00\x00\x00"
-    )
+    png.write_bytes(TINY_PNG)
 
     assert png_size(png) == (3, 5)

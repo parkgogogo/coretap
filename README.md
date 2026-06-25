@@ -65,10 +65,12 @@ CoreDevice screenshots are normalized to the primary display size reported by
 frame pixel coordinates aligned with the HID coordinate space even when the raw
 CoreDevice screenshot service returns a rotated PNG.
 
-For userspace CoreDevice HID, Coretap uses the `pymobiledevice3` Python API
-directly and returns after the touch dispatch is sent. This avoids the
-long-running CLI teardown path that can otherwise hide a successful tap behind a
-process timeout.
+In daemon mode, Coretap uses the `pymobiledevice3` Python API directly for
+userspace CoreDevice screenshot, display-info, and HID tap work. The daemon
+keeps a CoreDevice worker thread alive and reuses per-device RSD/touch sessions
+instead of spawning `pymobiledevice3` CLI subprocesses for the interactive path.
+This avoids the long-running CLI teardown path that can otherwise hide a
+successful tap behind a process timeout.
 
 Prerequisites:
 
@@ -127,18 +129,19 @@ matched text bounding box center, and does not invoke the VLM grounding model.
 Use `tap target` for semantic descriptions, icons, relative position, or cases
 where exact OCR text is absent or ambiguous.
 
-For repeated automation runs, start the local daemon and route CLI calls through
-it so the grounding model stays loaded between commands:
+By default, `coretap` runs as a thin client: non-daemon commands auto-start
+`coretapd` and execute inside that long-running process. This keeps the MLX
+grounding model resident after the first semantic request and gives real-device
+tap commands a persistent CoreDevice userspace HID worker.
 
 ```bash
-coretap daemon start
-coretap --daemon on --format json --backend device --device "$UDID" tap target --target "the ChatGPT app icon"
+coretap --format json --backend device --device "$UDID" tap target --target "the ChatGPT app icon"
 coretap daemon status
 coretap daemon stop
 ```
 
-Use `--daemon auto` to try the daemon and fall back to single-process execution
-when it is not running.
+Use `--daemon off` for one-shot local debugging, or `--daemon on` to require an
+already-running daemon without auto-starting it.
 
 `coretap assert text` and `coretap wait text` currently use the local
 `tesseract` CLI. Install it separately, for example:

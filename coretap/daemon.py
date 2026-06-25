@@ -12,11 +12,14 @@ from contextlib import suppress
 from pathlib import Path
 from typing import Any
 
+from coretap.device_worker import CoreDeviceWorkerPool, set_default_device_worker_pool
+from coretap.model_pack import model_worker_status
 from coretap.runtime import CoretapError, ensure_state, response_error, response_ok, run_id
 
 
 REQUEST_SCHEMA = "coretap.daemon.request.v1"
 RESPONSE_SCHEMA = "coretap.response.v1"
+DEVICE_WORKER_POOL = CoreDeviceWorkerPool()
 
 
 def default_socket_path() -> Path:
@@ -155,13 +158,13 @@ def handle_argv(argv: list[str], *, cwd: str | None = None) -> dict[str, Any]:
         result = dispatch(args)
         data = response_ok(command, result)
         data["durationMs"] = round((time.monotonic() - started) * 1000)
-        data["daemon"] = {"pid": os.getpid(), "socket": str(default_socket_path())}
+        data["daemon"] = daemon_status()
         data["exitCode"] = 0
         return data
     except CoretapError as exc:
         data = response_error(command, exc)
         data["durationMs"] = round((time.monotonic() - started) * 1000)
-        data["daemon"] = {"pid": os.getpid(), "socket": str(default_socket_path())}
+        data["daemon"] = daemon_status()
         data["exitCode"] = EXIT_CODES.get(exc.code, 70)
         return data
     except SystemExit as exc:
@@ -174,7 +177,7 @@ def handle_argv(argv: list[str], *, cwd: str | None = None) -> dict[str, Any]:
         )
         data = response_error(command, error)
         data["durationMs"] = round((time.monotonic() - started) * 1000)
-        data["daemon"] = {"pid": os.getpid(), "socket": str(default_socket_path())}
+        data["daemon"] = daemon_status()
         data["exitCode"] = 2
         return data
     except BaseException as exc:
@@ -187,7 +190,7 @@ def handle_argv(argv: list[str], *, cwd: str | None = None) -> dict[str, Any]:
         )
         data = response_error(command, error)
         data["durationMs"] = round((time.monotonic() - started) * 1000)
-        data["daemon"] = {"pid": os.getpid(), "socket": str(default_socket_path())}
+        data["daemon"] = daemon_status()
         data["exitCode"] = 70
         return data
     finally:
@@ -222,6 +225,8 @@ def serve(*, socket_path: str | Path | None = None) -> int:
 
     old_term = signal.signal(signal.SIGTERM, _request_shutdown)
     old_int = signal.signal(signal.SIGINT, _request_shutdown)
+    set_default_device_worker_pool(DEVICE_WORKER_POOL)
+    DEVICE_WORKER_POOL.start()
     try:
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as server:
             server.bind(str(path))
@@ -237,11 +242,24 @@ def serve(*, socket_path: str | Path | None = None) -> int:
                     if _handle_connection(conn):
                         shutting_down = True
     finally:
+        set_default_device_worker_pool(None)
+        DEVICE_WORKER_POOL.close()
         signal.signal(signal.SIGTERM, old_term)
         signal.signal(signal.SIGINT, old_int)
         path.unlink(missing_ok=True)
         pid_path.unlink(missing_ok=True)
     return 0
+
+
+def daemon_status() -> dict[str, Any]:
+    return {
+        "pid": os.getpid(),
+        "socket": str(default_socket_path()),
+        "workers": {
+            "model": model_worker_status(),
+            "coredevice": DEVICE_WORKER_POOL.stats(),
+        },
+    }
 
 
 def _handle_connection(conn: socket.socket) -> bool:
@@ -252,9 +270,9 @@ def _handle_connection(conn: socket.socket) -> bool:
             request = json.loads(line.decode("utf-8"))
             action = request.get("action")
             if action == "ping":
-                response = response_ok("daemon", {"running": True, "pid": os.getpid(), "socket": str(default_socket_path())})
+                response = response_ok("daemon", {"running": True, **daemon_status()})
             elif action == "shutdown":
-                response = response_ok("daemon", {"stopping": True, "pid": os.getpid(), "socket": str(default_socket_path())})
+                response = response_ok("daemon", {"stopping": True, **daemon_status()})
                 shutting_down = True
             elif action == "argv":
                 response = handle_argv(list(request.get("argv") or []), cwd=request.get("cwd"))

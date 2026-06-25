@@ -248,36 +248,51 @@ class DeviceBackend:
 
     def screenshot(self, device: str, out: Path) -> Frame:
         out.parent.mkdir(parents=True, exist_ok=True)
-        done = _check_coredevice_result(
-            run_command(
-                [
-                    "pymobiledevice3",
-                    "developer",
-                    "core-device",
-                    "screen-capture",
-                    "screenshot",
-                    *self.coredevice_device_options(device),
-                    str(out),
-                ],
-                env=self.coredevice_env(device),
-                timeout=20,
-            ),
-            code="COREDEVICE_SCREENSHOT_FAILED",
-            stage="screenshot",
-        )
-        require_success(done, code="COREDEVICE_SCREENSHOT_FAILED", stage="screenshot")
+        capture: dict[str, Any] | None = None
+        if self.coredevice_tunnel_mode == "userspace":
+            from coretap.device_worker import get_default_device_worker_pool
+
+            pool = get_default_device_worker_pool()
+            if pool is not None:
+                capture = pool.capture_screenshot_userspace(device)
+                out.write_bytes(capture["image"])
+        if capture is None:
+            done = _check_coredevice_result(
+                run_command(
+                    [
+                        "pymobiledevice3",
+                        "developer",
+                        "core-device",
+                        "screen-capture",
+                        "screenshot",
+                        *self.coredevice_device_options(device),
+                        str(out),
+                    ],
+                    env=self.coredevice_env(device),
+                    timeout=20,
+                ),
+                code="COREDEVICE_SCREENSHOT_FAILED",
+                stage="screenshot",
+            )
+            require_success(done, code="COREDEVICE_SCREENSHOT_FAILED", stage="screenshot")
         if not out.exists() or out.stat().st_size == 0:
             raise CoretapError(
                 "COREDEVICE_SCREENSHOT_EMPTY",
                 "CoreDevice screenshot did not produce a valid PNG",
                 stage="screenshot",
-                details={"path": str(out), "stdout": done.stdout, "stderr": done.stderr},
+                details={"path": str(out), "capture": _public_capture_metadata(capture)},
             )
         self._normalize_screenshot_orientation(device, out)
         width, height = png_size(out)
         return Frame(f"frame_{out.stem}", out, width, height, self.name, device)
 
     def display_info(self, device: str) -> dict[str, Any]:
+        if self.coredevice_tunnel_mode == "userspace":
+            from coretap.device_worker import get_default_device_worker_pool
+
+            pool = get_default_device_worker_pool()
+            if pool is not None:
+                return pool.display_info_userspace(device)
         done = _check_coredevice_result(
             run_command(
                 [
@@ -372,6 +387,12 @@ class DeviceBackend:
         return self._tap_cli(device, x, y, hx, hy)
 
     def _tap_userspace_direct(self, device: str, x: float, y: float, hx: int, hy: int) -> dict[str, Any]:
+        from coretap.device_worker import get_default_device_worker_pool
+
+        pool = get_default_device_worker_pool()
+        if pool is not None:
+            return pool.tap_userspace(device, x, y, hx, hy)
+
         timeout = 15.0
         cleanup_grace = 1.0
         started = time.monotonic()
@@ -637,6 +658,12 @@ def _terminate_process(proc: subprocess.Popen[str]) -> str:
         except ValueError:
             stderr = ""
     return stderr
+
+
+def _public_capture_metadata(capture: dict[str, Any] | None) -> dict[str, Any] | None:
+    if capture is None:
+        return None
+    return {key: value for key, value in capture.items() if key != "image"}
 
 
 def _check_coredevice_result(done: Completed, *, code: str, stage: str) -> Completed:
