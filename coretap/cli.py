@@ -10,6 +10,7 @@ from typing import Any
 
 from coretap import __version__
 from coretap.backends import backend_for
+from coretap.device_buttons import BUTTON_STATES, button_choices
 from coretap.grounding import (
     GROUNDING_PROFILES,
     ground_target,
@@ -19,10 +20,12 @@ from coretap.grounding import (
     model_install,
     model_status,
     model_stop,
+    prepare_grounding_image,
+    remap_grounding_to_source_frame,
     warm_model,
 )
 from coretap.model_pack import INTERNAL_FIXTURE_PROFILE, PUBLIC_MODEL_PROFILE
-from coretap.ocr import find_exact_text_candidates, find_text, run_tesseract, tesseract_status
+from coretap.ocr import DEFAULT_OCR_LANG, find_exact_text_candidates, find_text, run_tesseract, tesseract_status
 from coretap.runtime import (
     CoretapError,
     artifact_dir,
@@ -50,9 +53,13 @@ EXIT_CODES = {
     "COREDEVICE_DISPLAY_INFO_FAILED": 21,
     "COREDEVICE_DISPLAY_INFO_INVALID": 21,
     "COREDEVICE_TUNNELD_UNAVAILABLE": 10,
+    "COREDEVICE_DRAG_FAILED": 32,
+    "COREDEVICE_PRESS_FAILED": 32,
     "COREDEVICE_TAP_FAILED": 32,
     "COREDEVICE_WORKER_FAILED": 32,
     "COREDEVICE_WORKER_TIMEOUT": 32,
+    "SIMULATOR_DRAG_UNSUPPORTED": 32,
+    "SIMULATOR_PRESS_UNSUPPORTED": 32,
     "SIMULATOR_TAP_UNSUPPORTED": 32,
     "SIMULATOR_TAP_FAILED": 32,
     "SIMULATOR_DESCRIBE_FAILED": 32,
@@ -132,7 +139,7 @@ def command_setup(args: argparse.Namespace) -> dict[str, Any]:
                 "version": 1,
                 "capabilities": {
                     "grounding": {"profile": PUBLIC_MODEL_PROFILE},
-                    "ocr": {"profile": "builtin:tesseract-fast-eng@dev"},
+                    "ocr": {"profile": "builtin:tesseract-chi-sim-eng@dev", "lang": DEFAULT_OCR_LANG},
                 },
                 "storage": {name: str(path) for name, path in roots.items()},
             },
@@ -143,8 +150,18 @@ def command_setup(args: argparse.Namespace) -> dict[str, Any]:
         except json.JSONDecodeError:
             config = {}
         grounding = config.setdefault("capabilities", {}).setdefault("grounding", {})
+        changed = False
         if grounding.get("profile") == "builtin:text-ocr-grounder@dev":
             grounding["profile"] = PUBLIC_MODEL_PROFILE
+            changed = True
+        ocr = config.setdefault("capabilities", {}).setdefault("ocr", {})
+        if ocr.get("profile") in (None, "builtin:tesseract-fast-eng@dev"):
+            ocr["profile"] = "builtin:tesseract-chi-sim-eng@dev"
+            changed = True
+        if ocr.get("lang") != DEFAULT_OCR_LANG:
+            ocr["lang"] = DEFAULT_OCR_LANG
+            changed = True
+        if changed:
             write_json(config_path, config)
     return {
         "version": __version__,
@@ -167,7 +184,7 @@ def command_status(args: argparse.Namespace) -> dict[str, Any]:
         "ocr": ocr,
         "ready": {
             "grounding": bool(model.get("ready")),
-            "textAssertions": bool(ocr.get("ready")),
+            "textAssertions": bool(ocr.get("ready") and ocr.get("defaultLangAvailable")),
         },
     }
 
@@ -208,7 +225,7 @@ def command_doctor(args: argparse.Namespace) -> dict[str, Any]:
     model = model_status(args.profile)
     checks.append({"id": "grounding", "status": "pass" if model["ready"] else "fail", "details": model})
     ocr = tesseract_status()
-    checks.append({"id": "ocr", "status": "pass" if ocr["ready"] else "warn", "details": ocr})
+    checks.append({"id": "ocr", "status": "pass" if ocr["ready"] and ocr["defaultLangAvailable"] else "warn", "details": ocr})
     try:
         devices = command_discover(args)["devices"]
         checks.append({"id": f"{args.backend}-discover", "status": "pass", "details": {"count": len(devices)}})
@@ -250,6 +267,14 @@ def command_ocr(args: argparse.Namespace) -> dict[str, Any]:
     if args.ocr_command == "check":
         if not status["ready"]:
             raise CoretapError("OCR_UNAVAILABLE", "tesseract not found or not runnable", stage="ocr", details=status)
+        if not status["defaultLangAvailable"]:
+            missing = ", ".join(status.get("missingLanguages") or [])
+            raise CoretapError(
+                "OCR_UNAVAILABLE",
+                f"default OCR language is unavailable: {status['defaultLang']} missing {missing}",
+                stage="ocr",
+                details=status,
+            )
         return status
     raise CoretapError("UNKNOWN_OCR_COMMAND", args.ocr_command, category="usage", stage="ocr")
 
@@ -305,10 +330,103 @@ def command_tap_point(args: argparse.Namespace) -> dict[str, Any]:
     return {"point": point, "tap": tap}
 
 
+def _parse_xy_pair(raw: str, *, option: str) -> tuple[float, float]:
+    parts = [part.strip() for part in raw.split(",")]
+    if len(parts) != 2 or not parts[0] or not parts[1]:
+        raise CoretapError("INVALID_ARGUMENT", f"{option} must be formatted as x,y", category="usage", stage="coordinate")
+    try:
+        return float(parts[0]), float(parts[1])
+    except ValueError as exc:
+        raise CoretapError("INVALID_ARGUMENT", f"{option} must contain numeric coordinates", category="usage", stage="coordinate") from exc
+
+
+def _point_frame_dimensions(args: argparse.Namespace) -> tuple[int, int]:
+    if getattr(args, "frame", None):
+        return png_size(Path(args.frame))
+    return args.width or 1, args.height or 1
+
+
+def command_drag(args: argparse.Namespace) -> dict[str, Any]:
+    width, height = _point_frame_dimensions(args)
+    from_x, from_y = _parse_xy_pair(args.from_point, option="--from")
+    to_x, to_y = _parse_xy_pair(args.to_point, option="--to")
+    from_point = point_to_hid(from_x, from_y, width=width, height=height, space=args.space)
+    to_point = point_to_hid(to_x, to_y, width=width, height=height, space=args.space)
+    backend = backend_for(args.backend, developer_dir=args.developer_dir, coredevice_tunnel_mode=args.coredevice_tunnel_mode)
+    drag = backend.drag_normalized(
+        args.device,
+        from_point["normalized"]["x"],
+        from_point["normalized"]["y"],
+        to_point["normalized"]["x"],
+        to_point["normalized"]["y"],
+        dry_run=args.dry_run,
+        start_hid_u16=from_point["hidU16"],
+        end_hid_u16=to_point["hidU16"],
+        steps=args.steps,
+        duration_ms=args.duration_ms,
+    )
+    return {"from": from_point, "to": to_point, "drag": drag}
+
+
+def command_scroll(args: argparse.Namespace) -> dict[str, Any]:
+    if not (0 < args.distance <= 0.9):
+        raise CoretapError("INVALID_ARGUMENT", "scroll --distance must be in (0, 0.9]", category="usage", stage="scroll")
+
+    half = args.distance / 2
+    edge_margin = 0.05
+
+    def clamp(value: float) -> float:
+        return max(edge_margin, min(1 - edge_margin, value))
+
+    if args.direction == "down":
+        from_x, from_y = args.anchor_x, clamp(args.anchor_y + half)
+        to_x, to_y = args.anchor_x, clamp(args.anchor_y - half)
+    elif args.direction == "up":
+        from_x, from_y = args.anchor_x, clamp(args.anchor_y - half)
+        to_x, to_y = args.anchor_x, clamp(args.anchor_y + half)
+    else:
+        raise CoretapError("INVALID_ARGUMENT", f"Unsupported scroll direction: {args.direction}", category="usage", stage="scroll")
+
+    ns = argparse.Namespace(**vars(args))
+    ns.space = "normalized"
+    ns.from_point = f"{from_x},{from_y}"
+    ns.to_point = f"{to_x},{to_y}"
+    ns.frame = None
+    ns.width = 1
+    ns.height = 1
+    result = command_drag(ns)
+    return {
+        "direction": args.direction,
+        "distance": args.distance,
+        "anchor": {"x": args.anchor_x, "y": args.anchor_y},
+        **result,
+    }
+
+
 def command_locate(args: argparse.Namespace) -> dict[str, Any]:
     warm_model(args.profile)
-    frame, run_dir, _ = capture(args, label="source")
-    grounded = ground_target(frame.path, args.target, profile=args.profile)
+    frame, run_dir, source_image = capture(args, label="source")
+    if args.profile == INTERNAL_FIXTURE_PROFILE:
+        model_input = {
+            "path": str(source_image),
+            "widthPx": frame.width,
+            "heightPx": frame.height,
+            "resized": False,
+            "maxLongSidePx": None,
+            "scale": 1.0,
+        }
+    else:
+        model_input = prepare_grounding_image(source_image, output_dir=run_dir)
+    grounded = ground_target(Path(model_input["path"]), args.target, profile=args.profile)
+    grounded["modelInput"] = {
+        "path": model_input["path"],
+        "widthPx": model_input["widthPx"],
+        "heightPx": model_input["heightPx"],
+        "resized": model_input["resized"],
+        "maxLongSidePx": model_input["maxLongSidePx"],
+        "scale": model_input["scale"],
+    }
+    grounded = remap_grounding_to_source_frame(grounded, source_width=frame.width, source_height=frame.height)
     raw_tsv = grounded.pop("rawTsv", None)
     raw_output = grounded.pop("rawOutput", None)
     if raw_tsv is not None:
@@ -325,6 +443,7 @@ def command_locate(args: argparse.Namespace) -> dict[str, Any]:
             "widthPx": frame.width,
             "heightPx": frame.height,
         },
+        "modelInput": grounded.get("modelInput"),
         "grounding": grounded,
     }
     write_json(run_dir / "locate.result.json", result)
@@ -441,6 +560,18 @@ def command_tap_text(args: argparse.Namespace) -> dict[str, Any]:
     return result
 
 
+def command_press(args: argparse.Namespace) -> dict[str, Any]:
+    backend = backend_for(args.backend, developer_dir=args.developer_dir, coredevice_tunnel_mode=args.coredevice_tunnel_mode)
+    pressed = backend.press_button(
+        args.device,
+        args.button,
+        state=args.state,
+        hold_ms=args.hold_ms,
+        dry_run=args.dry_run,
+    )
+    return pressed
+
+
 def command_assert_text(args: argparse.Namespace) -> dict[str, Any]:
     if args.image:
         image = Path(args.image)
@@ -452,13 +583,16 @@ def command_assert_text(args: argparse.Namespace) -> dict[str, Any]:
     last: dict[str, Any] | None = None
     while True:
         attempts += 1
-        tokens, raw = run_tesseract(image)
+        lang = getattr(args, "lang", DEFAULT_OCR_LANG)
+        psm = int(getattr(args, "psm", 11))
+        tokens, raw = run_tesseract(image, lang=lang, psm=psm)
         (run_dir / f"assert-{attempts:03d}.tsv").write_text(raw, encoding="utf-8")
         match = find_text(tokens, args.text, case_sensitive=args.case_sensitive)
         last = {
             "attempts": attempts,
             "image": str(image),
             "tokenCount": len(tokens),
+            "ocr": {"lang": lang, "psm": psm},
             "match": match,
         }
         if match:
@@ -466,6 +600,7 @@ def command_assert_text(args: argparse.Namespace) -> dict[str, Any]:
                 "artifactDir": str(run_dir),
                 "expected": args.text,
                 "matched": True,
+                "ocr": {"lang": lang, "psm": psm, "tokenCount": len(tokens)},
                 **match,
                 "attempts": attempts,
             }
@@ -519,12 +654,41 @@ def command_run(args: argparse.Namespace) -> dict[str, Any]:
         elif "tapText" in step:
             ns = argparse.Namespace(**vars(args))
             ns.text = step["tapText"]["text"]
-            ns.lang = step["tapText"].get("lang", "eng")
+            ns.lang = step["tapText"].get("lang", DEFAULT_OCR_LANG)
             ns.psm = int(step["tapText"].get("psm", 11))
             ns.min_confidence = float(step["tapText"].get("minConfidence", 50.0))
             ns.case_sensitive = bool(step["tapText"].get("caseSensitive", False))
             ns.dry_run = bool(step["tapText"].get("dryRun", args.dry_run))
             results.append({"tapText": command_tap_text(ns)})
+        elif "press" in step:
+            ns = argparse.Namespace(**vars(args))
+            ns.button = step["press"]["button"]
+            ns.state = step["press"].get("state", "press")
+            ns.hold_ms = step["press"].get("holdMs")
+            ns.dry_run = bool(step["press"].get("dryRun", args.dry_run))
+            results.append({"press": command_press(ns)})
+        elif "drag" in step:
+            ns = argparse.Namespace(**vars(args))
+            ns.from_point = step["drag"]["from"]
+            ns.to_point = step["drag"]["to"]
+            ns.space = step["drag"].get("space", "normalized")
+            ns.frame = step["drag"].get("frame")
+            ns.width = step["drag"].get("width")
+            ns.height = step["drag"].get("height")
+            ns.steps = int(step["drag"].get("steps", 30))
+            ns.duration_ms = int(step["drag"].get("durationMs", 600))
+            ns.dry_run = bool(step["drag"].get("dryRun", args.dry_run))
+            results.append({"drag": command_drag(ns)})
+        elif "scroll" in step:
+            ns = argparse.Namespace(**vars(args))
+            ns.direction = step["scroll"]["direction"]
+            ns.distance = float(step["scroll"].get("distance", 0.5))
+            ns.anchor_x = float(step["scroll"].get("anchorX", 0.5))
+            ns.anchor_y = float(step["scroll"].get("anchorY", 0.5))
+            ns.steps = int(step["scroll"].get("steps", 30))
+            ns.duration_ms = int(step["scroll"].get("durationMs", 600))
+            ns.dry_run = bool(step["scroll"].get("dryRun", args.dry_run))
+            results.append({"scroll": command_scroll(ns)})
         elif "locate" in step:
             ns = argparse.Namespace(**vars(args))
             ns.target = step["locate"]["target"]
@@ -537,6 +701,8 @@ def command_run(args: argparse.Namespace) -> dict[str, Any]:
             ns.timeout_ms = int(step["assertText"].get("timeoutMs", args.timeout_ms))
             ns.poll_interval_ms = int(step["assertText"].get("pollIntervalMs", args.poll_interval_ms))
             ns.case_sensitive = bool(step["assertText"].get("caseSensitive", False))
+            ns.lang = step["assertText"].get("lang", DEFAULT_OCR_LANG)
+            ns.psm = int(step["assertText"].get("psm", 11))
             results.append({"assertText": command_assert_text(ns)})
         else:
             raise CoretapError("FLOW_FAILED", f"Unknown flow step: {step}", category="usage", stage="flow")
@@ -691,10 +857,36 @@ def build_parser() -> argparse.ArgumentParser:
     tap_text.add_argument("text_query", nargs="?")
     tap_text.add_argument("--text", dest="text", default=None)
     tap_text.add_argument("--dry-run", action="store_true")
-    tap_text.add_argument("--lang", default="eng")
+    tap_text.add_argument("--lang", default=DEFAULT_OCR_LANG)
     tap_text.add_argument("--psm", type=int, default=11)
     tap_text.add_argument("--min-confidence", type=float, default=50.0)
     tap_text.add_argument("--case-sensitive", action="store_true")
+
+    press = sub.add_parser("press")
+    press.add_argument("button", choices=button_choices())
+    press.add_argument("--state", choices=BUTTON_STATES, default="press")
+    press.add_argument("--hold-ms", type=int, default=None)
+    press.add_argument("--dry-run", action="store_true")
+
+    drag = sub.add_parser("drag")
+    drag.add_argument("--space", choices=["px", "normalized", "hid"], default="normalized")
+    drag.add_argument("--from", dest="from_point", required=True)
+    drag.add_argument("--to", dest="to_point", required=True)
+    drag.add_argument("--frame", default=None)
+    drag.add_argument("--width", type=int, default=None)
+    drag.add_argument("--height", type=int, default=None)
+    drag.add_argument("--steps", type=int, default=30)
+    drag.add_argument("--duration-ms", type=int, default=600)
+    drag.add_argument("--dry-run", action="store_true")
+
+    scroll = sub.add_parser("scroll")
+    scroll.add_argument("direction", choices=["down", "up"])
+    scroll.add_argument("--distance", type=float, default=0.5)
+    scroll.add_argument("--anchor-x", type=float, default=0.5)
+    scroll.add_argument("--anchor-y", type=float, default=0.5)
+    scroll.add_argument("--steps", type=int, default=30)
+    scroll.add_argument("--duration-ms", type=int, default=600)
+    scroll.add_argument("--dry-run", action="store_true")
 
     assert_text = sub.add_parser("assert")
     assert_sub = assert_text.add_subparsers(dest="assert_command", required=True)
@@ -703,6 +895,8 @@ def build_parser() -> argparse.ArgumentParser:
     text.add_argument("--image", default=None)
     text.add_argument("--timeout-ms", type=int, default=3000)
     text.add_argument("--poll-interval-ms", type=int, default=300)
+    text.add_argument("--lang", default=DEFAULT_OCR_LANG)
+    text.add_argument("--psm", type=int, default=11)
     text.add_argument("--case-sensitive", action="store_true")
 
     wait = sub.add_parser("wait")
@@ -712,6 +906,8 @@ def build_parser() -> argparse.ArgumentParser:
     wait.add_argument("--image", default=None)
     wait.add_argument("--timeout-ms", type=int, default=3000)
     wait.add_argument("--poll-interval-ms", type=int, default=300)
+    wait.add_argument("--lang", default=DEFAULT_OCR_LANG)
+    wait.add_argument("--psm", type=int, default=11)
     wait.add_argument("--case-sensitive", action="store_true")
 
     run = sub.add_parser("run")
@@ -789,6 +985,12 @@ def dispatch(args: argparse.Namespace) -> dict[str, Any]:
             return command_tap_target(args)
         if args.tap_command == "text":
             return command_tap_text(args)
+    if args.command == "press":
+        return command_press(args)
+    if args.command == "drag":
+        return command_drag(args)
+    if args.command == "scroll":
+        return command_scroll(args)
     if args.command == "assert" and args.assert_command == "text":
         return command_assert_text(args)
     if args.command == "wait":

@@ -22,6 +22,75 @@ from coretap.runtime import CoretapError
 
 GROUNDING_PROFILES = public_profiles()
 ALL_GROUNDING_PROFILES = {**GROUNDING_PROFILES, **internal_profiles()}
+DEFAULT_GROUNDING_IMAGE_LONG_SIDE = 1368
+
+
+def prepare_grounding_image(
+    image: Path,
+    *,
+    output_dir: Path,
+    max_long_side: int = DEFAULT_GROUNDING_IMAGE_LONG_SIDE,
+) -> dict[str, Any]:
+    width, height = _image_size(image)
+    long_side = max(width, height)
+    if max_long_side <= 0 or long_side <= max_long_side:
+        return {
+            "path": str(image),
+            "widthPx": width,
+            "heightPx": height,
+            "sourceWidthPx": width,
+            "sourceHeightPx": height,
+            "resized": False,
+            "maxLongSidePx": max_long_side,
+            "scale": 1.0,
+        }
+
+    scale = max_long_side / long_side
+    resized_width = max(1, round(width * scale))
+    resized_height = max(1, round(height * scale))
+    out = output_dir / f"{image.stem}.model-input.png"
+    try:
+        from PIL import Image
+    except ImportError as exc:
+        raise CoretapError(
+            "DEPENDENCY_MISSING",
+            "Pillow is required to resize grounding screenshots",
+            stage="grounding-preprocess",
+            category="environment",
+            details={"package": "pillow"},
+        ) from exc
+    with Image.open(image) as source:
+        source.convert("RGB").resize((resized_width, resized_height), Image.Resampling.LANCZOS).save(out, optimize=True)
+    return {
+        "path": str(out),
+        "widthPx": resized_width,
+        "heightPx": resized_height,
+        "sourceWidthPx": width,
+        "sourceHeightPx": height,
+        "resized": True,
+        "maxLongSidePx": max_long_side,
+        "scale": scale,
+    }
+
+
+def remap_grounding_to_source_frame(grounded: dict[str, Any], *, source_width: int, source_height: int) -> dict[str, Any]:
+    point = grounded.get("point")
+    if not isinstance(point, dict):
+        return grounded
+    normalized = point.get("normalized")
+    if not isinstance(normalized, dict):
+        return grounded
+    try:
+        x = float(normalized["x"])
+        y = float(normalized["y"])
+    except (KeyError, TypeError, ValueError):
+        return grounded
+    model_frame_px = point.get("framePx")
+    if isinstance(model_frame_px, dict):
+        point["modelInputFramePx"] = model_frame_px
+    point["framePx"] = {"x": x * source_width, "y": y * source_height}
+    grounded["frame"] = {"widthPx": source_width, "heightPx": source_height}
+    return grounded
 
 
 def model_status(profile: str = PUBLIC_MODEL_PROFILE) -> dict[str, Any]:
@@ -30,10 +99,11 @@ def model_status(profile: str = PUBLIC_MODEL_PROFILE) -> dict[str, Any]:
         return {"ready": False, "profile": profile, "state": "unknown-profile"}
     if profile == INTERNAL_FIXTURE_PROFILE:
         ocr = tesseract_status()
+        ready = bool(ocr["ready"] and ocr["defaultLangAvailable"])
         return {
-            "ready": bool(ocr["ready"]),
+            "ready": ready,
             "profile": profile,
-            "state": "ready" if ocr["ready"] else "missing-ocr",
+            "state": "ready" if ready else "missing-ocr",
             "implementation": "internal-ocr-fixture-grounder",
             "ocr": ocr,
         }

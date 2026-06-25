@@ -10,6 +10,9 @@ from typing import Any
 from coretap.runtime import CoretapError, require_success, run_command, which
 
 
+DEFAULT_OCR_LANG = "chi_sim+eng"
+
+
 @dataclass(frozen=True)
 class OcrToken:
     text: str
@@ -28,16 +31,54 @@ def normalize_text(text: str) -> str:
     return " ".join(unicodedata.normalize("NFKC", text).casefold().split())
 
 
+def parse_tesseract_languages(output: str) -> list[str]:
+    languages: list[str] = []
+    for line in output.splitlines():
+        item = line.strip()
+        if not item or item.startswith("List of available languages"):
+            continue
+        languages.append(item)
+    return languages
+
+
+def required_tesseract_languages(lang: str = DEFAULT_OCR_LANG) -> list[str]:
+    return [part for part in lang.split("+") if part]
+
+
+def missing_tesseract_languages(languages: list[str], lang: str = DEFAULT_OCR_LANG) -> list[str]:
+    available = set(languages)
+    return [part for part in required_tesseract_languages(lang) if part not in available]
+
+
 def tesseract_status() -> dict[str, Any]:
     exe = which("tesseract")
     if not exe:
-        return {"ready": False, "executable": None, "version": None}
+        return {
+            "ready": False,
+            "executable": None,
+            "version": None,
+            "defaultLang": DEFAULT_OCR_LANG,
+            "languages": [],
+            "defaultLangAvailable": False,
+            "missingLanguages": required_tesseract_languages(),
+        }
     done = run_command([exe, "--version"], timeout=5)
     first = done.stdout.splitlines()[0] if done.stdout else ""
-    return {"ready": done.returncode == 0, "executable": exe, "version": first}
+    languages_done = run_command([exe, "--list-langs"], timeout=5)
+    languages = parse_tesseract_languages(languages_done.stdout) if languages_done.returncode == 0 else []
+    missing = missing_tesseract_languages(languages)
+    return {
+        "ready": done.returncode == 0,
+        "executable": exe,
+        "version": first,
+        "defaultLang": DEFAULT_OCR_LANG,
+        "languages": languages,
+        "defaultLangAvailable": done.returncode == 0 and languages_done.returncode == 0 and not missing,
+        "missingLanguages": missing,
+    }
 
 
-def run_tesseract(image: Path, *, lang: str = "eng", psm: int = 11) -> tuple[list[OcrToken], str]:
+def run_tesseract(image: Path, *, lang: str = DEFAULT_OCR_LANG, psm: int = 11) -> tuple[list[OcrToken], str]:
     exe = which("tesseract")
     if not exe:
         raise CoretapError("OCR_UNAVAILABLE", "tesseract not found in PATH", stage="ocr")

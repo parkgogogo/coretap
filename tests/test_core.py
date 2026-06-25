@@ -4,11 +4,13 @@ from pathlib import Path
 
 import pytest
 
-from coretap.backends import DeviceBackend, _check_coredevice_result, _coredevice_screenshot_rotation, parse_usbmux_devices
+from coretap.backends import DeviceBackend, SimulatorBackend, _check_coredevice_result, _coredevice_screenshot_rotation, parse_usbmux_devices
 from coretap.cli import point_to_hid
+from coretap.device_buttons import resolve_button
 from coretap.device_worker import set_default_device_worker_pool
+from coretap.grounding import prepare_grounding_image, remap_grounding_to_source_frame
 from coretap.model_pack import parse_grounding_output
-from coretap.ocr import find_exact_text_candidates, find_text, parse_tsv
+from coretap.ocr import DEFAULT_OCR_LANG, find_exact_text_candidates, find_text, missing_tesseract_languages, parse_tesseract_languages, parse_tsv
 from coretap.runtime import Completed, CoretapError, png_size
 
 
@@ -62,6 +64,41 @@ def test_parse_grounding_output_rejects_out_of_bounds() -> None:
     assert result["reason"] == "coordinate outside model-1000 space"
 
 
+def test_prepare_grounding_image_downscales_to_default_long_side(tmp_path: Path) -> None:
+    from PIL import Image
+
+    source = tmp_path / "source.png"
+    Image.new("RGB", (1260, 2736), color=(255, 255, 255)).save(source)
+
+    result = prepare_grounding_image(source, output_dir=tmp_path)
+
+    assert result["resized"] is True
+    assert result["widthPx"] == 630
+    assert result["heightPx"] == 1368
+    assert result["sourceWidthPx"] == 1260
+    assert result["sourceHeightPx"] == 2736
+    assert Path(result["path"]).exists()
+    assert png_size(Path(result["path"])) == (630, 1368)
+
+
+def test_remap_grounding_to_source_frame_preserves_normalized_coordinates() -> None:
+    grounded = {
+        "status": "found",
+        "point": {
+            "framePx": {"x": 534.24, "y": 664.848},
+            "normalized": {"x": 0.848, "y": 0.486},
+        },
+        "frame": {"widthPx": 630, "heightPx": 1368},
+    }
+
+    result = remap_grounding_to_source_frame(grounded, source_width=1260, source_height=2736)
+
+    assert result["point"]["modelInputFramePx"] == {"x": 534.24, "y": 664.848}
+    assert result["point"]["framePx"] == {"x": 1068.48, "y": 1329.696}
+    assert result["point"]["normalized"] == {"x": 0.848, "y": 0.486}
+    assert result["frame"] == {"widthPx": 1260, "heightPx": 2736}
+
+
 def test_parse_tsv_and_find_text() -> None:
     tsv = """level\tpage_num\tblock_num\tpar_num\tline_num\tword_num\tleft\ttop\twidth\theight\tconf\ttext
 5\t1\t1\t1\t1\t1\t10\t20\t30\t12\t95\tGeneral
@@ -75,6 +112,20 @@ def test_parse_tsv_and_find_text() -> None:
     assert match is not None
     assert match["matchedText"] == "General"
     assert match["matchedBoxPx"] == {"x": 10, "y": 20, "width": 30, "height": 12}
+
+
+def test_default_ocr_language_requires_chinese_and_english() -> None:
+    languages = parse_tesseract_languages(
+        """List of available languages in "/opt/homebrew/share/tessdata/" (3):
+eng
+chi_sim
+osd
+"""
+    )
+
+    assert DEFAULT_OCR_LANG == "chi_sim+eng"
+    assert missing_tesseract_languages(languages) == []
+    assert missing_tesseract_languages(["eng"]) == ["chi_sim"]
 
 
 def test_find_exact_text_candidates_requires_exact_normalized_match() -> None:
@@ -157,6 +208,34 @@ def test_coredevice_default_tunnel_mode_uses_userspace() -> None:
     assert backend.coredevice_env("device-udid")["PYMOBILEDEVICE3_UDID"] == "device-udid"
 
 
+def test_coredevice_button_alias_resolves_to_canonical_lock() -> None:
+    button = resolve_button("power")
+
+    assert button is not None
+    assert button.name == "lock"
+    assert button.usage_page == 0x0C
+    assert button.usage_code == 0x30
+    assert button.hold_ms == 500
+
+
+def test_device_backend_press_button_dry_run_uses_resolved_metadata() -> None:
+    result = DeviceBackend().press_button("device-udid", "power", dry_run=True)
+
+    assert result["button"] == "lock"
+    assert result["requestedButton"] == "power"
+    assert result["state"] == "press"
+    assert result["holdMs"] == 500
+    assert result["hidButton"] == {"usagePage": 0x0C, "usageCode": 0x30}
+    assert result["attempted"] is False
+
+
+def test_simulator_backend_rejects_coredevice_press() -> None:
+    with pytest.raises(CoretapError) as exc:
+        SimulatorBackend().press_button("booted", "home")
+
+    assert exc.value.code == "SIMULATOR_PRESS_UNSUPPORTED"
+
+
 def test_coredevice_tunneld_mode_omits_userspace() -> None:
     backend = DeviceBackend(coredevice_tunnel_mode="tunneld")
 
@@ -167,6 +246,7 @@ def test_coredevice_tunneld_mode_omits_userspace() -> None:
 def test_coredevice_screenshot_rotation_matches_display_orientation() -> None:
     assert _coredevice_screenshot_rotation((2736, 1260), (1260, 2736), "landscapeRight") == 270
     assert _coredevice_screenshot_rotation((2736, 1260), (1260, 2736), "landscapeLeft") == 90
+    assert _coredevice_screenshot_rotation((1260, 2736), (1260, 2736), "portraitUpsideDown") == 180
     assert _coredevice_screenshot_rotation((1260, 2736), (1260, 2736), "portrait") is None
 
 
@@ -194,6 +274,38 @@ def test_device_backend_uses_registered_persistent_worker_for_userspace_tap() ->
 
     assert pool.calls == [("device-udid", 0.25, 0.5, 100, 200)]
     assert result == {"workerKind": "fake-persistent-worker", "dispatchStatus": "sent"}
+
+
+def test_device_backend_uses_registered_persistent_worker_for_button_press() -> None:
+    class FakePool:
+        def __init__(self) -> None:
+            self.calls = []
+
+        def press_button_userspace(
+            self,
+            device: str,
+            *,
+            button: str,
+            state: str,
+            usage_page: int,
+            usage_code: int,
+            hold_ms: int,
+        ) -> dict:
+            self.calls.append((device, button, state, usage_page, usage_code, hold_ms))
+            return {"workerKind": "fake-persistent-worker", "dispatchStatus": "sent"}
+
+    pool = FakePool()
+    set_default_device_worker_pool(pool)  # type: ignore[arg-type]
+    try:
+        result = DeviceBackend().press_button("device-udid", "home")
+    finally:
+        set_default_device_worker_pool(None)
+
+    assert pool.calls == [("device-udid", "home", "press", 0x0C, 0x40, 50)]
+    assert result["workerKind"] == "fake-persistent-worker"
+    assert result["dispatchStatus"] == "sent"
+    assert result["attempted"] is True
+    assert result["dryRun"] is False
 
 
 def test_device_backend_uses_registered_persistent_worker_for_screenshot(tmp_path: Path) -> None:

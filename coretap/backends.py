@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from coretap.device_buttons import BUTTON_STATES, resolve_button
 from coretap.runtime import (
     Completed,
     CoretapError,
@@ -148,6 +149,45 @@ class SimulatorBackend:
             "idbScreen": {"width": width, "height": height},
             "durationMs": done.duration_ms,
         }
+
+    def press_button(
+        self,
+        device: str,
+        button: str,
+        *,
+        state: str = "press",
+        hold_ms: int | None = None,
+        dry_run: bool = False,
+    ) -> dict[str, Any]:
+        raise CoretapError(
+            "SIMULATOR_PRESS_UNSUPPORTED",
+            "CoreDevice hardware button events are only supported for real devices",
+            category="usage",
+            stage="press",
+            details={"backend": self.name, "button": button, "state": state},
+        )
+
+    def drag_normalized(
+        self,
+        device: str,
+        start_x: float,
+        start_y: float,
+        end_x: float,
+        end_y: float,
+        *,
+        dry_run: bool,
+        start_hid_u16: dict[str, int] | None = None,
+        end_hid_u16: dict[str, int] | None = None,
+        steps: int = 30,
+        duration_ms: int = 600,
+    ) -> dict[str, Any]:
+        raise CoretapError(
+            "SIMULATOR_DRAG_UNSUPPORTED",
+            "CoreDevice drag events are only supported for real devices",
+            category="usage",
+            stage="drag",
+            details={"backend": self.name},
+        )
 
     def _idb_base_command(self) -> list[str]:
         companion = self._idb_companion_path()
@@ -504,6 +544,179 @@ class DeviceBackend:
             "durationMs": done.duration_ms,
         }
 
+    def press_button(
+        self,
+        device: str,
+        button: str,
+        *,
+        state: str = "press",
+        hold_ms: int | None = None,
+        dry_run: bool = False,
+    ) -> dict[str, Any]:
+        spec = resolve_button(button)
+        if spec is None:
+            raise CoretapError(
+                "INVALID_ARGUMENT",
+                f"Unsupported CoreDevice button: {button}",
+                category="usage",
+                stage="press",
+            )
+        if state not in BUTTON_STATES:
+            raise CoretapError(
+                "INVALID_ARGUMENT",
+                f"Unsupported CoreDevice button state: {state}",
+                category="usage",
+                stage="press",
+                details={"validStates": list(BUTTON_STATES)},
+            )
+        resolved_hold_ms = spec.hold_ms if hold_ms is None else hold_ms
+        base = {
+            "button": spec.name,
+            "requestedButton": button,
+            "state": state,
+            "hidButton": {"usagePage": spec.usage_page, "usageCode": spec.usage_code},
+            "holdMs": resolved_hold_ms if state == "press" else 0,
+            "coredeviceTunnelMode": self.coredevice_tunnel_mode,
+        }
+        if dry_run:
+            return {
+                **base,
+                "attempted": False,
+                "dryRun": True,
+                "reason": "dry-run requested",
+            }
+        if self.coredevice_tunnel_mode == "userspace":
+            from coretap.device_worker import get_default_device_worker_pool
+
+            pool = get_default_device_worker_pool()
+            if pool is not None:
+                result = pool.press_button_userspace(
+                    device,
+                    button=spec.name,
+                    state=state,
+                    usage_page=spec.usage_page,
+                    usage_code=spec.usage_code,
+                    hold_ms=resolved_hold_ms,
+                )
+                return {**base, **result, "attempted": True, "dryRun": False}
+        done = _check_coredevice_result(
+            run_command(
+                [
+                    "pymobiledevice3",
+                    "developer",
+                    "core-device",
+                    "hid",
+                    "button",
+                    *self.coredevice_device_options(device),
+                    spec.name,
+                    state,
+                ],
+                env=self.coredevice_env(device),
+                timeout=max(10, int((resolved_hold_ms / 1000) + 5)),
+            ),
+            code="COREDEVICE_PRESS_FAILED",
+            stage="press",
+        )
+        require_success(done, code="COREDEVICE_PRESS_FAILED", stage="press")
+        return {
+            **base,
+            "attempted": True,
+            "dryRun": False,
+            "dispatchStatus": "sent",
+            "confirmationStatus": "not_requested",
+            "completionStatus": "exited",
+            "durationMs": done.duration_ms,
+        }
+
+    def drag_normalized(
+        self,
+        device: str,
+        start_x: float,
+        start_y: float,
+        end_x: float,
+        end_y: float,
+        *,
+        dry_run: bool,
+        start_hid_u16: dict[str, int] | None = None,
+        end_hid_u16: dict[str, int] | None = None,
+        steps: int = 30,
+        duration_ms: int = 600,
+    ) -> dict[str, Any]:
+        start_hx = int(round(start_x * 65535)) if start_hid_u16 is None else start_hid_u16["x"]
+        start_hy = int(round(start_y * 65535)) if start_hid_u16 is None else start_hid_u16["y"]
+        end_hx = int(round(end_x * 65535)) if end_hid_u16 is None else end_hid_u16["x"]
+        end_hy = int(round(end_y * 65535)) if end_hid_u16 is None else end_hid_u16["y"]
+        if steps < 1:
+            raise CoretapError("INVALID_ARGUMENT", "drag --steps must be >= 1", category="usage", stage="drag")
+        if duration_ms < 0:
+            raise CoretapError("INVALID_ARGUMENT", "drag --duration-ms must be >= 0", category="usage", stage="drag")
+        base = {
+            "from": {"normalized": {"x": start_x, "y": start_y}, "hidU16": {"x": start_hx, "y": start_hy}},
+            "to": {"normalized": {"x": end_x, "y": end_y}, "hidU16": {"x": end_hx, "y": end_hy}},
+            "steps": steps,
+            "requestedDurationMs": duration_ms,
+            "coredeviceTunnelMode": self.coredevice_tunnel_mode,
+        }
+        if dry_run:
+            return {
+                **base,
+                "attempted": False,
+                "dryRun": True,
+                "reason": "dry-run requested",
+            }
+        if self.coredevice_tunnel_mode == "userspace":
+            from coretap.device_worker import get_default_device_worker_pool
+
+            pool = get_default_device_worker_pool()
+            if pool is not None:
+                return pool.drag_userspace(
+                    device,
+                    start_x=start_x,
+                    start_y=start_y,
+                    end_x=end_x,
+                    end_y=end_y,
+                    start_hx=start_hx,
+                    start_hy=start_hy,
+                    end_hx=end_hx,
+                    end_hy=end_hy,
+                    steps=steps,
+                    duration_ms=duration_ms,
+                )
+        done = _check_coredevice_result(
+            run_command(
+                [
+                    "pymobiledevice3",
+                    "developer",
+                    "core-device",
+                    "universal-hid-service",
+                    "drag",
+                    *self.coredevice_device_options(device),
+                    str(start_hx),
+                    str(start_hy),
+                    str(end_hx),
+                    str(end_hy),
+                    "--steps",
+                    str(steps),
+                    "--duration",
+                    f"{duration_ms / 1000:.3f}",
+                ],
+                env=self.coredevice_env(device),
+                timeout=max(10, int((duration_ms / 1000) + 5)),
+            ),
+            code="COREDEVICE_DRAG_FAILED",
+            stage="drag",
+        )
+        require_success(done, code="COREDEVICE_DRAG_FAILED", stage="drag")
+        return {
+            **base,
+            "attempted": True,
+            "dryRun": False,
+            "dispatchStatus": "sent",
+            "confirmationStatus": "not_requested",
+            "completionStatus": "exited",
+            "durationMs": done.duration_ms,
+        }
+
 
 def parse_usbmux_devices(stdout: str) -> list[Device]:
     try:
@@ -604,14 +817,14 @@ def _coredevice_screenshot_rotation(
     display_size: tuple[int, int],
     orientation: str | None,
 ) -> int | None:
+    if orientation == "portraitUpsideDown":
+        return 180
     if image_size == display_size:
         return None
     if image_size != (display_size[1], display_size[0]):
         return None
     if orientation == "landscapeLeft":
         return 90
-    if orientation == "portraitUpsideDown":
-        return 180
     return 270
 
 

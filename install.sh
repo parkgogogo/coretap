@@ -126,6 +126,27 @@ ensure_brew_package() {
   brew install "$package"
 }
 
+ensure_brew_formula() {
+  formula="$1"
+  if [ "$NO_BREW_INSTALL" -eq 1 ]; then
+    return 1
+  fi
+  if ! have brew; then
+    return 1
+  fi
+  if brew list --formula "$formula" >/dev/null 2>&1; then
+    return 0
+  fi
+  log "Installing $formula with Homebrew"
+  brew install "$formula"
+}
+
+tesseract_has_lang() {
+  lang="$1"
+  have tesseract || return 1
+  tesseract --list-langs 2>/dev/null | awk 'NR > 1 { print $0 }' | grep -qx "$lang"
+}
+
 ensure_uv() {
   if have uv; then
     return 0
@@ -178,14 +199,22 @@ install_ocr_tools() {
 
   if have tesseract; then
     log "Tesseract already installed"
+  elif ! ensure_brew_package tesseract tesseract; then
+    warn "Tesseract is not installed. Text assertions will fail until you install it, e.g. brew install tesseract tesseract-lang"
     return 0
   fi
 
-  if ensure_brew_package tesseract tesseract; then
+  if tesseract_has_lang eng && tesseract_has_lang chi_sim; then
+    log "Tesseract English and Simplified Chinese language data available"
     return 0
   fi
 
-  warn "Tesseract is not installed. Text assertions will fail until you install it, e.g. brew install tesseract"
+  if ensure_brew_formula tesseract-lang && tesseract_has_lang eng && tesseract_has_lang chi_sim; then
+    log "Tesseract language data installed"
+    return 0
+  fi
+
+  warn "Tesseract default OCR language data is missing. Install it with: brew install tesseract-lang"
 }
 
 install_idb_companion() {

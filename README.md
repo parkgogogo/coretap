@@ -11,7 +11,7 @@ This MVP intentionally implements the product skeleton first:
 - Built-in MAI-UI 2B MLX 6-bit grounding profile:
   `builtin:mai-ui-2b-mlx-6bit@1`.
 - Fixed model pack install/check/warm/run/status/stop/cache/gc commands.
-- OCR capability through the local `tesseract` CLI for text assertions only.
+- OCR capability through the local `tesseract` CLI for Chinese and English text assertions.
 - JSON/NDJSON-friendly command envelopes and artifact capture.
 - A thin async Node test client that calls the CLI and consumes JSON.
 
@@ -129,10 +129,40 @@ matched text bounding box center, and does not invoke the VLM grounding model.
 Use `tap target` for semantic descriptions, icons, relative position, or cases
 where exact OCR text is absent or ambiguous.
 
+For `locate` and `tap target`, Coretap keeps the full source screenshot as an
+artifact but feeds the VLM a downscaled model input with long side 1368 px. The
+model's normalized point is mapped back to the original screenshot before HID
+coordinates are computed.
+
+CoreDevice hardware button events are exposed as direct UI automation
+primitives:
+
+```bash
+coretap --format json --backend device --device "$UDID" press home
+coretap --format json --backend device --device "$UDID" press lock
+coretap --format json --backend device --device "$UDID" press volume-up
+```
+
+Supported buttons are `home`, `lock`/`power`, `volume-up`, `volume-down`,
+`mute`, and `siri`. The default state is `press`; `--state down`, `--state up`,
+and `--state canceled` are available for lower-level test control.
+
+Drag and scroll use CoreDevice's main touchscreen contact path:
+
+```bash
+coretap --format json --backend device --device "$UDID" drag --from 0.5,0.75 --to 0.5,0.25
+coretap --format json --backend device --device "$UDID" scroll down
+coretap --format json --backend device --device "$UDID" scroll up
+```
+
+`drag` is the low-level primitive and accepts `--space normalized`, `px`, or
+`hid`. `scroll down` is a convenience wrapper around a finger drag from lower
+screen to upper screen, which moves the viewport downward in normal iOS lists.
+
 By default, `coretap` runs as a thin client: non-daemon commands auto-start
 `coretapd` and execute inside that long-running process. This keeps the MLX
 grounding model resident after the first semantic request and gives real-device
-tap commands a persistent CoreDevice userspace HID worker.
+tap/press/drag/scroll commands a persistent CoreDevice userspace HID worker.
 
 ```bash
 coretap --format json --backend device --device "$UDID" tap target --target "the ChatGPT app icon"
@@ -143,11 +173,12 @@ coretap daemon stop
 Use `--daemon off` for one-shot local debugging, or `--daemon on` to require an
 already-running daemon without auto-starting it.
 
-`coretap assert text` and `coretap wait text` currently use the local
-`tesseract` CLI. Install it separately, for example:
+`coretap tap text`, `coretap assert text`, and `coretap wait text` use the
+local `tesseract` CLI. The default OCR language is `chi_sim+eng`, so Chinese
+and English visible text work without passing `--lang`:
 
 ```bash
-brew install tesseract
+brew install tesseract tesseract-lang
 ```
 
 If Xcode is installed but `xcode-select` points at CommandLineTools, set:

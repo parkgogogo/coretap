@@ -7,6 +7,7 @@ import sys
 import pytest
 
 from coretap.daemon import handle_argv
+from coretap.ocr import DEFAULT_OCR_LANG
 from coretap.runtime import CoretapError
 
 
@@ -42,6 +43,17 @@ def test_internal_fixture_profile_is_not_default() -> None:
 
     assert data["ok"] is True
     assert data["result"]["implementation"] == "internal-ocr-fixture-grounder"
+
+
+def test_press_button_dry_run_json() -> None:
+    data = run_coretap("--backend", "device", "--device", "device-udid", "press", "power", "--dry-run")
+
+    assert data["ok"] is True
+    assert data["result"]["button"] == "lock"
+    assert data["result"]["requestedButton"] == "power"
+    assert data["result"]["state"] == "press"
+    assert data["result"]["attempted"] is False
+    assert data["result"]["dryRun"] is True
 
 
 def test_daemon_handle_argv_reuses_cli_dispatch(tmp_path) -> None:
@@ -128,3 +140,18 @@ def test_daemon_on_requires_existing_daemon(monkeypatch, capsys) -> None:
     data = json.loads(capsys.readouterr().out)
     assert data["ok"] is False
     assert data["error"]["code"] == "DAEMON_UNAVAILABLE"
+
+
+def test_text_ocr_commands_default_to_chinese_and_english() -> None:
+    from coretap.cli import build_parser, normalize_global_args
+
+    parser = build_parser()
+
+    tap = parser.parse_args(normalize_global_args(["tap", "text", "搜索", "--dry-run"]))
+    assert tap.lang == DEFAULT_OCR_LANG
+
+    assert_text = parser.parse_args(normalize_global_args(["assert", "text", "--text", "搜索"]))
+    assert assert_text.lang == DEFAULT_OCR_LANG
+
+    wait_text = parser.parse_args(normalize_global_args(["wait", "text", "--text", "搜索"]))
+    assert wait_text.lang == DEFAULT_OCR_LANG
