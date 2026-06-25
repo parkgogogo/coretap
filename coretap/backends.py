@@ -221,11 +221,15 @@ class DeviceBackend:
         return resolved
 
     def coredevice_device_options(self, device: str) -> list[str]:
-        options: list[str] = []
         if self.coredevice_tunnel_mode == "userspace":
-            options.append("--userspace")
-        options.extend(["--tunnel", device])
-        return options
+            return ["--userspace"]
+        return ["--tunnel", device]
+
+    def coredevice_env(self, device: str) -> dict[str, str]:
+        env = os.environ.copy()
+        if self.coredevice_tunnel_mode == "userspace":
+            env["PYMOBILEDEVICE3_UDID"] = device
+        return env
 
     def discover(self) -> list[Device]:
         done = run_command(["pymobiledevice3", "usbmux", "list"], timeout=10)
@@ -251,6 +255,7 @@ class DeviceBackend:
                     *self.coredevice_device_options(device),
                     str(out),
                 ],
+                env=self.coredevice_env(device),
                 timeout=20,
             ),
             code="COREDEVICE_SCREENSHOT_FAILED",
@@ -264,8 +269,77 @@ class DeviceBackend:
                 stage="screenshot",
                 details={"path": str(out), "stdout": done.stdout, "stderr": done.stderr},
             )
+        self._normalize_screenshot_orientation(device, out)
         width, height = png_size(out)
         return Frame(f"frame_{out.stem}", out, width, height, self.name, device)
+
+    def display_info(self, device: str) -> dict[str, Any]:
+        done = _check_coredevice_result(
+            run_command(
+                [
+                    "pymobiledevice3",
+                    "developer",
+                    "core-device",
+                    "get-display-info",
+                    *self.coredevice_device_options(device),
+                ],
+                env=self.coredevice_env(device),
+                timeout=20,
+                max_output=10_000_000,
+            ),
+            code="COREDEVICE_DISPLAY_INFO_FAILED",
+            stage="display-info",
+        )
+        require_success(done, code="COREDEVICE_DISPLAY_INFO_FAILED", stage="display-info")
+        try:
+            data = json.loads(done.stdout)
+        except json.JSONDecodeError as exc:
+            raise CoretapError(
+                "COREDEVICE_DISPLAY_INFO_INVALID",
+                "Could not parse CoreDevice display info JSON",
+                stage="display-info",
+                details={"stdout": done.stdout[:1000], "stderr": done.stderr[:1000]},
+            ) from exc
+        if not isinstance(data, dict):
+            raise CoretapError(
+                "COREDEVICE_DISPLAY_INFO_INVALID",
+                "CoreDevice display info was not a JSON object",
+                stage="display-info",
+                details={"stdout": done.stdout[:1000]},
+            )
+        return data
+
+    def _normalize_screenshot_orientation(self, device: str, out: Path) -> None:
+        image_size = png_size(out)
+        info = self.display_info(device)
+        display_size = _primary_display_size(info)
+        orientation = _device_non_flat_orientation(info)
+        rotation = _coredevice_screenshot_rotation(image_size, display_size, orientation)
+        if rotation is None:
+            return
+
+        tmp = out.with_name(f"{out.stem}.normalized{out.suffix}")
+        require_success(
+            run_command(["sips", "-r", str(rotation), str(out), "--out", str(tmp)], timeout=20),
+            code="SCREENSHOT_ORIENTATION_NORMALIZE_FAILED",
+            stage="screenshot",
+        )
+        tmp.replace(out)
+        normalized_size = png_size(out)
+        if normalized_size != display_size:
+            raise CoretapError(
+                "SCREENSHOT_ORIENTATION_NORMALIZE_FAILED",
+                "Normalized screenshot size did not match the primary display size",
+                stage="screenshot",
+                details={
+                    "path": str(out),
+                    "imageSize": list(image_size),
+                    "displaySize": list(display_size),
+                    "normalizedSize": list(normalized_size),
+                    "rotation": rotation,
+                    "orientation": orientation,
+                },
+            )
 
     def tap_hid(self, device: str, x: int, y: int, *, dry_run: bool) -> dict[str, Any]:
         return self.tap_normalized(device, x / 65535, y / 65535, dry_run=dry_run, hid_u16={"x": x, "y": y})
@@ -289,30 +363,52 @@ class DeviceBackend:
                 "hidU16": {"x": hx, "y": hy},
                 "coredeviceTunnelMode": self.coredevice_tunnel_mode,
             }
-        done = _check_coredevice_result(
-            run_command(
-                [
-                    "pymobiledevice3",
-                    "developer",
-                    "core-device",
-                    "universal-hid-service",
-                    "tap",
-                    *self.coredevice_device_options(device),
-                    str(hx),
-                    str(hy),
-                ],
-                timeout=10,
-            ),
-            code="COREDEVICE_TAP_FAILED",
-            stage="tap",
-        )
-        require_success(done, code="COREDEVICE_TAP_FAILED", stage="tap")
+        timeout = 20
+        try:
+            done = _check_coredevice_result(
+                run_command(
+                    [
+                        "pymobiledevice3",
+                        "developer",
+                        "core-device",
+                        "universal-hid-service",
+                        "tap",
+                        *self.coredevice_device_options(device),
+                        str(hx),
+                        str(hy),
+                    ],
+                    env=self.coredevice_env(device),
+                    timeout=timeout,
+                ),
+                code="COREDEVICE_TAP_FAILED",
+                stage="tap",
+            )
+            require_success(done, code="COREDEVICE_TAP_FAILED", stage="tap")
+        except CoretapError as exc:
+            if exc.code != "COMMAND_TIMEOUT" or self.coredevice_tunnel_mode != "userspace":
+                raise
+            return {
+                "attempted": True,
+                "dryRun": False,
+                "normalized": {"x": x, "y": y},
+                "hidU16": {"x": hx, "y": hy},
+                "coredeviceTunnelMode": self.coredevice_tunnel_mode,
+                "completionStatus": "timeout",
+                "deliveryStatus": "unknown",
+                "timeoutMs": timeout * 1000,
+                "reason": (
+                    "pymobiledevice3 userspace HID tap can hang while closing the media stream; "
+                    "continue with a screenshot or assertion to confirm the UI state"
+                ),
+            }
         return {
             "attempted": True,
             "dryRun": False,
             "normalized": {"x": x, "y": y},
             "hidU16": {"x": hx, "y": hy},
             "coredeviceTunnelMode": self.coredevice_tunnel_mode,
+            "completionStatus": "exited",
+            "deliveryStatus": "sent",
             "durationMs": done.duration_ms,
         }
 
@@ -358,6 +454,73 @@ def parse_usbmux_devices(stdout: str) -> list[Device]:
             )
         )
     return devices
+
+
+def _primary_display_size(display_info: dict[str, Any]) -> tuple[int, int]:
+    displays = display_info.get("displays")
+    if not isinstance(displays, list):
+        raise CoretapError(
+            "COREDEVICE_DISPLAY_INFO_INVALID",
+            "CoreDevice display info did not include displays",
+            stage="display-info",
+            details={"displayInfo": display_info},
+        )
+    primary = next((d for d in displays if isinstance(d, dict) and d.get("primary") is True), None)
+    if primary is None:
+        primary = next((d for d in displays if isinstance(d, dict) and d.get("external") is False), None)
+    if primary is None and displays and isinstance(displays[0], dict):
+        primary = displays[0]
+    mode = primary.get("currentMode") if isinstance(primary, dict) else None
+    size = mode.get("size") if isinstance(mode, dict) else None
+    if not isinstance(size, list | tuple) or len(size) != 2:
+        raise CoretapError(
+            "COREDEVICE_DISPLAY_INFO_INVALID",
+            "CoreDevice primary display did not include currentMode.size",
+            stage="display-info",
+            details={"displayInfo": display_info},
+        )
+    try:
+        width = int(round(float(size[0])))
+        height = int(round(float(size[1])))
+    except (TypeError, ValueError) as exc:
+        raise CoretapError(
+            "COREDEVICE_DISPLAY_INFO_INVALID",
+            "CoreDevice primary display size was not numeric",
+            stage="display-info",
+            details={"size": size},
+        ) from exc
+    if width <= 0 or height <= 0:
+        raise CoretapError(
+            "COREDEVICE_DISPLAY_INFO_INVALID",
+            "CoreDevice primary display size was empty",
+            stage="display-info",
+            details={"size": size},
+        )
+    return width, height
+
+
+def _device_non_flat_orientation(display_info: dict[str, Any]) -> str | None:
+    orientation = display_info.get("orientation")
+    if not isinstance(orientation, dict):
+        return None
+    value = orientation.get("currentDeviceNonFlatOrientation") or orientation.get("currentDeviceOrientation")
+    return str(value) if value is not None else None
+
+
+def _coredevice_screenshot_rotation(
+    image_size: tuple[int, int],
+    display_size: tuple[int, int],
+    orientation: str | None,
+) -> int | None:
+    if image_size == display_size:
+        return None
+    if image_size != (display_size[1], display_size[0]):
+        return None
+    if orientation == "landscapeLeft":
+        return 90
+    if orientation == "portraitUpsideDown":
+        return 180
+    return 270
 
 
 def _parse_simple_usbmux_lines(stdout: str) -> list[Device]:

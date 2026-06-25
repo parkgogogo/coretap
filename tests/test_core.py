@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from coretap.backends import DeviceBackend, _check_coredevice_result, parse_usbmux_devices
+from coretap.backends import DeviceBackend, _check_coredevice_result, _coredevice_screenshot_rotation, parse_usbmux_devices
 from coretap.cli import point_to_hid
 from coretap.model_pack import parse_grounding_output
 from coretap.ocr import find_text, parse_tsv
@@ -113,13 +113,21 @@ def test_coredevice_default_tunnel_mode_uses_userspace() -> None:
     backend = DeviceBackend()
 
     assert backend.coredevice_tunnel_mode == "userspace"
-    assert backend.coredevice_device_options("device-udid") == ["--userspace", "--tunnel", "device-udid"]
+    assert backend.coredevice_device_options("device-udid") == ["--userspace"]
+    assert backend.coredevice_env("device-udid")["PYMOBILEDEVICE3_UDID"] == "device-udid"
 
 
 def test_coredevice_tunneld_mode_omits_userspace() -> None:
     backend = DeviceBackend(coredevice_tunnel_mode="tunneld")
 
     assert backend.coredevice_device_options("device-udid") == ["--tunnel", "device-udid"]
+    assert backend.coredevice_env("device-udid").get("PYMOBILEDEVICE3_UDID") is None
+
+
+def test_coredevice_screenshot_rotation_matches_display_orientation() -> None:
+    assert _coredevice_screenshot_rotation((2736, 1260), (1260, 2736), "landscapeRight") == 270
+    assert _coredevice_screenshot_rotation((2736, 1260), (1260, 2736), "landscapeLeft") == 90
+    assert _coredevice_screenshot_rotation((1260, 2736), (1260, 2736), "portrait") is None
 
 
 def test_png_size(tmp_path: Path) -> None:

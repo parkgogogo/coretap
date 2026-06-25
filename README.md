@@ -53,12 +53,22 @@ Real-device automation uses `pymobiledevice3 developer core-device` and does
 not use WDA. On current `pymobiledevice3`, Coretap defaults to the CoreDevice
 userspace tunnel path:
 
-```text
---userspace --tunnel <udid>
+```bash
+PYMOBILEDEVICE3_UDID="$UDID" pymobiledevice3 developer core-device ... --userspace
 ```
 
 This is the default because it does not require root/admin privileges, which is
 important for agent-driven CLI runs.
+
+CoreDevice screenshots are normalized to the primary display size reported by
+`get-display-info` before grounding/OCR/tap coordinates are used. This keeps the
+frame pixel coordinates aligned with the HID coordinate space even when the raw
+CoreDevice screenshot service returns a rotated PNG.
+
+On userspace CoreDevice HID, `pymobiledevice3` can dispatch the touch but hang
+while closing its media stream. Coretap treats that as an attempted tap with
+`completionStatus: "timeout"` and `deliveryStatus: "unknown"` so test flows can
+continue to the next screenshot or assertion for confirmation.
 
 Prerequisites:
 
