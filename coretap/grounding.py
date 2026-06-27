@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import shutil
 from pathlib import Path
 from typing import Any
 
@@ -25,17 +26,21 @@ ALL_GROUNDING_PROFILES = {**GROUNDING_PROFILES, **internal_profiles()}
 DEFAULT_GROUNDING_IMAGE_LONG_SIDE = 1368
 
 
-def prepare_grounding_image(
+def prepare_image_long_side(
     image: Path,
     *,
-    output_dir: Path,
+    output_path: Path,
     max_long_side: int = DEFAULT_GROUNDING_IMAGE_LONG_SIDE,
+    stage: str = "image-preprocess",
 ) -> dict[str, Any]:
     width, height = _image_size(image)
     long_side = max(width, height)
     if max_long_side <= 0 or long_side <= max_long_side:
+        if output_path != image:
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(image, output_path)
         return {
-            "path": str(image),
+            "path": str(output_path if output_path != image else image),
             "widthPx": width,
             "heightPx": height,
             "sourceWidthPx": width,
@@ -48,21 +53,21 @@ def prepare_grounding_image(
     scale = max_long_side / long_side
     resized_width = max(1, round(width * scale))
     resized_height = max(1, round(height * scale))
-    out = output_dir / f"{image.stem}.model-input.png"
     try:
         from PIL import Image
     except ImportError as exc:
         raise CoretapError(
             "DEPENDENCY_MISSING",
-            "Pillow is required to resize grounding screenshots",
-            stage="grounding-preprocess",
+            "Pillow is required to resize screenshots",
+            stage=stage,
             category="environment",
             details={"package": "pillow"},
         ) from exc
+    output_path.parent.mkdir(parents=True, exist_ok=True)
     with Image.open(image) as source:
-        source.convert("RGB").resize((resized_width, resized_height), Image.Resampling.LANCZOS).save(out, optimize=True)
+        source.convert("RGB").resize((resized_width, resized_height), Image.Resampling.LANCZOS).save(output_path, optimize=True)
     return {
-        "path": str(out),
+        "path": str(output_path),
         "widthPx": resized_width,
         "heightPx": resized_height,
         "sourceWidthPx": width,
@@ -71,6 +76,20 @@ def prepare_grounding_image(
         "maxLongSidePx": max_long_side,
         "scale": scale,
     }
+
+
+def prepare_grounding_image(
+    image: Path,
+    *,
+    output_dir: Path,
+    max_long_side: int = DEFAULT_GROUNDING_IMAGE_LONG_SIDE,
+) -> dict[str, Any]:
+    return prepare_image_long_side(
+        image,
+        output_path=output_dir / f"{image.stem}.model-input.png",
+        max_long_side=max_long_side,
+        stage="grounding-preprocess",
+    )
 
 
 def remap_grounding_to_source_frame(grounded: dict[str, Any], *, source_width: int, source_height: int) -> dict[str, Any]:
@@ -168,8 +187,8 @@ def _image_size(image: Path) -> tuple[int, int]:
     return png_size(image)
 
 
-def model_install(profile: str = PUBLIC_MODEL_PROFILE, *, force: bool = False) -> dict[str, Any]:
-    return install_model(profile, force=force)
+def model_install(profile: str = PUBLIC_MODEL_PROFILE, *, force: bool = False, dry_run: bool = False) -> dict[str, Any]:
+    return install_model(profile, force=force, dry_run=dry_run)
 
 
 def model_check(profile: str = PUBLIC_MODEL_PROFILE, *, deep: bool = False) -> dict[str, Any]:

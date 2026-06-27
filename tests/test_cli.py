@@ -7,6 +7,7 @@ import sys
 import pytest
 
 from coretap.daemon import handle_argv
+from coretap.grounding import DEFAULT_GROUNDING_IMAGE_LONG_SIDE
 from coretap.ocr import DEFAULT_OCR_LANG
 from coretap.runtime import CoretapError
 
@@ -54,6 +55,40 @@ def test_press_button_dry_run_json() -> None:
     assert data["result"]["state"] == "press"
     assert data["result"]["attempted"] is False
     assert data["result"]["dryRun"] is True
+
+
+def test_type_text_dry_run_json() -> None:
+    data = run_coretap("--backend", "device", "--device", "device-udid", "type", "hello@example.com", "--dry-run")
+
+    assert data["ok"] is True
+    assert data["result"]["attempted"] is False
+    assert data["result"]["dryRun"] is True
+    assert data["result"]["text"]["length"] == len("hello@example.com")
+    assert data["result"]["inputMethod"] == "coredevice-pasteboard-edit-menu"
+
+
+def test_type_text_supports_non_ascii_dry_run_json() -> None:
+    data = run_coretap("--backend", "device", "--device", "device-udid", "type", "搜索", "--dry-run")
+
+    assert data["ok"] is True
+    assert data["result"]["attempted"] is False
+    assert data["result"]["text"]["asciiOnly"] is False
+    assert data["result"]["inputMethod"] == "coredevice-pasteboard-edit-menu"
+
+
+def test_type_text_dry_run_accepts_paste_anchor_json() -> None:
+    data = run_coretap("--backend", "device", "--device", "device-udid", "type", "hello", "--paste-at", "0.2,0.925", "--dry-run")
+
+    assert data["ok"] is True
+    assert data["result"]["pasteAt"] == {"x": 0.2, "y": 0.925}
+
+
+def test_model_install_dry_run_json() -> None:
+    data = run_coretap("model", "install", "--dry-run")
+
+    assert data["ok"] is True
+    assert data["result"]["dryRun"] is True
+    assert data["result"]["changed"] is False
 
 
 def test_daemon_handle_argv_reuses_cli_dispatch(tmp_path) -> None:
@@ -155,3 +190,13 @@ def test_text_ocr_commands_default_to_chinese_and_english() -> None:
 
     wait_text = parser.parse_args(normalize_global_args(["wait", "text", "--text", "搜索"]))
     assert wait_text.lang == DEFAULT_OCR_LANG
+
+
+def test_screenshot_defaults_to_preview_long_side() -> None:
+    from coretap.cli import build_parser, normalize_global_args
+
+    parser = build_parser()
+
+    screenshot = parser.parse_args(normalize_global_args(["screenshot"]))
+    assert screenshot.max_long_side == DEFAULT_GROUNDING_IMAGE_LONG_SIDE
+    assert screenshot.full_size is False

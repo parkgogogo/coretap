@@ -11,9 +11,11 @@ SKIP_MODEL=0
 SKIP_OCR=0
 SKIP_SIMULATOR=0
 SKIP_DEVICE=0
+SKIP_NODE_SMOKE=0
 NO_BREW_INSTALL=0
 NO_WARM=0
 PRINT_HELP=0
+CORETAP_SOURCE_DIR=""
 
 log() {
   printf '[coretap-install] %s\n' "$*"
@@ -44,6 +46,7 @@ Options:
   --skip-ocr            Do not install/check Tesseract OCR.
   --skip-simulator      Do not install/check Simulator tap support.
   --skip-device         Do not install/check pymobiledevice3.
+  --skip-node-smoke     Do not run the Node test-kit smoke check from a checkout.
   --no-brew-install     Never install missing packages with Homebrew.
   --no-warm             Install/check the model but skip model warm.
   --ref <git-ref>       Git ref to install when not running from a checkout.
@@ -70,6 +73,9 @@ while [ "$#" -gt 0 ]; do
       ;;
     --skip-device)
       SKIP_DEVICE=1
+      ;;
+    --skip-node-smoke)
+      SKIP_NODE_SMOKE=1
       ;;
     --no-brew-install)
       NO_BREW_INSTALL=1
@@ -168,6 +174,16 @@ path_contains() {
   esac
 }
 
+resolve_coretap_bin() {
+  uv_bin="$(tool_bin_dir)"
+  coretap_bin="$uv_bin/coretap"
+  if [ ! -x "$coretap_bin" ]; then
+    coretap_bin="$(command -v coretap || true)"
+  fi
+  [ -n "$coretap_bin" ] || fail "coretap executable was not found after install"
+  printf '%s\n' "$coretap_bin"
+}
+
 install_coretap_cli() {
   script_path="${BASH_SOURCE[0]}"
   script_dir="$(cd "$(dirname "$script_path")" >/dev/null 2>&1 && pwd -P || true)"
@@ -175,10 +191,25 @@ install_coretap_cli() {
 
   if [ -n "$script_dir" ] && [ -f "$script_dir/pyproject.toml" ] && grep -q 'name = "coretap"' "$script_dir/pyproject.toml"; then
     source_spec="$script_dir"
+    CORETAP_SOURCE_DIR="$script_dir"
   fi
 
   log "Installing Coretap CLI from $source_spec"
-  uv tool install --force "$source_spec"
+  if [ -n "$CORETAP_SOURCE_DIR" ]; then
+    uv tool install --force --editable "$source_spec"
+  else
+    uv tool install --force "$source_spec"
+  fi
+}
+
+stop_existing_daemon() {
+  coretap_bin="$1"
+  log "Stopping any existing coretap daemon"
+  if "$coretap_bin" --daemon off --format json daemon stop >/dev/null 2>&1; then
+    log "Stopped existing coretap daemon"
+  else
+    log "No running coretap daemon detected"
+  fi
 }
 
 install_device_tools() {
@@ -256,40 +287,70 @@ install_idb_companion() {
 }
 
 run_coretap_setup() {
-  uv_bin="$(tool_bin_dir)"
-  coretap_bin="$uv_bin/coretap"
-  if [ ! -x "$coretap_bin" ]; then
-    coretap_bin="$(command -v coretap || true)"
-  fi
-  [ -n "$coretap_bin" ] || fail "coretap executable was not found after install"
-
+  coretap_bin="$1"
+  tmp_doctor=""
   log "Running coretap setup"
-  "$coretap_bin" setup --format json >/dev/null
+  "$coretap_bin" --daemon off --format json setup >/dev/null
 
   if [ "$SKIP_MODEL" -eq 0 ]; then
     log "Installing built-in MAI-UI model pack"
-    "$coretap_bin" model install --format json
+    "$coretap_bin" --daemon off --format json model install
     log "Checking model pack"
-    "$coretap_bin" model check --deep --format json
+    "$coretap_bin" --daemon off --format json model check --deep
     if [ "$NO_WARM" -eq 0 ]; then
       log "Warming model pack"
-      "$coretap_bin" model warm --format json
+      "$coretap_bin" --daemon off --format json model warm
     fi
   else
     log "Skipping model install"
   fi
 
   if [ "$SKIP_OCR" -eq 0 ]; then
-    if ! "$coretap_bin" ocr check --format json; then
+    if ! "$coretap_bin" --daemon off --format json ocr check; then
       warn "OCR check failed. Install Tesseract if you need assert text / wait text."
     fi
   fi
 
-  if "$coretap_bin" doctor --format json; then
-    log "Coretap doctor passed"
+  tmp_doctor="$(mktemp)"
+  if "$coretap_bin" --daemon off --format json doctor >"$tmp_doctor"; then
+    cat "$tmp_doctor"
+    if have python3 && python3 - "$tmp_doctor" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as f:
+    data = json.load(f)
+sys.exit(0 if data.get("result", {}).get("ready") is True else 1)
+PY
+    then
+      log "Coretap doctor passed"
+    else
+      warn "Coretap doctor completed but reported not ready. Review the JSON output above."
+    fi
   else
+    cat "$tmp_doctor"
     warn "Coretap doctor did not pass. Review the JSON output above."
   fi
+  rm -f "$tmp_doctor"
+}
+
+run_node_smoke() {
+  coretap_bin="$1"
+  if [ "$SKIP_NODE_SMOKE" -eq 1 ]; then
+    log "Skipping Node test-kit smoke check"
+    return 0
+  fi
+  if [ -z "$CORETAP_SOURCE_DIR" ] || [ ! -f "$CORETAP_SOURCE_DIR/packages/node/smoke.js" ]; then
+    log "Skipping Node test-kit smoke check outside a source checkout"
+    return 0
+  fi
+  if ! have node; then
+    warn "Node.js is not installed. Skipping Node test-kit smoke check."
+    return 0
+  fi
+
+  log "Running Node test-kit smoke check"
+  CORETAP_BIN="$coretap_bin" node "$CORETAP_SOURCE_DIR/packages/node/smoke.js"
 }
 
 main() {
@@ -302,10 +363,13 @@ main() {
   fi
 
   install_coretap_cli
+  coretap_bin="$(resolve_coretap_bin)"
+  stop_existing_daemon "$coretap_bin"
   install_device_tools
   install_ocr_tools
   install_idb_companion
-  run_coretap_setup
+  run_coretap_setup "$coretap_bin"
+  run_node_smoke "$coretap_bin"
 
   log "Done"
 }

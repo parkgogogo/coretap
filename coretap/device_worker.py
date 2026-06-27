@@ -23,6 +23,10 @@ def get_default_device_worker_pool() -> "CoreDeviceWorkerPool | None":
     return _DEFAULT_POOL
 
 
+def _clamp(value: float, lower: float, upper: float) -> float:
+    return max(lower, min(upper, value))
+
+
 @dataclass
 class _RsdSession:
     device: str
@@ -41,6 +45,9 @@ class _TouchSession:
     last_used_at: float
     taps: int = 0
     drags: int = 0
+    typed_characters: int = 0
+    keyboard_service_id: int | None = None
+    last_tap_normalized: dict[str, float] | None = None
 
 
 @dataclass
@@ -65,7 +72,7 @@ class CoreDeviceWorkerPool:
 
     def tap_userspace(self, device: str, x: float, y: float, hx: int, hy: int) -> dict[str, Any]:
         started = time.monotonic()
-        result = self._run(self._tap_userspace(device, hx, hy), stage="tap")
+        result = self._run(self._tap_userspace(device, x, y, hx, hy), stage="tap")
         result.update(
             {
                 "attempted": True,
@@ -149,6 +156,44 @@ class CoreDeviceWorkerPool:
         )
         return result
 
+    def type_text_userspace(
+        self,
+        device: str,
+        *,
+        text: str,
+        char_delay_ms: int,
+        inter_delay_ms: int,
+        paste_at: dict[str, float] | None = None,
+        paste_hold_ms: int = 1600,
+        clear_existing: bool = False,
+    ) -> dict[str, Any]:
+        started = time.monotonic()
+        result = self._run(
+            self._type_text_userspace(
+                device,
+                text=text,
+                char_delay_ms=char_delay_ms,
+                inter_delay_ms=inter_delay_ms,
+                paste_at=paste_at,
+                paste_hold_ms=paste_hold_ms,
+                clear_existing=clear_existing,
+            ),
+            stage="type",
+        )
+        result.update(
+            {
+                "attempted": True,
+                "dryRun": False,
+                "typedCharacters": len(text),
+                "charDelayMs": char_delay_ms,
+                "interDelayMs": inter_delay_ms,
+                "coredeviceTunnelMode": "userspace",
+                "workerKind": "coredevice-userspace-persistent",
+                "durationMs": round((time.monotonic() - started) * 1000),
+            }
+        )
+        return result
+
     def capture_screenshot_userspace(self, device: str) -> dict[str, Any]:
         started = time.monotonic()
         result = self._run(self._capture_screenshot_userspace(device), stage="screenshot")
@@ -189,6 +234,9 @@ class CoreDeviceWorkerPool:
                     "idleMs": round((now - session.last_used_at) * 1000),
                     "taps": session.taps,
                     "drags": session.drags,
+                    "typedCharacters": session.typed_characters,
+                    "keyboardServiceRegistered": session.keyboard_service_id is not None,
+                    "lastTap": session.last_tap_normalized,
                 }
             )
         for session in self._button_sessions.values():
@@ -280,7 +328,7 @@ class CoreDeviceWorkerPool:
             loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
         loop.close()
 
-    async def _tap_userspace(self, device: str, hx: int, hy: int) -> dict[str, Any]:
+    async def _tap_userspace(self, device: str, x: float, y: float, hx: int, hy: int) -> dict[str, Any]:
         assert self._lock is not None
         async with self._lock:
             try:
@@ -307,6 +355,7 @@ class CoreDeviceWorkerPool:
                     ) from retry_exc
             session.last_used_at = time.monotonic()
             session.taps += 1
+            session.last_tap_normalized = {"x": x, "y": y}
             rsd_session = self._rsd_sessions.get(device)
             if rsd_session is not None:
                 rsd_session.last_used_at = session.last_used_at
@@ -429,6 +478,73 @@ class CoreDeviceWorkerPool:
                 "confirmationStatus": "not_requested",
                 "sessionStatus": status,
                 "sessionPressCount": session.presses,
+            }
+
+    async def _type_text_userspace(
+        self,
+        device: str,
+        *,
+        text: str,
+        char_delay_ms: int,
+        inter_delay_ms: int,
+        paste_at: dict[str, float] | None,
+        paste_hold_ms: int,
+        clear_existing: bool,
+    ) -> dict[str, Any]:
+        assert self._lock is not None
+        async with self._lock:
+            try:
+                session, status = await self._get_or_open_session(device)
+                paste_result = await self._paste_text(
+                    session,
+                    text=text,
+                    char_delay_ms=char_delay_ms,
+                    inter_delay_ms=inter_delay_ms,
+                    paste_at=paste_at,
+                    paste_hold_ms=paste_hold_ms,
+                    clear_existing=clear_existing,
+                )
+            except Exception as exc:
+                await self._close_device(device)
+                try:
+                    session, _ = await self._get_or_open_session(device)
+                    paste_result = await self._paste_text(
+                        session,
+                        text=text,
+                        char_delay_ms=char_delay_ms,
+                        inter_delay_ms=inter_delay_ms,
+                        paste_at=paste_at,
+                        paste_hold_ms=paste_hold_ms,
+                        clear_existing=clear_existing,
+                    )
+                    status = "recreated_after_error"
+                except Exception as retry_exc:
+                    raise CoretapError(
+                        "COREDEVICE_TYPE_FAILED",
+                        f"Persistent CoreDevice text input failed: {retry_exc}",
+                        stage="type",
+                        category="infrastructure",
+                        retryable=True,
+                        details={
+                            "device": device,
+                            "errorType": type(retry_exc).__name__,
+                            "previousErrorType": type(exc).__name__,
+                        },
+                    ) from retry_exc
+            session.last_used_at = time.monotonic()
+            session.typed_characters += len(text)
+            rsd_session = self._rsd_sessions.get(device)
+            if rsd_session is not None:
+                rsd_session.last_used_at = session.last_used_at
+                rsd_session.requests += 1
+            return {
+                "dispatchStatus": "sent",
+                "confirmationStatus": "dispatched_unverified",
+                "sessionStatus": status,
+                "sessionTypedCharacterCount": session.typed_characters,
+                "keyboardServiceRegistered": session.keyboard_service_id is not None,
+                "pasteboardSet": True,
+                **paste_result,
             }
 
     async def _capture_screenshot_userspace(self, device: str) -> dict[str, Any]:
@@ -606,6 +722,121 @@ class CoreDeviceWorkerPool:
         else:
             await session.service.send_button(usage_page, usage_code, states[state])
         await asyncio.sleep(0.1)
+
+    async def _send_text(
+        self,
+        session: _TouchSession,
+        *,
+        text: str,
+        char_delay_ms: int,
+        inter_delay_ms: int,
+    ) -> None:
+        from pymobiledevice3.remote.core_device.hid_service import ASCII_TO_HID, KEY_LEFT_SHIFT
+
+        if session.keyboard_service_id is None:
+            session.keyboard_service_id = await session.service.create_keyboard_service()
+        char_delay = char_delay_ms / 1000
+        inter_delay = inter_delay_ms / 1000
+        for ch in text:
+            mapping = ASCII_TO_HID.get(ch)
+            if mapping is None:
+                raise ValueError(f"unsupported character: {ch!r}")
+            usage, needs_shift = mapping
+            usages = (KEY_LEFT_SHIFT, usage) if needs_shift else (usage,)
+            await session.service.send_keyboard(session.keyboard_service_id, usages)
+            if char_delay:
+                await asyncio.sleep(char_delay)
+            await session.service.send_keyboard(session.keyboard_service_id, ())
+            if inter_delay:
+                await asyncio.sleep(inter_delay)
+
+    async def _paste_text(
+        self,
+        session: _TouchSession,
+        *,
+        text: str,
+        char_delay_ms: int,
+        inter_delay_ms: int,
+        paste_at: dict[str, float] | None,
+        paste_hold_ms: int,
+        clear_existing: bool,
+    ) -> dict[str, Any]:
+        from pymobiledevice3.remote.core_device.pasteboard_service import PasteboardService
+
+        clear_count = 0
+        if clear_existing:
+            clear_count = await self._clear_focused_text(session)
+
+        rsd_session = self._rsd_sessions[session.device]
+        async with PasteboardService(rsd_session.rsd) as pasteboard:
+            await pasteboard.set_text(text)
+
+        anchor, anchor_source = self._resolve_paste_anchor(session, paste_at)
+        await asyncio.sleep(inter_delay_ms / 1000)
+        menu_point = await self._paste_via_edit_menu(
+            session,
+            anchor_x=anchor["x"],
+            anchor_y=anchor["y"],
+            hold_ms=paste_hold_ms,
+        )
+        if char_delay_ms:
+            await asyncio.sleep(char_delay_ms / 1000)
+        return {
+            "inputMethod": "coredevice-pasteboard-edit-menu",
+            "pasteAnchor": {"source": anchor_source, **anchor},
+            "pasteMenuTap": menu_point,
+            "pasteHoldMs": paste_hold_ms,
+            "clearExisting": clear_existing,
+            "clearKeypresses": clear_count,
+        }
+
+    def _resolve_paste_anchor(
+        self,
+        session: _TouchSession,
+        paste_at: dict[str, float] | None,
+    ) -> tuple[dict[str, float], str]:
+        if paste_at is not None:
+            return paste_at, "explicit"
+        last = session.last_tap_normalized
+        if last is not None:
+            y = last["y"]
+            if y < 0.75 or y >= 0.9:
+                return dict(last), "last-tap"
+        return {"x": 0.2, "y": 0.54}, "ios-spotlight-search-field"
+
+    async def _clear_focused_text(self, session: _TouchSession, *, count: int = 80) -> int:
+        from pymobiledevice3.remote.core_device.hid_service import KEY_BACKSPACE
+
+        if session.keyboard_service_id is None:
+            session.keyboard_service_id = await session.service.create_keyboard_service()
+        for _ in range(count):
+            await session.service.send_keyboard(session.keyboard_service_id, (KEY_BACKSPACE,))
+            await session.service.send_keyboard(session.keyboard_service_id, ())
+        await asyncio.sleep(0.15)
+        return count
+
+    async def _paste_via_edit_menu(
+        self,
+        session: _TouchSession,
+        *,
+        anchor_x: float,
+        anchor_y: float,
+        hold_ms: int,
+    ) -> dict[str, Any]:
+        hx = int(round(anchor_x * 65535))
+        hy = int(round(anchor_y * 65535))
+        await self._send_drag(session, hx, hy, hx, hy, steps=12, duration_ms=hold_ms)
+        await asyncio.sleep(0.5)
+        paste_x = _clamp(anchor_x - 0.07, 0.08, 0.92)
+        paste_y = _clamp(anchor_y - 0.059, 0.05, 0.95)
+        paste_hx = int(round(paste_x * 65535))
+        paste_hy = int(round(paste_y * 65535))
+        await self._send_tap(session, paste_hx, paste_hy)
+        await asyncio.sleep(0.25)
+        return {
+            "normalized": {"x": paste_x, "y": paste_y},
+            "hidU16": {"x": paste_hx, "y": paste_hy},
+        }
 
     async def _close_button_session(self, device: str) -> None:
         session = self._button_sessions.pop(device, None)

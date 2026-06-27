@@ -4,7 +4,10 @@
   "description": "Node test client for Coretap visual iOS automation.",
   "main": "index.js",
   "types": "index.d.ts",
+  "scripts": {
+    "smoke": "node smoke.js",
+    "test": "node smoke.js"
+  },
   "license": "UNLICENSED",
   "type": "commonjs"
 }
-

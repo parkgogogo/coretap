@@ -114,19 +114,35 @@ def build_manifest(paths: ModelPaths) -> dict[str, Any]:
     }
 
 
-def install_model(profile: str = PUBLIC_MODEL_PROFILE, *, force: bool = False) -> dict[str, Any]:
+def install_model(profile: str = PUBLIC_MODEL_PROFILE, *, force: bool = False, dry_run: bool = False) -> dict[str, Any]:
     _require_public_profile(profile)
     model_root_from_env()
     paths = model_paths()
     if paths.manifest.exists() and paths.model.exists() and not force:
         manifest = read_json(paths.manifest)
         return {
+            "dryRun": dry_run,
+            "wouldInstall": False,
             "installed": True,
             "changed": False,
             "profile": profile,
             "packVersion": manifest.get("packVersion"),
             "modelDir": str(paths.model),
             "manifest": str(paths.manifest),
+        }
+
+    if dry_run:
+        return {
+            "dryRun": True,
+            "wouldInstall": True,
+            "installed": paths.manifest.exists() and paths.model.exists(),
+            "changed": False,
+            "profile": profile,
+            "packVersion": PUBLIC_MODEL_PACK_VERSION,
+            "source": {"repo": PUBLIC_MODEL_REPO, "revision": PUBLIC_MODEL_REVISION},
+            "modelDir": str(paths.model),
+            "manifest": str(paths.manifest),
+            "force": force,
         }
 
     try:

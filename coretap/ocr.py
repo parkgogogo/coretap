@@ -1,13 +1,15 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import io
+import json
 import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from coretap.runtime import CoretapError, require_success, run_command, which
+from coretap.runtime import CoretapError, cache_root, command_env, require_success, run_command, which
 
 
 DEFAULT_OCR_LANG = "chi_sim+eng"
@@ -21,6 +23,7 @@ class OcrToken:
     top: int
     width: int
     height: int
+    engine: str = "tesseract"
 
     @property
     def center(self) -> tuple[float, float]:
@@ -90,6 +93,49 @@ def run_tesseract(image: Path, *, lang: str = DEFAULT_OCR_LANG, psm: int = 11) -
     return parse_tsv(done.stdout), done.stdout
 
 
+def run_ocr(image: Path, *, lang: str = DEFAULT_OCR_LANG, psm: int = 11) -> tuple[list[OcrToken], dict[str, Any]]:
+    tokens: list[OcrToken] = []
+    raw: dict[str, Any] = {"engines": [], "errors": []}
+
+    try:
+        tesseract_tokens, tsv = run_tesseract(image, lang=lang, psm=psm)
+        tokens.extend(tesseract_tokens)
+        raw["engines"].append("tesseract")
+        raw["tesseractTsv"] = tsv
+    except CoretapError as exc:
+        raw["errors"].append({"engine": "tesseract", "code": exc.code, "message": str(exc), "details": exc.details})
+
+    try:
+        vision_tokens, vision_stdout = run_vision_ocr(image)
+        tokens.extend(vision_tokens)
+        raw["engines"].append("vision")
+        raw["visionJson"] = vision_stdout
+    except CoretapError as exc:
+        raw["errors"].append({"engine": "vision", "code": exc.code, "message": str(exc), "details": exc.details})
+
+    if not raw["engines"]:
+        errors = raw.get("errors") or []
+        first = errors[0] if errors else {}
+        raise CoretapError(
+            first.get("code") or "OCR_UNAVAILABLE",
+            first.get("message") or "No OCR engine is available",
+            stage="ocr",
+            category="environment",
+            details={"image": str(image), "errors": errors},
+        )
+    return tokens, raw
+
+
+def run_vision_ocr(image: Path) -> tuple[list[OcrToken], str]:
+    helper = _vision_helper_binary()
+    done = require_success(
+        run_command([str(helper), str(image)], env=command_env(), timeout=30, max_output=10_000_000),
+        code="VISION_OCR_FAILED",
+        stage="ocr",
+    )
+    return parse_vision_json(done.stdout), done.stdout
+
+
 def parse_tsv(tsv: str) -> list[OcrToken]:
     tokens: list[OcrToken] = []
     reader = csv.DictReader(io.StringIO(tsv), delimiter="\t", quoting=csv.QUOTE_NONE)
@@ -107,7 +153,48 @@ def parse_tsv(tsv: str) -> list[OcrToken]:
             continue
         if conf < 0:
             continue
-        tokens.append(OcrToken(text, conf, left, top, width, height))
+        tokens.append(OcrToken(text, conf, left, top, width, height, "tesseract"))
+    return tokens
+
+
+def parse_vision_json(raw: str) -> list[OcrToken]:
+    try:
+        data, _ = json.JSONDecoder().raw_decode(raw.strip())
+    except json.JSONDecodeError as exc:
+        raise CoretapError(
+            "VISION_OCR_FAILED",
+            "Could not parse Vision OCR output",
+            stage="ocr",
+            details={"stdout": raw[:1000]},
+        ) from exc
+    if not isinstance(data, list):
+        raise CoretapError(
+            "VISION_OCR_FAILED",
+            "Vision OCR output was not a JSON array",
+            stage="ocr",
+            details={"stdout": raw[:1000]},
+        )
+    tokens: list[OcrToken] = []
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        text = str(item.get("text") or "").strip()
+        if not text:
+            continue
+        try:
+            tokens.append(
+                OcrToken(
+                    text=text,
+                    confidence=float(item.get("confidence") or 0),
+                    left=int(float(item.get("left") or 0)),
+                    top=int(float(item.get("top") or 0)),
+                    width=int(float(item.get("width") or 0)),
+                    height=int(float(item.get("height") or 0)),
+                    engine="vision",
+                )
+            )
+        except (TypeError, ValueError):
+            continue
     return tokens
 
 
@@ -151,7 +238,8 @@ def find_exact_text_candidates(
             acc = (acc + " " + normalized[end]).strip()
             if acc == needle:
                 match = token_match(tokens[start : end + 1], start, end + 1)
-                if match["matchedTokenMinimumConfidence"] >= min_confidence:
+                match["matchedKind"] = "exact"
+                if _passes_min_confidence(match, min_confidence):
                     key = (match["matchedTokenRange"]["start"], match["matchedTokenRange"]["endExclusive"])
                     if key not in seen:
                         candidates.append(match)
@@ -159,6 +247,18 @@ def find_exact_text_candidates(
                 break
             if len(acc) > len(needle) + 40:
                 break
+    if candidates:
+        return candidates
+
+    for idx, token in enumerate(tokens):
+        if needle and needle in normalized[idx]:
+            match = token_match([token], idx, idx + 1)
+            match["matchedKind"] = "token_contains"
+            if _passes_min_confidence(match, min_confidence):
+                key = (match["matchedTokenRange"]["start"], match["matchedTokenRange"]["endExclusive"])
+                if key not in seen:
+                    candidates.append(match)
+                    seen.add(key)
     return candidates
 
 
@@ -169,8 +269,10 @@ def token_match(tokens: list[OcrToken], start: int, end: int) -> dict[str, Any]:
     bottom = max(t.top + t.height for t in tokens)
     text = " ".join(t.text for t in tokens)
     confidences = [t.confidence for t in tokens]
+    engines = sorted({t.engine for t in tokens})
     return {
         "matchedText": text,
+        "matchedEngines": engines,
         "matchedTokenRange": {"start": start, "endExclusive": end},
         "matchedTokenMeanConfidence": sum(confidences) / len(confidences),
         "matchedTokenMinimumConfidence": min(confidences),
@@ -181,3 +283,116 @@ def token_match(tokens: list[OcrToken], start: int, end: int) -> dict[str, Any]:
             "height": bottom - top,
         },
     }
+
+
+def _passes_min_confidence(match: dict[str, Any], min_confidence: float) -> bool:
+    threshold = min_confidence
+    if "vision" in match.get("matchedEngines", []):
+        threshold = min(threshold, 25.0)
+    return float(match["matchedTokenMinimumConfidence"]) >= threshold
+
+
+def _vision_helper_binary() -> Path:
+    source = _VISION_OCR_SWIFT_SOURCE
+    digest = hashlib.sha256(source.encode("utf-8")).hexdigest()[:16]
+    root = cache_root() / "vision-ocr" / digest
+    binary = root / "coretap-vision-ocr"
+    if binary.exists():
+        return binary
+    swiftc = which("xcrun")
+    if not swiftc:
+        raise CoretapError(
+            "VISION_OCR_UNAVAILABLE",
+            "xcrun is required for macOS Vision OCR fallback",
+            stage="ocr",
+            category="environment",
+        )
+    root.mkdir(parents=True, exist_ok=True)
+    source_path = root / "main.swift"
+    source_path.write_text(source, encoding="utf-8")
+    done = require_success(
+        run_command(["xcrun", "swiftc", str(source_path), "-o", str(binary)], env=command_env(), timeout=120, max_output=2_000_000),
+        code="VISION_OCR_UNAVAILABLE",
+        stage="ocr",
+    )
+    if not binary.exists():
+        raise CoretapError(
+            "VISION_OCR_UNAVAILABLE",
+            "Vision OCR helper did not produce a binary",
+            stage="ocr",
+            category="environment",
+            details={"stdout": done.stdout[-1000:], "stderr": done.stderr[-1000:]},
+        )
+    return binary
+
+
+_VISION_OCR_SWIFT_SOURCE = r'''
+import Foundation
+import Vision
+import CoreGraphics
+import ImageIO
+
+struct Token: Codable {
+    let text: String
+    let confidence: Double
+    let left: Int
+    let top: Int
+    let width: Int
+    let height: Int
+}
+
+let args = CommandLine.arguments
+if args.count < 2 {
+    fputs("usage: coretap-vision-ocr image\n", stderr)
+    exit(2)
+}
+
+let url = URL(fileURLWithPath: args[1])
+guard let source = CGImageSourceCreateWithURL(url as CFURL, nil),
+      let image = CGImageSourceCreateImageAtIndex(source, 0, nil) else {
+    fputs("could not load image\n", stderr)
+    exit(3)
+}
+
+let imageWidth = image.width
+let imageHeight = image.height
+var tokens: [Token] = []
+let request = VNRecognizeTextRequest { request, error in
+    if let error = error {
+        fputs("vision error: \(error)\n", stderr)
+        exit(4)
+    }
+    let observations = (request.results as? [VNRecognizedTextObservation]) ?? []
+    for observation in observations {
+        guard let candidate = observation.topCandidates(1).first else { continue }
+        let box = observation.boundingBox
+        let left = Int((box.minX * CGFloat(imageWidth)).rounded())
+        let top = Int(((1.0 - box.maxY) * CGFloat(imageHeight)).rounded())
+        let width = Int((box.width * CGFloat(imageWidth)).rounded())
+        let height = Int((box.height * CGFloat(imageHeight)).rounded())
+        tokens.append(Token(
+            text: candidate.string,
+            confidence: Double(candidate.confidence * 100.0),
+            left: left,
+            top: top,
+            width: width,
+            height: height
+        ))
+    }
+}
+
+request.recognitionLevel = .accurate
+request.usesLanguageCorrection = true
+request.recognitionLanguages = ["zh-Hans", "en-US"]
+
+let handler = VNImageRequestHandler(cgImage: image, options: [:])
+do {
+    try handler.perform([request])
+} catch {
+    fputs("perform error: \(error)\n", stderr)
+    exit(5)
+}
+
+let data = try JSONEncoder().encode(tokens)
+FileHandle.standardOutput.write(data)
+'''

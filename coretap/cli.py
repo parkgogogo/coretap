@@ -12,6 +12,7 @@ from coretap import __version__
 from coretap.backends import backend_for
 from coretap.device_buttons import BUTTON_STATES, button_choices
 from coretap.grounding import (
+    DEFAULT_GROUNDING_IMAGE_LONG_SIDE,
     GROUNDING_PROFILES,
     ground_target,
     model_cache,
@@ -20,12 +21,13 @@ from coretap.grounding import (
     model_install,
     model_status,
     model_stop,
+    prepare_image_long_side,
     prepare_grounding_image,
     remap_grounding_to_source_frame,
     warm_model,
 )
 from coretap.model_pack import INTERNAL_FIXTURE_PROFILE, PUBLIC_MODEL_PROFILE
-from coretap.ocr import DEFAULT_OCR_LANG, find_exact_text_candidates, find_text, run_tesseract, tesseract_status
+from coretap.ocr import DEFAULT_OCR_LANG, find_exact_text_candidates, find_text, run_ocr, tesseract_status
 from coretap.runtime import (
     CoretapError,
     artifact_dir,
@@ -56,15 +58,19 @@ EXIT_CODES = {
     "COREDEVICE_DRAG_FAILED": 32,
     "COREDEVICE_PRESS_FAILED": 32,
     "COREDEVICE_TAP_FAILED": 32,
+    "COREDEVICE_TYPE_FAILED": 32,
     "COREDEVICE_WORKER_FAILED": 32,
     "COREDEVICE_WORKER_TIMEOUT": 32,
     "SIMULATOR_DRAG_UNSUPPORTED": 32,
     "SIMULATOR_PRESS_UNSUPPORTED": 32,
     "SIMULATOR_TAP_UNSUPPORTED": 32,
+    "SIMULATOR_TYPE_UNSUPPORTED": 32,
     "SIMULATOR_TAP_FAILED": 32,
     "SIMULATOR_DESCRIBE_FAILED": 32,
     "OCR_UNAVAILABLE": 10,
     "OCR_PROCESS_FAILED": 40,
+    "VISION_OCR_UNAVAILABLE": 10,
+    "VISION_OCR_FAILED": 40,
     "CAPABILITY_UNAVAILABLE": 10,
     "UNKNOWN_MODEL_PROFILE": 2,
     "MODEL_NOT_INSTALLED": 60,
@@ -74,6 +80,9 @@ EXIT_CODES = {
     "TARGET_ABSENT": 30,
     "TEXT_TARGET_NOT_FOUND": 30,
     "TEXT_TARGET_AMBIGUOUS": 30,
+    "TEXT_INPUT_UNSUPPORTED": 30,
+    "TEXT_INPUT_TARGET_UNKNOWN": 30,
+    "TEXT_INPUT_VERIFICATION_FAILED": 30,
     "GROUNDING_NOT_FOUND": 30,
     "GROUNDING_AMBIGUOUS": 30,
     "GROUNDING_SCHEMA_INVALID": 30,
@@ -97,19 +106,19 @@ def emit(data: dict[str, Any], fmt: str) -> None:
         print(json.dumps(data, ensure_ascii=False))
 
 
-def point_to_hid(x: float, y: float, *, width: int, height: int, space: str) -> dict[str, Any]:
+def point_to_hid(x: float, y: float, *, width: int, height: int, space: str, frame_known: bool = True) -> dict[str, Any]:
     if space == "hid":
         hx, hy = int(round(x)), int(round(y))
         if not (0 <= hx <= 65535 and 0 <= hy <= 65535):
             raise CoretapError("INVALID_POINT", "HID coordinates must be in [0,65535]", category="usage", stage="coordinate")
         normalized = {"x": hx / 65535, "y": hy / 65535}
-        screenshot_px = {"x": normalized["x"] * width, "y": normalized["y"] * height}
+        screenshot_px = {"x": normalized["x"] * width, "y": normalized["y"] * height} if frame_known else None
     elif space == "normalized":
         if not (0 <= x <= 1 and 0 <= y <= 1):
             raise CoretapError("INVALID_POINT", "Normalized coordinates must be in [0,1]", category="usage", stage="coordinate")
         hx, hy = int(round(x * 65535)), int(round(y * 65535))
         normalized = {"x": x, "y": y}
-        screenshot_px = {"x": x * width, "y": y * height}
+        screenshot_px = {"x": x * width, "y": y * height} if frame_known else None
     elif space == "px":
         if width <= 0 or height <= 0:
             raise CoretapError("INVALID_POINT", "Frame dimensions are required for pixel coordinates", category="usage", stage="coordinate")
@@ -124,6 +133,7 @@ def point_to_hid(x: float, y: float, *, width: int, height: int, space: str) -> 
         "input": {"space": space, "x": x, "y": y},
         "normalized": normalized,
         "screenshotPx": screenshot_px,
+        "frame": {"known": frame_known, "widthPx": width if frame_known else None, "heightPx": height if frame_known else None},
         "hidU16": {"x": hx, "y": hy},
     }
 
@@ -243,7 +253,7 @@ def command_model(args: argparse.Namespace) -> dict[str, Any]:
     if args.model_command == "warm":
         return warm_model(args.profile)
     if args.model_command == "install":
-        return model_install(args.profile, force=args.force)
+        return model_install(args.profile, force=args.force, dry_run=args.dry_run)
     if args.model_command == "run":
         if not args.image or not args.target:
             raise CoretapError("INVALID_ARGUMENT", "model run requires --image and --target", category="usage", stage="model")
@@ -298,10 +308,44 @@ def capture(args: argparse.Namespace, *, label: str = "screenshot") -> tuple[Any
 
 
 def command_screenshot(args: argparse.Namespace) -> dict[str, Any]:
-    frame, run_dir, _ = capture(args, label=args.label)
-    return {
+    if getattr(args, "full_size", False):
+        frame, run_dir, _ = capture(args, label=args.label)
+        return {
+            "artifactDir": str(run_dir),
+            "frame": {
+                "frameId": frame.frame_id,
+                "path": str(frame.path),
+                "widthPx": frame.width,
+                "heightPx": frame.height,
+                "backend": frame.backend,
+                "device": frame.device,
+                "resized": False,
+                "maxLongSidePx": None,
+                "scale": 1.0,
+            },
+        }
+
+    capture_args = argparse.Namespace(**vars(args))
+    capture_args.out = None
+    source_label = f"{args.label}.source"
+    frame, run_dir, source_image = capture(capture_args, label=source_label)
+    output_path = Path(args.out) if args.out else run_dir / f"{args.label}.png"
+    max_long_side = getattr(args, "max_long_side", DEFAULT_GROUNDING_IMAGE_LONG_SIDE)
+    preview = prepare_image_long_side(source_image, output_path=output_path, max_long_side=max_long_side)
+    result = {
         "artifactDir": str(run_dir),
         "frame": {
+            "frameId": f"frame_{args.label}",
+            "path": preview["path"],
+            "widthPx": preview["widthPx"],
+            "heightPx": preview["heightPx"],
+            "backend": frame.backend,
+            "device": frame.device,
+            "resized": preview["resized"],
+            "maxLongSidePx": preview["maxLongSidePx"],
+            "scale": preview["scale"],
+        },
+        "sourceFrame": {
             "frameId": frame.frame_id,
             "path": str(frame.path),
             "widthPx": frame.width,
@@ -310,15 +354,25 @@ def command_screenshot(args: argparse.Namespace) -> dict[str, Any]:
             "device": frame.device,
         },
     }
+    write_json(run_dir / f"{args.label}.result.json", result)
+    return {
+        **result,
+    }
 
 
 def command_tap_point(args: argparse.Namespace) -> dict[str, Any]:
     if args.frame:
         width, height = png_size(Path(args.frame))
+        frame_known = True
+    elif args.width is not None and args.height is not None:
+        width = args.width
+        height = args.height
+        frame_known = True
     else:
-        width = args.width or 1
-        height = args.height or 1
-    point = point_to_hid(args.x, args.y, width=width, height=height, space=args.space)
+        width = 1
+        height = 1
+        frame_known = False
+    point = point_to_hid(args.x, args.y, width=width, height=height, space=args.space, frame_known=frame_known)
     backend = backend_for(args.backend, developer_dir=args.developer_dir, coredevice_tunnel_mode=args.coredevice_tunnel_mode)
     tap = backend.tap_normalized(
         args.device,
@@ -340,18 +394,28 @@ def _parse_xy_pair(raw: str, *, option: str) -> tuple[float, float]:
         raise CoretapError("INVALID_ARGUMENT", f"{option} must contain numeric coordinates", category="usage", stage="coordinate") from exc
 
 
-def _point_frame_dimensions(args: argparse.Namespace) -> tuple[int, int]:
+def _parse_normalized_pair(raw: str, *, option: str, stage: str) -> dict[str, float]:
+    x, y = _parse_xy_pair(raw, option=option)
+    if not (0 <= x <= 1 and 0 <= y <= 1):
+        raise CoretapError("INVALID_POINT", f"{option} coordinates must be normalized values in [0,1]", category="usage", stage=stage)
+    return {"x": x, "y": y}
+
+
+def _point_frame_dimensions(args: argparse.Namespace) -> tuple[int, int, bool]:
     if getattr(args, "frame", None):
-        return png_size(Path(args.frame))
-    return args.width or 1, args.height or 1
+        width, height = png_size(Path(args.frame))
+        return width, height, True
+    if args.width is not None and args.height is not None:
+        return args.width, args.height, True
+    return 1, 1, False
 
 
 def command_drag(args: argparse.Namespace) -> dict[str, Any]:
-    width, height = _point_frame_dimensions(args)
+    width, height, frame_known = _point_frame_dimensions(args)
     from_x, from_y = _parse_xy_pair(args.from_point, option="--from")
     to_x, to_y = _parse_xy_pair(args.to_point, option="--to")
-    from_point = point_to_hid(from_x, from_y, width=width, height=height, space=args.space)
-    to_point = point_to_hid(to_x, to_y, width=width, height=height, space=args.space)
+    from_point = point_to_hid(from_x, from_y, width=width, height=height, space=args.space, frame_known=frame_known)
+    to_point = point_to_hid(to_x, to_y, width=width, height=height, space=args.space, frame_known=frame_known)
     backend = backend_for(args.backend, developer_dir=args.developer_dir, coredevice_tunnel_mode=args.coredevice_tunnel_mode)
     drag = backend.drag_normalized(
         args.device,
@@ -503,8 +567,8 @@ def _text_query(args: argparse.Namespace) -> str:
 def command_tap_text(args: argparse.Namespace) -> dict[str, Any]:
     text = _text_query(args)
     frame, run_dir, image = capture(args, label="text-source")
-    tokens, raw = run_tesseract(image, lang=args.lang, psm=args.psm)
-    (run_dir / "ocr.tsv").write_text(raw, encoding="utf-8")
+    tokens, raw = run_ocr(image, lang=args.lang, psm=args.psm)
+    _write_ocr_artifacts(run_dir, "ocr", raw)
     candidates = find_exact_text_candidates(
         tokens,
         text,
@@ -517,7 +581,7 @@ def command_tap_text(args: argparse.Namespace) -> dict[str, Any]:
             f"Text target was not found: {text}",
             stage="tap-text",
             category="grounding",
-            details={"artifactDir": str(run_dir), "text": text, "tokenCount": len(tokens)},
+            details={"artifactDir": str(run_dir), "text": text, "tokenCount": len(tokens), "ocr": _ocr_summary(raw)},
         )
     if len(candidates) > 1:
         raise CoretapError(
@@ -525,7 +589,7 @@ def command_tap_text(args: argparse.Namespace) -> dict[str, Any]:
             f"Text target matched multiple regions: {text}",
             stage="tap-text",
             category="grounding",
-            details={"artifactDir": str(run_dir), "text": text, "candidateCount": len(candidates), "candidates": candidates},
+            details={"artifactDir": str(run_dir), "text": text, "candidateCount": len(candidates), "candidates": candidates, "ocr": _ocr_summary(raw)},
         )
     match = candidates[0]
     box = match["matchedBoxPx"]
@@ -552,6 +616,7 @@ def command_tap_text(args: argparse.Namespace) -> dict[str, Any]:
             "psm": args.psm,
             "minConfidence": args.min_confidence,
             "match": match,
+            **_ocr_summary(raw),
         },
         "point": point,
         "tap": tap,
@@ -572,6 +637,73 @@ def command_press(args: argparse.Namespace) -> dict[str, Any]:
     return pressed
 
 
+def _type_text_query(args: argparse.Namespace) -> str:
+    text = getattr(args, "text", None) or getattr(args, "text_query", None)
+    if text is None:
+        raise CoretapError("INVALID_ARGUMENT", "type requires text", category="usage", stage="type")
+    return str(text)
+
+
+def command_type(args: argparse.Namespace) -> dict[str, Any]:
+    backend = backend_for(args.backend, developer_dir=args.developer_dir, coredevice_tunnel_mode=args.coredevice_tunnel_mode)
+    text = _type_text_query(args)
+    if args.verify_timeout_ms < 0:
+        raise CoretapError("INVALID_ARGUMENT", "type --verify-timeout-ms must be >= 0", category="usage", stage="type")
+    paste_at = _parse_normalized_pair(args.paste_at, option="--paste-at", stage="type") if args.paste_at else None
+    result = backend.type_text(
+        args.device,
+        text,
+        char_delay_ms=args.char_delay_ms,
+        inter_delay_ms=args.inter_delay_ms,
+        paste_at=paste_at,
+        paste_hold_ms=args.paste_hold_ms,
+        clear_existing=args.replace,
+        dry_run=args.dry_run,
+    )
+    if args.dry_run or args.no_verify or not text:
+        return result
+    return _verify_type_result(args, text, result)
+
+
+def _verify_type_result(args: argparse.Namespace, text: str, result: dict[str, Any]) -> dict[str, Any]:
+    deadline = time.monotonic() + (args.verify_timeout_ms / 1000)
+    attempts = 0
+    last: dict[str, Any] | None = None
+    while True:
+        attempts += 1
+        capture_args = argparse.Namespace(**vars(args))
+        capture_args.out = None
+        frame, run_dir, image = capture(capture_args, label="type-verify")
+        tokens, raw = run_ocr(image, lang=DEFAULT_OCR_LANG, psm=11)
+        _write_ocr_artifacts(run_dir, "type-verify", raw)
+        candidates = find_exact_text_candidates(tokens, text, min_confidence=25.0)
+        last = {
+            "artifactDir": str(run_dir),
+            "frame": {"path": str(image), "widthPx": frame.width, "heightPx": frame.height},
+            "attempts": attempts,
+            "tokenCount": len(tokens),
+            "candidateCount": len(candidates),
+            "ocr": _ocr_summary(raw),
+        }
+        if candidates:
+            verification = {**last, "match": candidates[0]}
+            return {
+                **result,
+                "confirmationStatus": "verified_text",
+                "verification": verification,
+            }
+        if time.monotonic() >= deadline:
+            break
+        time.sleep(0.25)
+    raise CoretapError(
+        "TEXT_INPUT_VERIFICATION_FAILED",
+        f"Typed text was not visible after input: {text}",
+        stage="type",
+        category="assertion",
+        details={"text": text, "input": result, "lastVerification": last},
+    )
+
+
 def command_assert_text(args: argparse.Namespace) -> dict[str, Any]:
     if args.image:
         image = Path(args.image)
@@ -585,14 +717,14 @@ def command_assert_text(args: argparse.Namespace) -> dict[str, Any]:
         attempts += 1
         lang = getattr(args, "lang", DEFAULT_OCR_LANG)
         psm = int(getattr(args, "psm", 11))
-        tokens, raw = run_tesseract(image, lang=lang, psm=psm)
-        (run_dir / f"assert-{attempts:03d}.tsv").write_text(raw, encoding="utf-8")
+        tokens, raw = run_ocr(image, lang=lang, psm=psm)
+        _write_ocr_artifacts(run_dir, f"assert-{attempts:03d}", raw)
         match = find_text(tokens, args.text, case_sensitive=args.case_sensitive)
         last = {
             "attempts": attempts,
             "image": str(image),
             "tokenCount": len(tokens),
-            "ocr": {"lang": lang, "psm": psm},
+            "ocr": {"lang": lang, "psm": psm, **_ocr_summary(raw)},
             "match": match,
         }
         if match:
@@ -600,7 +732,7 @@ def command_assert_text(args: argparse.Namespace) -> dict[str, Any]:
                 "artifactDir": str(run_dir),
                 "expected": args.text,
                 "matched": True,
-                "ocr": {"lang": lang, "psm": psm, "tokenCount": len(tokens)},
+                "ocr": {"lang": lang, "psm": psm, "tokenCount": len(tokens), **_ocr_summary(raw)},
                 **match,
                 "attempts": attempts,
             }
@@ -644,6 +776,8 @@ def command_run(args: argparse.Namespace) -> dict[str, Any]:
             ns = argparse.Namespace(**vars(args))
             ns.label = step["screenshot"].get("label", "screenshot")
             ns.out = step["screenshot"].get("out")
+            ns.full_size = bool(step["screenshot"].get("fullSize", False))
+            ns.max_long_side = int(step["screenshot"].get("maxLongSide", DEFAULT_GROUNDING_IMAGE_LONG_SIDE))
             results.append({"screenshot": command_screenshot(ns)})
         elif "tapTarget" in step:
             ns = argparse.Namespace(**vars(args))
@@ -667,6 +801,18 @@ def command_run(args: argparse.Namespace) -> dict[str, Any]:
             ns.hold_ms = step["press"].get("holdMs")
             ns.dry_run = bool(step["press"].get("dryRun", args.dry_run))
             results.append({"press": command_press(ns)})
+        elif "type" in step:
+            ns = argparse.Namespace(**vars(args))
+            ns.text = step["type"]["text"]
+            ns.char_delay_ms = int(step["type"].get("charDelayMs", 40))
+            ns.inter_delay_ms = int(step["type"].get("interDelayMs", 20))
+            ns.paste_at = step["type"].get("pasteAt")
+            ns.paste_hold_ms = int(step["type"].get("pasteHoldMs", 1600))
+            ns.verify_timeout_ms = int(step["type"].get("verifyTimeoutMs", 3000))
+            ns.no_verify = bool(step["type"].get("noVerify", False))
+            ns.replace = bool(step["type"].get("replace", False))
+            ns.dry_run = bool(step["type"].get("dryRun", args.dry_run))
+            results.append({"type": command_type(ns)})
         elif "drag" in step:
             ns = argparse.Namespace(**vars(args))
             ns.from_point = step["drag"]["from"]
@@ -730,7 +876,28 @@ def command_replay(args: argparse.Namespace) -> dict[str, Any]:
     if not image.is_absolute():
         image = (base / image).resolve() if not image.exists() else image.resolve()
     profile = data.get("profile") or data.get("grounding", {}).get("model", {}).get("profile") or args.profile
-    replayed = ground_target(image, data["target"], profile=profile)
+    source_width, source_height = png_size(image)
+    if profile == INTERNAL_FIXTURE_PROFILE:
+        model_input = {
+            "path": str(image),
+            "widthPx": source_width,
+            "heightPx": source_height,
+            "resized": False,
+            "maxLongSidePx": None,
+            "scale": 1.0,
+        }
+    else:
+        model_input = prepare_grounding_image(image, output_dir=base)
+    replayed = ground_target(Path(model_input["path"]), data["target"], profile=profile)
+    replayed["modelInput"] = {
+        "path": model_input["path"],
+        "widthPx": model_input["widthPx"],
+        "heightPx": model_input["heightPx"],
+        "resized": model_input["resized"],
+        "maxLongSidePx": model_input["maxLongSidePx"],
+        "scale": model_input["scale"],
+    }
+    replayed = remap_grounding_to_source_frame(replayed, source_width=source_width, source_height=source_height)
     replayed.pop("rawTsv", None)
     replayed.pop("rawOutput", None)
     comparison = {
@@ -751,6 +918,21 @@ def command_replay(args: argparse.Namespace) -> dict[str, Any]:
         "recorded": data.get("grounding"),
         "replayed": replayed,
         "comparison": comparison,
+    }
+
+
+def _write_ocr_artifacts(run_dir: Path, stem: str, raw: dict[str, Any]) -> None:
+    if "tesseractTsv" in raw:
+        (run_dir / f"{stem}.tsv").write_text(raw["tesseractTsv"], encoding="utf-8")
+    if "visionJson" in raw:
+        (run_dir / f"{stem}.vision.json").write_text(raw["visionJson"], encoding="utf-8")
+    write_json(run_dir / f"{stem}.ocr.json", _ocr_summary(raw))
+
+
+def _ocr_summary(raw: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "engines": list(raw.get("engines") or []),
+        "engineErrors": list(raw.get("errors") or []),
     }
 
 
@@ -834,6 +1016,8 @@ def build_parser() -> argparse.ArgumentParser:
     screenshot = sub.add_parser("screenshot")
     screenshot.add_argument("--label", default="screenshot")
     screenshot.add_argument("--out", default=None)
+    screenshot.add_argument("--max-long-side", type=int, default=DEFAULT_GROUNDING_IMAGE_LONG_SIDE)
+    screenshot.add_argument("--full-size", action="store_true")
 
     locate = sub.add_parser("locate")
     locate.add_argument("--target", required=True)
@@ -867,6 +1051,18 @@ def build_parser() -> argparse.ArgumentParser:
     press.add_argument("--state", choices=BUTTON_STATES, default="press")
     press.add_argument("--hold-ms", type=int, default=None)
     press.add_argument("--dry-run", action="store_true")
+
+    type_text = sub.add_parser("type")
+    type_text.add_argument("text_query", nargs="?")
+    type_text.add_argument("--text", dest="text", default=None)
+    type_text.add_argument("--char-delay-ms", type=int, default=40)
+    type_text.add_argument("--inter-delay-ms", type=int, default=20)
+    type_text.add_argument("--paste-at", default=None, help="Normalized x,y anchor used to open the iOS edit paste menu")
+    type_text.add_argument("--paste-hold-ms", type=int, default=1600)
+    type_text.add_argument("--verify-timeout-ms", type=int, default=3000)
+    type_text.add_argument("--no-verify", action="store_true")
+    type_text.add_argument("--replace", action="store_true")
+    type_text.add_argument("--dry-run", action="store_true")
 
     drag = sub.add_parser("drag")
     drag.add_argument("--space", choices=["px", "normalized", "hid"], default="normalized")
@@ -987,6 +1183,8 @@ def dispatch(args: argparse.Namespace) -> dict[str, Any]:
             return command_tap_text(args)
     if args.command == "press":
         return command_press(args)
+    if args.command == "type":
+        return command_type(args)
     if args.command == "drag":
         return command_drag(args)
     if args.command == "scroll":

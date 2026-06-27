@@ -64,6 +64,11 @@ CoreDevice screenshots are normalized to the primary display size reported by
 frame pixel coordinates aligned with the HID coordinate space even when the raw
 CoreDevice screenshot service returns a rotated PNG.
 
+The standalone `coretap screenshot` command saves the full source frame as an
+artifact, but returns a preview frame downscaled to long side 1368 px by default.
+This keeps screenshots cheaper to inspect in agent workflows. Use `--full-size`
+when you need the original resolution as the returned frame.
+
 In daemon mode, which is the default for non-daemon commands, Coretap uses the
 `pymobiledevice3` Python API directly for userspace CoreDevice screenshot,
 display-info, and HID tap work. The daemon keeps a CoreDevice worker thread
@@ -106,6 +111,7 @@ Useful installer options:
 ./install.sh --skip-ocr
 ./install.sh --skip-simulator
 ./install.sh --skip-device
+./install.sh --skip-node-smoke
 ./install.sh --no-brew-install
 ./install.sh --no-warm
 ```
@@ -129,6 +135,33 @@ matched text bounding box center, and does not invoke the VLM grounding model.
 Use `tap target` for semantic descriptions, icons, relative position, or cases
 where exact OCR text is absent or ambiguous.
 
+The Node test client exposes the same split for JavaScript test suites:
+
+```js
+const { Coretap } = require("./packages/node");
+
+const client = await Coretap.connect({
+  backend: "device",
+  device: process.env.UDID,
+});
+
+await client.checkEnvironment();
+
+const run = await client.openRun({ name: "home-screen" });
+await run.test("open app from home screen", async (ui) => {
+  await ui.pressHome();
+  await ui.tapText("搜索");
+  await ui.tap("the ChatGPT app icon");
+  await ui.typeText("hello@example.com");
+  await ui.scroll("down");
+});
+await run.close();
+```
+
+The Node package is a test kit over the local Coretap CLI. If `coretap` is not
+installed or not on `PATH`, the client raises `CORETAP_CLI_NOT_INSTALLED` with
+the install command and `CORETAP_BIN` override hint.
+
 For `locate` and `tap target`, Coretap keeps the full source screenshot as an
 artifact but feeds the VLM a downscaled model input with long side 1368 px. The
 model's normalized point is mapped back to the original screenshot before HID
@@ -146,6 +179,25 @@ coretap --format json --backend device --device "$UDID" press volume-up
 Supported buttons are `home`, `lock`/`power`, `volume-up`, `volume-down`,
 `mute`, and `siri`. The default state is `press`; `--state down`, `--state up`,
 and `--state canceled` are available for lower-level test control.
+
+Direct text input is exposed through CoreDevice pasteboard plus the iOS edit
+menu paste action:
+
+```bash
+coretap --format json --backend device --device "$UDID" type "hello@example.com"
+coretap --format json --backend device --device "$UDID" type "搜索" --paste-at 0.2,0.54
+```
+
+Coretap sets the device pasteboard through CoreDevice, long-presses a text
+field anchor, taps the paste item in the system edit menu, then verifies visible
+text through OCR/Vision by default. This avoids the active iOS keyboard or IME
+rewriting ASCII input, and supports Unicode text without WDA. Pass `--replace`
+when you intentionally want Coretap to clear the current focused field before
+pasting. Pass
+`--paste-at x,y` to explicitly anchor the long press on the focused text field;
+without it, Coretap uses the last real tap when suitable and falls back to the
+standard iOS Spotlight search field position. Pass `--no-verify` only for
+hidden or non-visible input fields.
 
 Drag and scroll use CoreDevice's main touchscreen contact path:
 
@@ -174,8 +226,9 @@ Use `--daemon off` for one-shot local debugging, or `--daemon on` to require an
 already-running daemon without auto-starting it.
 
 `coretap tap text`, `coretap assert text`, and `coretap wait text` use the
-local `tesseract` CLI. The default OCR language is `chi_sim+eng`, so Chinese
-and English visible text work without passing `--lang`:
+local `tesseract` CLI plus a macOS Vision OCR fallback when the Xcode toolchain
+is available. The default OCR language is `chi_sim+eng`, so Chinese and English
+visible text work without passing `--lang`:
 
 ```bash
 brew install tesseract tesseract-lang
@@ -191,6 +244,7 @@ export DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer
 
 ```bash
 coretap screenshot --backend simulator --device booted --format json
+coretap screenshot --backend simulator --device booted --full-size --format json
 coretap locate --backend simulator --device booted --target "Settings app icon" --format json
 coretap tap point --backend simulator --device booted --space normalized --x 0.5 --y 0.5 --format json
 coretap assert text --backend simulator --device booted --text "Settings" --format json

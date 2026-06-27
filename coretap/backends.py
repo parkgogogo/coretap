@@ -19,6 +19,7 @@ from coretap.runtime import (
     require_success,
     run_command,
 )
+from coretap.text_input import text_input_summary
 
 
 @dataclass(frozen=True)
@@ -167,6 +168,26 @@ class SimulatorBackend:
             details={"backend": self.name, "button": button, "state": state},
         )
 
+    def type_text(
+        self,
+        device: str,
+        text: str,
+        *,
+        char_delay_ms: int = 40,
+        inter_delay_ms: int = 20,
+        paste_at: dict[str, float] | None = None,
+        paste_hold_ms: int = 1600,
+        clear_existing: bool = False,
+        dry_run: bool = False,
+    ) -> dict[str, Any]:
+        raise CoretapError(
+            "SIMULATOR_TYPE_UNSUPPORTED",
+            "CoreDevice virtual keyboard text input is only supported for real devices",
+            category="usage",
+            stage="type",
+            details={"backend": self.name},
+        )
+
     def drag_normalized(
         self,
         device: str,
@@ -294,8 +315,13 @@ class DeviceBackend:
 
             pool = get_default_device_worker_pool()
             if pool is not None:
-                capture = pool.capture_screenshot_userspace(device)
-                out.write_bytes(capture["image"])
+                try:
+                    capture = pool.capture_screenshot_userspace(device)
+                    out.write_bytes(capture["image"])
+                except CoretapError as exc:
+                    if not exc.retryable:
+                        raise
+                    capture = self._screenshot_cli_userspace_fallback(device, out, previous_error=exc)
         if capture is None:
             done = _check_coredevice_result(
                 run_command(
@@ -325,6 +351,35 @@ class DeviceBackend:
         self._normalize_screenshot_orientation(device, out)
         width, height = png_size(out)
         return Frame(f"frame_{out.stem}", out, width, height, self.name, device)
+
+    def _screenshot_cli_userspace_fallback(self, device: str, out: Path, *, previous_error: CoretapError) -> dict[str, Any]:
+        done = _check_coredevice_result(
+            run_command(
+                [
+                    "pymobiledevice3",
+                    "developer",
+                    "core-device",
+                    "screen-capture",
+                    "screenshot",
+                    "--userspace",
+                    str(out),
+                ],
+                env=self.coredevice_env(device),
+                timeout=30,
+            ),
+            code="COREDEVICE_SCREENSHOT_FAILED",
+            stage="screenshot",
+        )
+        require_success(done, code="COREDEVICE_SCREENSHOT_FAILED", stage="screenshot")
+        return {
+            "fallback": "pymobiledevice3-cli-userspace",
+            "previousError": {
+                "code": previous_error.code,
+                "message": str(previous_error),
+                "details": previous_error.details,
+            },
+            "durationMs": done.duration_ms,
+        }
 
     def display_info(self, device: str) -> dict[str, Any]:
         if self.coredevice_tunnel_mode == "userspace":
@@ -627,6 +682,78 @@ class DeviceBackend:
             "completionStatus": "exited",
             "durationMs": done.duration_ms,
         }
+
+    def type_text(
+        self,
+        device: str,
+        text: str,
+        *,
+        char_delay_ms: int = 40,
+        inter_delay_ms: int = 20,
+        paste_at: dict[str, float] | None = None,
+        paste_hold_ms: int = 1600,
+        clear_existing: bool = False,
+        dry_run: bool = False,
+    ) -> dict[str, Any]:
+        if char_delay_ms < 0:
+            raise CoretapError("INVALID_ARGUMENT", "type --char-delay-ms must be >= 0", category="usage", stage="type")
+        if inter_delay_ms < 0:
+            raise CoretapError("INVALID_ARGUMENT", "type --inter-delay-ms must be >= 0", category="usage", stage="type")
+        if paste_hold_ms < 300:
+            raise CoretapError("INVALID_ARGUMENT", "type --paste-hold-ms must be >= 300", category="usage", stage="type")
+        base = {
+            "text": text_input_summary(text),
+            "charDelayMs": char_delay_ms,
+            "interDelayMs": inter_delay_ms,
+            "pasteHoldMs": paste_hold_ms,
+            "pasteAt": paste_at,
+            "clearExisting": clear_existing,
+            "inputMethod": "coredevice-pasteboard-edit-menu",
+            "coredeviceTunnelMode": self.coredevice_tunnel_mode,
+        }
+        if dry_run:
+            return {
+                **base,
+                "attempted": False,
+                "dryRun": True,
+                "reason": "dry-run requested",
+            }
+        if self.coredevice_tunnel_mode == "userspace":
+            from coretap.device_worker import CoreDeviceWorkerPool, get_default_device_worker_pool
+
+            pool = get_default_device_worker_pool()
+            if pool is not None:
+                result = pool.type_text_userspace(
+                    device,
+                    text=text,
+                    char_delay_ms=char_delay_ms,
+                    inter_delay_ms=inter_delay_ms,
+                    paste_at=paste_at,
+                    paste_hold_ms=paste_hold_ms,
+                    clear_existing=clear_existing,
+                )
+                return {**base, **result, "attempted": True, "dryRun": False}
+            temporary_pool = CoreDeviceWorkerPool()
+            try:
+                result = temporary_pool.type_text_userspace(
+                    device,
+                    text=text,
+                    char_delay_ms=char_delay_ms,
+                    inter_delay_ms=inter_delay_ms,
+                    paste_at=paste_at,
+                    paste_hold_ms=paste_hold_ms,
+                    clear_existing=clear_existing,
+                )
+                return {**base, **result, "attempted": True, "dryRun": False}
+            finally:
+                temporary_pool.close()
+        raise CoretapError(
+            "COREDEVICE_TYPE_FAILED",
+            "Pasteboard text input requires CoreDevice userspace mode",
+            category="usage",
+            stage="type",
+            details={"coredeviceTunnelMode": self.coredevice_tunnel_mode},
+        )
 
     def drag_normalized(
         self,
