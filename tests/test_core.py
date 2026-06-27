@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -15,7 +17,13 @@ from coretap.backends import (
 )
 from coretap.cli import point_to_hid
 from coretap.device_buttons import resolve_button
-from coretap.device_worker import is_recoverable_userspace_tunnel_error, set_default_device_worker_pool
+from coretap.device_worker import (
+    CoreDeviceWorkerPool,
+    is_recoverable_coredevice_display_error,
+    is_recoverable_userspace_tunnel_error,
+    recover_coredevice_display_service,
+    set_default_device_worker_pool,
+)
 from coretap.grounding import (
     assess_grounding_tap_safety,
     prepare_grounding_image,
@@ -305,6 +313,109 @@ def test_userspace_tunnel_singleton_error_is_recoverable() -> None:
     assert is_recoverable_userspace_tunnel_error(error) is True
 
 
+def test_coredevice_display_service_error_is_recoverable() -> None:
+    error = CoretapError(
+        "COREDEVICE_DISPLAY_SERVICE_FAILED",
+        "bounded touch session failed during display-enter: TimeoutError:",
+        stage="touch-session",
+        retryable=True,
+    )
+
+    assert is_recoverable_coredevice_display_error(error) is True
+
+
+def test_recover_coredevice_display_service_signals_dtremotedisplayd(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[dict[str, object]] = []
+
+    def fake_run_command(argv: list[str], **kwargs: object) -> Completed:
+        calls.append({"argv": argv, "env": kwargs.get("env")})
+        if "list-processes" in argv:
+            return Completed(
+                argv=argv,
+                returncode=0,
+                stdout=json.dumps(
+                    [
+                        {
+                            "executableURL": {
+                                "relative": "file:///System/Developer/usr/libexec/dtremotedisplayd"
+                            },
+                            "processIdentifier": 4037,
+                        }
+                    ]
+                ),
+                stderr="",
+                duration_ms=3,
+            )
+        if "send-signal-to-process" in argv:
+            return Completed(argv=argv, returncode=0, stdout="", stderr="", duration_ms=4)
+        raise AssertionError(argv)
+
+    monkeypatch.setattr("coretap.device_worker.run_command", fake_run_command)
+
+    result = recover_coredevice_display_service("device-udid")
+
+    assert result["status"] == "signaled"
+    assert result["targets"] == [
+        {"pid": 4037, "executable": "file:///System/Developer/usr/libexec/dtremotedisplayd", "signal": 15}
+    ]
+    assert calls[0]["argv"] == ["pymobiledevice3", "developer", "core-device", "list-processes", "--userspace"]
+    assert calls[1]["argv"] == [
+        "pymobiledevice3",
+        "developer",
+        "core-device",
+        "send-signal-to-process",
+        "--userspace",
+        "4037",
+        "15",
+    ]
+    assert calls[0]["env"]["PYMOBILEDEVICE3_UDID"] == "device-udid"  # type: ignore[index]
+
+
+def test_recover_coredevice_display_service_restarts_dtuhidd_when_display_daemon_is_absent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[list[str]] = []
+
+    def fake_run_command(argv: list[str], **_kwargs: object) -> Completed:
+        calls.append(argv)
+        if "list-processes" in argv:
+            return Completed(
+                argv=argv,
+                returncode=0,
+                stdout=json.dumps(
+                    [
+                        {
+                            "executableURL": {"relative": "file:///System/Developer/usr/libexec/dtuhidd"},
+                            "processIdentifier": 3218,
+                        }
+                    ]
+                ),
+                stderr="",
+                duration_ms=3,
+            )
+        if "send-signal-to-process" in argv:
+            return Completed(argv=argv, returncode=0, stdout="", stderr="", duration_ms=4)
+        raise AssertionError(argv)
+
+    monkeypatch.setattr("coretap.device_worker.run_command", fake_run_command)
+
+    result = recover_coredevice_display_service("device-udid")
+
+    assert result["status"] == "signaled"
+    assert result["targets"] == [
+        {"pid": 3218, "executable": "file:///System/Developer/usr/libexec/dtuhidd", "signal": 9}
+    ]
+    assert calls[1] == [
+        "pymobiledevice3",
+        "developer",
+        "core-device",
+        "send-signal-to-process",
+        "--userspace",
+        "3218",
+        "9",
+    ]
+
+
 def test_device_backend_tap_falls_back_after_worker_tunnel_error(monkeypatch: pytest.MonkeyPatch) -> None:
     class FailingPool:
         def tap_userspace(self, *_args: object) -> dict[str, object]:
@@ -336,6 +447,32 @@ def test_device_backend_tap_falls_back_after_worker_tunnel_error(monkeypatch: py
     assert result["dispatchStatus"] == "sent"
     assert result["workerFallback"] == "coretap-device-hid-helper"
     assert result["previousError"]["code"] == "COREDEVICE_TAP_FAILED"
+
+
+def test_device_backend_tap_does_not_fallback_after_display_service_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    class FailingPool:
+        def tap_userspace(self, *_args: object) -> dict[str, object]:
+            raise CoretapError(
+                "COREDEVICE_DISPLAY_SERVICE_FAILED",
+                "bounded touch session failed during display-enter: TimeoutError:",
+                stage="touch-session",
+                retryable=True,
+            )
+
+    backend = DeviceBackend()
+    set_default_device_worker_pool(FailingPool())  # type: ignore[arg-type]
+    monkeypatch.setattr(
+        backend,
+        "_tap_userspace_helper",
+        lambda *_args: pytest.fail("DisplayService errors should not fall back to one-shot HID helper"),
+    )
+    try:
+        with pytest.raises(CoretapError) as exc:
+            backend.tap_normalized("device-udid", 0.25, 0.5, dry_run=False)
+    finally:
+        set_default_device_worker_pool(None)
+
+    assert exc.value.code == "COREDEVICE_DISPLAY_SERVICE_FAILED"
 
 
 def test_device_backend_display_info_falls_back_after_worker_tunnel_error(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -605,6 +742,186 @@ def test_device_backend_uses_registered_persistent_worker_for_type_text() -> Non
 
     assert pool.calls == [("device-udid", "搜索", 1, 2, {"x": 0.2, "y": 0.925}, 1300, False)]
     assert result["workerKind"] == "fake-persistent-worker"
+    assert result["dispatchStatus"] == "sent"
+    assert result["attempted"] is True
+    assert result["dryRun"] is False
+
+
+def test_device_backend_drag_does_not_fallback_after_display_service_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FailingPool:
+        def drag_userspace(self, *_args: object, **_kwargs: object) -> dict[str, object]:
+            raise CoretapError(
+                "COREDEVICE_DISPLAY_SERVICE_FAILED",
+                "CoreDevice DisplayService touch session failed to open: display-enter TimeoutError",
+                stage="touch-session",
+                retryable=True,
+            )
+
+    calls: list[list[str]] = []
+
+    def fake_run_command(argv: list[str], **_kwargs: object) -> Completed:
+        calls.append(argv)
+        return Completed(argv=argv, returncode=0, stdout="", stderr="", duration_ms=1)
+
+    set_default_device_worker_pool(FailingPool())  # type: ignore[arg-type]
+    monkeypatch.setattr("coretap.backends.run_command", fake_run_command)
+    try:
+        with pytest.raises(CoretapError) as exc:
+            DeviceBackend().drag_normalized("device-udid", 0.2, 0.2, 0.8, 0.8, dry_run=False)
+    finally:
+        set_default_device_worker_pool(None)
+
+    assert exc.value.code == "COREDEVICE_DISPLAY_SERVICE_FAILED"
+    assert calls == []
+
+
+def test_coredevice_worker_types_ascii_with_virtual_keyboard(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def run() -> dict:
+        pool = CoreDeviceWorkerPool()
+        pool._lock = asyncio.Lock()
+        session = SimpleNamespace(
+            device="device-udid",
+            keyboard_service_id=None,
+            typed_characters=0,
+            last_used_at=0,
+        )
+        calls: list[tuple[str, object]] = []
+
+        async def fake_get_or_open_keyboard_session(device: str) -> tuple[object, str]:
+            calls.append(("open", device))
+            return session, "created"
+
+        async def fake_send_text(
+            target: object,
+            *,
+            text: str,
+            char_delay_ms: int,
+            inter_delay_ms: int,
+        ) -> None:
+            calls.append(("send-text", (target, text, char_delay_ms, inter_delay_ms)))
+
+        async def fake_clear_focused_text(target: object) -> int:
+            calls.append(("clear", target))
+            return 80
+
+        async def fake_paste_text(*_args: object, **_kwargs: object) -> dict:
+            raise AssertionError("ASCII input should not use pasteboard")
+
+        monkeypatch.setattr(pool, "_get_or_open_keyboard_session", fake_get_or_open_keyboard_session)
+        monkeypatch.setattr(pool, "_send_text", fake_send_text)
+        monkeypatch.setattr(pool, "_clear_focused_text", fake_clear_focused_text)
+        monkeypatch.setattr(pool, "_paste_text", fake_paste_text)
+
+        result = await pool._type_text_userspace(
+            "device-udid",
+            text="xiaohongshu",
+            char_delay_ms=1,
+            inter_delay_ms=2,
+            paste_at=None,
+            paste_hold_ms=1300,
+            clear_existing=True,
+        )
+        result["calls"] = calls
+        return result
+
+    result = asyncio.run(run())
+
+    assert result["inputMethod"] == "coredevice-virtual-keyboard"
+    assert result["pasteboardSet"] is False
+    assert result["clearKeypresses"] == 80
+    assert result["sessionTypedCharacterCount"] == len("xiaohongshu")
+    assert result["calls"][0] == ("open", "device-udid")
+    assert result["calls"][1][0] == "clear"
+    assert result["calls"][2][0] == "send-text"
+
+
+def test_coredevice_worker_touch_retry_keeps_existing_rsd(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def run() -> dict:
+        pool = CoreDeviceWorkerPool()
+        pool._lock = asyncio.Lock()
+        session = SimpleNamespace(
+            device="device-udid",
+            taps=0,
+            last_used_at=0,
+            last_tap_normalized=None,
+        )
+        calls: list[tuple[str, object]] = []
+
+        async def fake_get_or_open_session(device: str) -> tuple[object, str]:
+            calls.append(("open", device))
+            if sum(call[0] == "open" for call in calls) == 1:
+                raise CoretapError(
+                    "COREDEVICE_DISPLAY_SERVICE_FAILED",
+                    "CoreDevice DisplayService touch session failed to open: display-enter TimeoutError",
+                    stage="touch-session",
+                    retryable=True,
+                )
+            return session, "created"
+
+        async def fake_send_tap(target: object, hx: int, hy: int) -> None:
+            calls.append(("tap", (target, hx, hy)))
+
+        async def fake_close_session(device: str) -> None:
+            calls.append(("close-session", device))
+
+        async def fake_close_rsd(_device: str) -> None:
+            raise AssertionError("touch retry must not close the userspace RSD")
+
+        async def fake_recover(device: str, *, stage: str, error: BaseException) -> dict:
+            calls.append(("recover-display", (device, stage, type(error).__name__)))
+            return {"status": "not-running"}
+
+        monkeypatch.setattr(pool, "_get_or_open_session", fake_get_or_open_session)
+        monkeypatch.setattr(pool, "_send_tap", fake_send_tap)
+        monkeypatch.setattr(pool, "_close_session", fake_close_session)
+        monkeypatch.setattr(pool, "_close_rsd", fake_close_rsd)
+        monkeypatch.setattr(pool, "_recover_display_service_for_retry", fake_recover)
+
+        result = await pool._tap_userspace("device-udid", 0.25, 0.5, 100, 200)
+        result["calls"] = calls
+        return result
+
+    result = asyncio.run(run())
+
+    assert result["dispatchStatus"] == "sent"
+    assert result["sessionStatus"] == "recreated_after_display_service_recovery"
+    assert [call[0] for call in result["calls"]] == ["open", "close-session", "recover-display", "open", "tap"]
+
+
+def test_device_backend_uses_helper_for_userspace_type_without_registered_worker(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[tuple[object, ...]] = []
+
+    def fake_helper(
+        self: DeviceBackend,
+        device: str,
+        *,
+        text: str,
+        char_delay_ms: int,
+        inter_delay_ms: int,
+        paste_at: dict | None,
+        paste_hold_ms: int,
+        clear_existing: bool,
+    ) -> dict:
+        calls.append((device, text, char_delay_ms, inter_delay_ms, paste_at, paste_hold_ms, clear_existing))
+        return {"inputMethod": "coredevice-virtual-keyboard", "dispatchStatus": "sent"}
+
+    set_default_device_worker_pool(None)
+    monkeypatch.setattr(DeviceBackend, "_type_text_userspace_helper", fake_helper)
+
+    result = DeviceBackend().type_text(
+        "device-udid",
+        "App Store",
+        char_delay_ms=3,
+        inter_delay_ms=4,
+        paste_at=None,
+        paste_hold_ms=1600,
+        clear_existing=True,
+    )
+
+    assert calls == [("device-udid", "App Store", 3, 4, None, 1600, True)]
+    assert result["inputMethod"] == "coredevice-virtual-keyboard"
     assert result["dispatchStatus"] == "sent"
     assert result["attempted"] is True
     assert result["dryRun"] is False

@@ -520,13 +520,19 @@ class DeviceBackend:
         return self._tap_cli(device, x, y, hx, hy)
 
     def _tap_userspace_direct(self, device: str, x: float, y: float, hx: int, hy: int) -> dict[str, Any]:
-        from coretap.device_worker import get_default_device_worker_pool, is_recoverable_userspace_tunnel_error
+        from coretap.device_worker import (
+            get_default_device_worker_pool,
+            is_recoverable_coredevice_display_error,
+            is_recoverable_userspace_tunnel_error,
+        )
 
         pool = get_default_device_worker_pool()
         if pool is not None:
             try:
                 return pool.tap_userspace(device, x, y, hx, hy)
             except CoretapError as exc:
+                if is_recoverable_coredevice_display_error(exc):
+                    raise
                 if not (exc.retryable or is_recoverable_userspace_tunnel_error(exc)):
                     raise
                 result = self._tap_userspace_helper(device, x, y, hx, hy)
@@ -539,7 +545,7 @@ class DeviceBackend:
         return self._tap_userspace_helper(device, x, y, hx, hy)
 
     def _tap_userspace_helper(self, device: str, x: float, y: float, hx: int, hy: int) -> dict[str, Any]:
-        timeout = 15.0
+        timeout = 25.0
         cleanup_grace = 1.0
         started = time.monotonic()
         proc = subprocess.Popen(
@@ -694,7 +700,11 @@ class DeviceBackend:
                 "reason": "dry-run requested",
             }
         if self.coredevice_tunnel_mode == "userspace":
-            from coretap.device_worker import get_default_device_worker_pool, is_recoverable_userspace_tunnel_error
+            from coretap.device_worker import (
+                get_default_device_worker_pool,
+                is_recoverable_coredevice_display_error,
+                is_recoverable_userspace_tunnel_error,
+            )
 
             pool = get_default_device_worker_pool()
             if pool is not None:
@@ -709,6 +719,8 @@ class DeviceBackend:
                     )
                     return {**base, **result, "attempted": True, "dryRun": False}
                 except CoretapError as exc:
+                    if is_recoverable_coredevice_display_error(exc):
+                        raise
                     if not (exc.retryable or is_recoverable_userspace_tunnel_error(exc)):
                         raise
                     previous_error = exc
@@ -789,7 +801,11 @@ class DeviceBackend:
                 "reason": "dry-run requested",
             }
         if self.coredevice_tunnel_mode == "userspace":
-            from coretap.device_worker import CoreDeviceWorkerPool, get_default_device_worker_pool, is_recoverable_userspace_tunnel_error
+            from coretap.device_worker import (
+                get_default_device_worker_pool,
+                is_recoverable_coredevice_display_error,
+                is_recoverable_userspace_tunnel_error,
+            )
 
             pool = get_default_device_worker_pool()
             if pool is not None:
@@ -805,6 +821,8 @@ class DeviceBackend:
                     )
                     return {**base, **result, "attempted": True, "dryRun": False}
                 except CoretapError as exc:
+                    if is_recoverable_coredevice_display_error(exc):
+                        raise
                     if not (exc.retryable or is_recoverable_userspace_tunnel_error(exc)):
                         raise
                     result = self._type_text_userspace_helper(
@@ -824,20 +842,16 @@ class DeviceBackend:
                         "workerFallback": "coretap-device-hid-helper",
                         "previousError": _previous_error_metadata(exc),
                     }
-            temporary_pool = CoreDeviceWorkerPool()
-            try:
-                result = temporary_pool.type_text_userspace(
-                    device,
-                    text=text,
-                    char_delay_ms=char_delay_ms,
-                    inter_delay_ms=inter_delay_ms,
-                    paste_at=paste_at,
-                    paste_hold_ms=paste_hold_ms,
-                    clear_existing=clear_existing,
-                )
-                return {**base, **result, "attempted": True, "dryRun": False}
-            finally:
-                temporary_pool.close()
+            result = self._type_text_userspace_helper(
+                device,
+                text=text,
+                char_delay_ms=char_delay_ms,
+                inter_delay_ms=inter_delay_ms,
+                paste_at=paste_at,
+                paste_hold_ms=paste_hold_ms,
+                clear_existing=clear_existing,
+            )
+            return {**base, **result, "attempted": True, "dryRun": False}
         raise CoretapError(
             "COREDEVICE_TYPE_FAILED",
             "Pasteboard text input requires CoreDevice userspace mode",
@@ -881,9 +895,13 @@ class DeviceBackend:
                 "attempted": False,
                 "dryRun": True,
                 "reason": "dry-run requested",
-            }
+        }
         if self.coredevice_tunnel_mode == "userspace":
-            from coretap.device_worker import get_default_device_worker_pool, is_recoverable_userspace_tunnel_error
+            from coretap.device_worker import (
+                get_default_device_worker_pool,
+                is_recoverable_coredevice_display_error,
+                is_recoverable_userspace_tunnel_error,
+            )
 
             pool = get_default_device_worker_pool()
             if pool is not None:
@@ -902,6 +920,8 @@ class DeviceBackend:
                         duration_ms=duration_ms,
                     )
                 except CoretapError as exc:
+                    if is_recoverable_coredevice_display_error(exc):
+                        raise
                     if not (exc.retryable or is_recoverable_userspace_tunnel_error(exc)):
                         raise
                     previous_error = exc
