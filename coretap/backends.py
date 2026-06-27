@@ -310,6 +310,41 @@ class DeviceBackend:
     def screenshot(self, device: str, out: Path) -> Frame:
         out.parent.mkdir(parents=True, exist_ok=True)
         capture: dict[str, Any] | None = None
+        blank_frame: dict[str, Any] | None = None
+        for attempt in range(1, 3):
+            capture = self._capture_screenshot_file(device, out)
+            if not out.exists() or out.stat().st_size == 0:
+                raise CoretapError(
+                    "COREDEVICE_SCREENSHOT_EMPTY",
+                    "CoreDevice screenshot did not produce a valid PNG",
+                    stage="screenshot",
+                    details={"path": str(out), "capture": _public_capture_metadata(capture), "attempt": attempt},
+                )
+            blank_frame = _coredevice_blank_screenshot(out)
+            if blank_frame is None:
+                break
+            if attempt == 1:
+                time.sleep(0.35)
+                continue
+            raise CoretapError(
+                "COREDEVICE_SCREENSHOT_BLANK",
+                "CoreDevice screenshot returned an all-black frame",
+                stage="screenshot",
+                category="infrastructure",
+                retryable=True,
+                details={
+                    "path": str(out),
+                    "attempts": attempt,
+                    "blankFrame": blank_frame,
+                    "capture": _public_capture_metadata(capture),
+                },
+            )
+        self._normalize_screenshot_orientation(device, out)
+        width, height = png_size(out)
+        return Frame(f"frame_{out.stem}", out, width, height, self.name, device)
+
+    def _capture_screenshot_file(self, device: str, out: Path) -> dict[str, Any] | None:
+        capture: dict[str, Any] | None = None
         if self.coredevice_tunnel_mode == "userspace":
             from coretap.device_worker import get_default_device_worker_pool
 
@@ -318,39 +353,30 @@ class DeviceBackend:
                 try:
                     capture = pool.capture_screenshot_userspace(device)
                     out.write_bytes(capture["image"])
+                    return capture
                 except CoretapError as exc:
                     if not exc.retryable:
                         raise
-                    capture = self._screenshot_cli_userspace_fallback(device, out, previous_error=exc)
-        if capture is None:
-            done = _check_coredevice_result(
-                run_command(
-                    [
-                        "pymobiledevice3",
-                        "developer",
-                        "core-device",
-                        "screen-capture",
-                        "screenshot",
-                        *self.coredevice_device_options(device),
-                        str(out),
-                    ],
-                    env=self.coredevice_env(device),
-                    timeout=20,
-                ),
-                code="COREDEVICE_SCREENSHOT_FAILED",
-                stage="screenshot",
-            )
-            require_success(done, code="COREDEVICE_SCREENSHOT_FAILED", stage="screenshot")
-        if not out.exists() or out.stat().st_size == 0:
-            raise CoretapError(
-                "COREDEVICE_SCREENSHOT_EMPTY",
-                "CoreDevice screenshot did not produce a valid PNG",
-                stage="screenshot",
-                details={"path": str(out), "capture": _public_capture_metadata(capture)},
-            )
-        self._normalize_screenshot_orientation(device, out)
-        width, height = png_size(out)
-        return Frame(f"frame_{out.stem}", out, width, height, self.name, device)
+                    return self._screenshot_cli_userspace_fallback(device, out, previous_error=exc)
+        done = _check_coredevice_result(
+            run_command(
+                [
+                    "pymobiledevice3",
+                    "developer",
+                    "core-device",
+                    "screen-capture",
+                    "screenshot",
+                    *self.coredevice_device_options(device),
+                    str(out),
+                ],
+                env=self.coredevice_env(device),
+                timeout=20,
+            ),
+            code="COREDEVICE_SCREENSHOT_FAILED",
+            stage="screenshot",
+        )
+        require_success(done, code="COREDEVICE_SCREENSHOT_FAILED", stage="screenshot")
+        return capture
 
     def _screenshot_cli_userspace_fallback(self, device: str, out: Path, *, previous_error: CoretapError) -> dict[str, Any]:
         done = _check_coredevice_result(
@@ -1125,6 +1151,27 @@ def _coredevice_screenshot_rotation(
     if orientation == "landscapeLeft":
         return 90
     return 270
+
+
+def _coredevice_blank_screenshot(path: Path) -> dict[str, Any] | None:
+    try:
+        from PIL import Image, ImageStat
+
+        with Image.open(path) as image:
+            stat = ImageStat.Stat(image.convert("RGB"))
+    except Exception:
+        return None
+    extrema = stat.extrema
+    max_channel = max(high for _low, high in extrema)
+    min_channel = min(low for low, _high in extrema)
+    if max_channel > 2:
+        return None
+    return {
+        "reason": "all_black",
+        "minChannel": int(min_channel),
+        "maxChannel": int(max_channel),
+        "extrema": [[int(low), int(high)] for low, high in extrema],
+    }
 
 
 def _parse_simple_usbmux_lines(stdout: str) -> list[Device]:

@@ -5,7 +5,14 @@ from pathlib import Path
 
 import pytest
 
-from coretap.backends import DeviceBackend, SimulatorBackend, _check_coredevice_result, _coredevice_screenshot_rotation, parse_usbmux_devices
+from coretap.backends import (
+    DeviceBackend,
+    SimulatorBackend,
+    _check_coredevice_result,
+    _coredevice_blank_screenshot,
+    _coredevice_screenshot_rotation,
+    parse_usbmux_devices,
+)
 from coretap.cli import point_to_hid
 from coretap.device_buttons import resolve_button
 from coretap.device_worker import is_recoverable_userspace_tunnel_error, set_default_device_worker_pool
@@ -490,6 +497,21 @@ def test_coredevice_screenshot_rotation_matches_display_orientation() -> None:
     assert _coredevice_screenshot_rotation((1260, 2736), (1260, 2736), "portrait") is None
 
 
+def test_coredevice_blank_screenshot_detects_all_black_png(tmp_path: Path) -> None:
+    from PIL import Image
+
+    black = tmp_path / "black.png"
+    visible = tmp_path / "visible.png"
+    Image.new("RGB", (3, 5), color=(0, 0, 0)).save(black)
+    Image.new("RGB", (3, 5), color=(0, 0, 3)).save(visible)
+
+    blank = _coredevice_blank_screenshot(black)
+
+    assert blank is not None
+    assert blank["reason"] == "all_black"
+    assert _coredevice_blank_screenshot(visible) is None
+
+
 def test_device_backend_uses_registered_persistent_worker_for_userspace_tap() -> None:
     class FakePool:
         def __init__(self) -> None:
@@ -622,6 +644,66 @@ def test_device_backend_uses_registered_persistent_worker_for_screenshot(tmp_pat
     assert frame.height == 5
     assert frame.path == out
     assert out.read_bytes() == TINY_PNG
+
+
+def test_device_backend_retries_all_black_coredevice_screenshot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from PIL import Image
+
+    calls: list[list[str]] = []
+
+    def fake_run_command(argv: list[str], **_kwargs: object) -> Completed:
+        calls.append(argv)
+        if "screen-capture" in argv:
+            output = Path(argv[-1])
+            color = (0, 0, 0) if sum("screen-capture" in call for call in calls) == 1 else (255, 0, 0)
+            Image.new("RGB", (3, 5), color=color).save(output)
+            return Completed(argv=argv, returncode=0, stdout="", stderr="", duration_ms=1)
+        if "get-display-info" in argv:
+            return Completed(
+                argv=argv,
+                returncode=0,
+                stdout=json.dumps({"displays": [{"primary": True, "currentMode": {"size": [3, 5]}}]}),
+                stderr="",
+                duration_ms=1,
+            )
+        raise AssertionError(argv)
+
+    monkeypatch.setattr("coretap.backends.run_command", fake_run_command)
+    out = tmp_path / "screen.png"
+
+    frame = DeviceBackend().screenshot("device-udid", out)
+
+    assert frame.width == 3
+    assert frame.height == 5
+    assert sum("screen-capture" in call for call in calls) == 2
+    assert _coredevice_blank_screenshot(out) is None
+
+
+def test_device_backend_rejects_repeated_all_black_coredevice_screenshot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from PIL import Image
+
+    calls: list[list[str]] = []
+
+    def fake_run_command(argv: list[str], **_kwargs: object) -> Completed:
+        calls.append(argv)
+        if "screen-capture" in argv:
+            Image.new("RGB", (3, 5), color=(0, 0, 0)).save(Path(argv[-1]))
+            return Completed(argv=argv, returncode=0, stdout="", stderr="", duration_ms=1)
+        raise AssertionError(argv)
+
+    monkeypatch.setattr("coretap.backends.run_command", fake_run_command)
+
+    with pytest.raises(CoretapError) as excinfo:
+        DeviceBackend().screenshot("device-udid", tmp_path / "screen.png")
+
+    assert excinfo.value.code == "COREDEVICE_SCREENSHOT_BLANK"
+    assert excinfo.value.retryable is True
+    assert excinfo.value.details["attempts"] == 2
+    assert sum("screen-capture" in call for call in calls) == 2
 
 
 def test_png_size(tmp_path: Path) -> None:
