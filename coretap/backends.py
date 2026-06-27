@@ -382,12 +382,18 @@ class DeviceBackend:
         }
 
     def display_info(self, device: str) -> dict[str, Any]:
+        previous_error: CoretapError | None = None
         if self.coredevice_tunnel_mode == "userspace":
-            from coretap.device_worker import get_default_device_worker_pool
+            from coretap.device_worker import get_default_device_worker_pool, is_recoverable_userspace_tunnel_error
 
             pool = get_default_device_worker_pool()
             if pool is not None:
-                return pool.display_info_userspace(device)
+                try:
+                    return pool.display_info_userspace(device)
+                except CoretapError as exc:
+                    if not (exc.retryable or is_recoverable_userspace_tunnel_error(exc)):
+                        raise
+                    previous_error = exc
         done = _check_coredevice_result(
             run_command(
                 [
@@ -421,6 +427,12 @@ class DeviceBackend:
                 stage="display-info",
                 details={"stdout": done.stdout[:1000]},
             )
+        if previous_error is not None:
+            data["_coretap"] = {
+                "fallback": "pymobiledevice3-cli-userspace",
+                "previousError": _previous_error_metadata(previous_error),
+                "durationMs": done.duration_ms,
+            }
         return data
 
     def _normalize_screenshot_orientation(self, device: str, out: Path) -> None:
@@ -482,12 +494,25 @@ class DeviceBackend:
         return self._tap_cli(device, x, y, hx, hy)
 
     def _tap_userspace_direct(self, device: str, x: float, y: float, hx: int, hy: int) -> dict[str, Any]:
-        from coretap.device_worker import get_default_device_worker_pool
+        from coretap.device_worker import get_default_device_worker_pool, is_recoverable_userspace_tunnel_error
 
         pool = get_default_device_worker_pool()
         if pool is not None:
-            return pool.tap_userspace(device, x, y, hx, hy)
+            try:
+                return pool.tap_userspace(device, x, y, hx, hy)
+            except CoretapError as exc:
+                if not (exc.retryable or is_recoverable_userspace_tunnel_error(exc)):
+                    raise
+                result = self._tap_userspace_helper(device, x, y, hx, hy)
+                return {
+                    **result,
+                    "workerFallback": "coretap-device-hid-helper",
+                    "previousError": _previous_error_metadata(exc),
+                }
 
+        return self._tap_userspace_helper(device, x, y, hx, hy)
+
+    def _tap_userspace_helper(self, device: str, x: float, y: float, hx: int, hy: int) -> dict[str, Any]:
         timeout = 15.0
         cleanup_grace = 1.0
         started = time.monotonic()
@@ -498,6 +523,8 @@ class DeviceBackend:
                 "coretap.device_hid_helper",
                 "--mode",
                 "userspace",
+                "--action",
+                "tap",
                 "--device",
                 device,
                 "--x",
@@ -641,19 +668,28 @@ class DeviceBackend:
                 "reason": "dry-run requested",
             }
         if self.coredevice_tunnel_mode == "userspace":
-            from coretap.device_worker import get_default_device_worker_pool
+            from coretap.device_worker import get_default_device_worker_pool, is_recoverable_userspace_tunnel_error
 
             pool = get_default_device_worker_pool()
             if pool is not None:
-                result = pool.press_button_userspace(
-                    device,
-                    button=spec.name,
-                    state=state,
-                    usage_page=spec.usage_page,
-                    usage_code=spec.usage_code,
-                    hold_ms=resolved_hold_ms,
-                )
-                return {**base, **result, "attempted": True, "dryRun": False}
+                try:
+                    result = pool.press_button_userspace(
+                        device,
+                        button=spec.name,
+                        state=state,
+                        usage_page=spec.usage_page,
+                        usage_code=spec.usage_code,
+                        hold_ms=resolved_hold_ms,
+                    )
+                    return {**base, **result, "attempted": True, "dryRun": False}
+                except CoretapError as exc:
+                    if not (exc.retryable or is_recoverable_userspace_tunnel_error(exc)):
+                        raise
+                    previous_error = exc
+            else:
+                previous_error = None
+        else:
+            previous_error = None
         done = _check_coredevice_result(
             run_command(
                 [
@@ -681,6 +717,14 @@ class DeviceBackend:
             "confirmationStatus": "not_requested",
             "completionStatus": "exited",
             "durationMs": done.duration_ms,
+            **(
+                {
+                    "workerFallback": "pymobiledevice3-cli-userspace",
+                    "previousError": _previous_error_metadata(previous_error),
+                }
+                if previous_error is not None
+                else {}
+            ),
         }
 
     def type_text(
@@ -719,20 +763,41 @@ class DeviceBackend:
                 "reason": "dry-run requested",
             }
         if self.coredevice_tunnel_mode == "userspace":
-            from coretap.device_worker import CoreDeviceWorkerPool, get_default_device_worker_pool
+            from coretap.device_worker import CoreDeviceWorkerPool, get_default_device_worker_pool, is_recoverable_userspace_tunnel_error
 
             pool = get_default_device_worker_pool()
             if pool is not None:
-                result = pool.type_text_userspace(
-                    device,
-                    text=text,
-                    char_delay_ms=char_delay_ms,
-                    inter_delay_ms=inter_delay_ms,
-                    paste_at=paste_at,
-                    paste_hold_ms=paste_hold_ms,
-                    clear_existing=clear_existing,
-                )
-                return {**base, **result, "attempted": True, "dryRun": False}
+                try:
+                    result = pool.type_text_userspace(
+                        device,
+                        text=text,
+                        char_delay_ms=char_delay_ms,
+                        inter_delay_ms=inter_delay_ms,
+                        paste_at=paste_at,
+                        paste_hold_ms=paste_hold_ms,
+                        clear_existing=clear_existing,
+                    )
+                    return {**base, **result, "attempted": True, "dryRun": False}
+                except CoretapError as exc:
+                    if not (exc.retryable or is_recoverable_userspace_tunnel_error(exc)):
+                        raise
+                    result = self._type_text_userspace_helper(
+                        device,
+                        text=text,
+                        char_delay_ms=char_delay_ms,
+                        inter_delay_ms=inter_delay_ms,
+                        paste_at=paste_at,
+                        paste_hold_ms=paste_hold_ms,
+                        clear_existing=clear_existing,
+                    )
+                    return {
+                        **base,
+                        **result,
+                        "attempted": True,
+                        "dryRun": False,
+                        "workerFallback": "coretap-device-hid-helper",
+                        "previousError": _previous_error_metadata(exc),
+                    }
             temporary_pool = CoreDeviceWorkerPool()
             try:
                 result = temporary_pool.type_text_userspace(
@@ -792,23 +857,32 @@ class DeviceBackend:
                 "reason": "dry-run requested",
             }
         if self.coredevice_tunnel_mode == "userspace":
-            from coretap.device_worker import get_default_device_worker_pool
+            from coretap.device_worker import get_default_device_worker_pool, is_recoverable_userspace_tunnel_error
 
             pool = get_default_device_worker_pool()
             if pool is not None:
-                return pool.drag_userspace(
-                    device,
-                    start_x=start_x,
-                    start_y=start_y,
-                    end_x=end_x,
-                    end_y=end_y,
-                    start_hx=start_hx,
-                    start_hy=start_hy,
-                    end_hx=end_hx,
-                    end_hy=end_hy,
-                    steps=steps,
-                    duration_ms=duration_ms,
-                )
+                try:
+                    return pool.drag_userspace(
+                        device,
+                        start_x=start_x,
+                        start_y=start_y,
+                        end_x=end_x,
+                        end_y=end_y,
+                        start_hx=start_hx,
+                        start_hy=start_hy,
+                        end_hx=end_hx,
+                        end_hy=end_hy,
+                        steps=steps,
+                        duration_ms=duration_ms,
+                    )
+                except CoretapError as exc:
+                    if not (exc.retryable or is_recoverable_userspace_tunnel_error(exc)):
+                        raise
+                    previous_error = exc
+            else:
+                previous_error = None
+        else:
+            previous_error = None
         done = _check_coredevice_result(
             run_command(
                 [
@@ -842,7 +916,105 @@ class DeviceBackend:
             "confirmationStatus": "not_requested",
             "completionStatus": "exited",
             "durationMs": done.duration_ms,
+            **(
+                {
+                    "workerFallback": "pymobiledevice3-cli-userspace",
+                    "previousError": _previous_error_metadata(previous_error),
+                }
+                if previous_error is not None
+                else {}
+            ),
         }
+
+    def _type_text_userspace_helper(
+        self,
+        device: str,
+        *,
+        text: str,
+        char_delay_ms: int,
+        inter_delay_ms: int,
+        paste_at: dict[str, float] | None,
+        paste_hold_ms: int,
+        clear_existing: bool,
+    ) -> dict[str, Any]:
+        timeout = max(20.0, (paste_hold_ms / 1000) + (len(text) * max(char_delay_ms, 0) / 1000) + 10.0)
+        started = time.monotonic()
+        argv = [
+            sys.executable,
+            "-m",
+            "coretap.device_hid_helper",
+            "--mode",
+            "userspace",
+            "--action",
+            "type",
+            "--device",
+            device,
+            "--text",
+            text,
+            "--char-delay-ms",
+            str(char_delay_ms),
+            "--inter-delay-ms",
+            str(inter_delay_ms),
+            "--paste-hold-ms",
+            str(paste_hold_ms),
+        ]
+        if paste_at is not None:
+            argv.extend(["--paste-at", f"{paste_at['x']},{paste_at['y']}"])
+        if clear_existing:
+            argv.append("--clear-existing")
+        proc = subprocess.Popen(
+            argv,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=self.coredevice_env(device),
+        )
+        assert proc.stdout is not None
+        selector = selectors.DefaultSelector()
+        selector.register(proc.stdout, selectors.EVENT_READ)
+        result: dict[str, Any] | None = None
+        try:
+            while time.monotonic() - started < timeout:
+                remaining = max(0.0, timeout - (time.monotonic() - started))
+                events = selector.select(timeout=remaining)
+                if not events:
+                    break
+                line = proc.stdout.readline()
+                if not line:
+                    break
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if event.get("event") == "result" and isinstance(event.get("result"), dict):
+                    result = event["result"]
+                    break
+                if event.get("event") == "error":
+                    stderr = _terminate_process(proc)
+                    raise CoretapError(
+                        "COREDEVICE_TYPE_FAILED",
+                        "CoreDevice text input helper failed before dispatch",
+                        stage="type",
+                        retryable=True,
+                        details={"helperEvent": event, "stderr": stderr},
+                    )
+            if result is None:
+                stderr = _terminate_process(proc)
+                raise CoretapError(
+                    "COREDEVICE_TYPE_FAILED",
+                    "Timed out waiting for CoreDevice text input helper",
+                    stage="type",
+                    retryable=True,
+                    details={"timeoutMs": round(timeout * 1000), "stderr": stderr},
+                )
+            try:
+                proc.wait(timeout=1.0)
+            except subprocess.TimeoutExpired:
+                _terminate_process(proc)
+            result["durationMs"] = round((time.monotonic() - started) * 1000)
+            return result
+        finally:
+            selector.close()
 
 
 def parse_usbmux_devices(stdout: str) -> list[Device]:
@@ -986,6 +1158,16 @@ def _public_capture_metadata(capture: dict[str, Any] | None) -> dict[str, Any] |
     if capture is None:
         return None
     return {key: value for key, value in capture.items() if key != "image"}
+
+
+def _previous_error_metadata(error: CoretapError) -> dict[str, Any]:
+    return {
+        "code": error.code,
+        "stage": error.stage,
+        "message": str(error),
+        "retryable": error.retryable,
+        "details": error.details,
+    }
 
 
 def _check_coredevice_result(done: Completed, *, code: str, stage: str) -> Completed:

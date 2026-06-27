@@ -13,6 +13,19 @@ from coretap.runtime import CoretapError
 
 _DEFAULT_POOL: "CoreDeviceWorkerPool | None" = None
 
+_USERSPACE_TUNNEL_RECOVERY_MARKERS = (
+    "userspace tunnel is already active",
+    "pytcp",
+    "process-global singleton",
+    "only one userspace tunnel",
+    "remote service discovery",
+    "rsd",
+    "connection lost",
+    "connection reset",
+    "broken pipe",
+    "socket is closed",
+)
+
 
 def set_default_device_worker_pool(pool: "CoreDeviceWorkerPool | None") -> None:
     global _DEFAULT_POOL
@@ -21,6 +34,32 @@ def set_default_device_worker_pool(pool: "CoreDeviceWorkerPool | None") -> None:
 
 def get_default_device_worker_pool() -> "CoreDeviceWorkerPool | None":
     return _DEFAULT_POOL
+
+
+def is_recoverable_userspace_tunnel_error(exc: BaseException) -> bool:
+    text = _error_text(exc).casefold()
+    if not text:
+        return False
+    if "userspace" not in text and "pytcp" not in text and "rsd" not in text and "coredevice" not in text:
+        return False
+    return any(marker in text for marker in _USERSPACE_TUNNEL_RECOVERY_MARKERS)
+
+
+def _error_text(value: Any) -> str:
+    parts: list[str] = []
+    if isinstance(value, CoretapError):
+        parts.extend([value.code, value.stage, str(value)])
+        parts.append(_error_text(value.details))
+    elif isinstance(value, dict):
+        for key, item in value.items():
+            parts.append(str(key))
+            parts.append(_error_text(item))
+    elif isinstance(value, list | tuple | set):
+        for item in value:
+            parts.append(_error_text(item))
+    elif value is not None:
+        parts.append(str(value))
+    return " ".join(part for part in parts if part)
 
 
 def _clamp(value: float, lower: float, upper: float) -> float:
@@ -69,6 +108,8 @@ class CoreDeviceWorkerPool:
         self._sessions: dict[str, _TouchSession] = {}
         self._button_sessions: dict[str, _ButtonSession] = {}
         self._lock: asyncio.Lock | None = None
+        self._recovery_count = 0
+        self._last_recovery: dict[str, Any] | None = None
 
     def tap_userspace(self, device: str, x: float, y: float, hx: int, hy: int) -> dict[str, Any]:
         started = time.monotonic()
@@ -257,20 +298,12 @@ class CoreDeviceWorkerPool:
             "rsdSessions": rsd_sessions,
             "touchSessions": touch_sessions,
             "buttonSessions": button_sessions,
+            "recoveryCount": self._recovery_count,
+            "lastRecovery": self._last_recovery,
         }
 
     def close(self) -> None:
-        if self._loop is None:
-            return
-        with suppress(BaseException):
-            self._run(self._close_all())
-        loop = self._loop
-        loop.call_soon_threadsafe(loop.stop)
-        if self._thread is not None:
-            self._thread.join(timeout=2)
-        self._loop = None
-        self._thread = None
-        self._ready.clear()
+        self._shutdown_loop(close_sessions=True)
 
     def _run(self, coro: Any, *, stage: str) -> Any:
         self._ensure_loop()
@@ -280,24 +313,65 @@ class CoreDeviceWorkerPool:
             return future.result(timeout=30)
         except concurrent.futures.TimeoutError as exc:
             future.cancel()
+            self._recover_worker_state(stage=stage, reason="timeout", error=exc)
             raise CoretapError(
                 "COREDEVICE_WORKER_TIMEOUT",
                 "CoreDevice worker request timed out",
                 stage=stage,
                 category="infrastructure",
                 retryable=True,
+                details={"workerRecovered": True},
             ) from exc
-        except CoretapError:
+        except CoretapError as exc:
+            if is_recoverable_userspace_tunnel_error(exc):
+                self._recover_worker_state(stage=stage, reason="userspace-tunnel-error", error=exc)
+                exc.details = {**exc.details, "workerRecovered": True}
             raise
         except Exception as exc:
+            if is_recoverable_userspace_tunnel_error(exc):
+                self._recover_worker_state(stage=stage, reason="userspace-tunnel-error", error=exc)
             raise CoretapError(
                 "COREDEVICE_WORKER_FAILED",
                 f"CoreDevice worker request failed: {exc}",
                 stage=stage,
                 category="infrastructure",
                 retryable=True,
-                details={"errorType": type(exc).__name__},
+                details={
+                    "errorType": type(exc).__name__,
+                    "workerRecovered": is_recoverable_userspace_tunnel_error(exc),
+                },
             ) from exc
+
+    def _recover_worker_state(self, *, stage: str, reason: str, error: BaseException) -> None:
+        self._recovery_count += 1
+        self._last_recovery = {
+            "stage": stage,
+            "reason": reason,
+            "errorType": type(error).__name__,
+            "message": str(error),
+            "atMonotonic": time.monotonic(),
+        }
+        self._shutdown_loop(close_sessions=True)
+
+    def _shutdown_loop(self, *, close_sessions: bool) -> None:
+        loop = self._loop
+        thread = self._thread
+        if loop is not None and loop.is_running():
+            if close_sessions:
+                with suppress(BaseException):
+                    future = asyncio.run_coroutine_threadsafe(self._close_all(), loop)
+                    future.result(timeout=3)
+            with suppress(BaseException):
+                loop.call_soon_threadsafe(loop.stop)
+        if thread is not None and thread.is_alive() and thread is not threading.current_thread():
+            thread.join(timeout=2)
+        self._loop = None
+        self._thread = None
+        self._lock = None
+        self._ready.clear()
+        self._rsd_sessions.clear()
+        self._sessions.clear()
+        self._button_sessions.clear()
 
     def _ensure_loop(self) -> None:
         if self._thread is not None and self._thread.is_alive():

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -7,10 +8,25 @@ import pytest
 from coretap.backends import DeviceBackend, SimulatorBackend, _check_coredevice_result, _coredevice_screenshot_rotation, parse_usbmux_devices
 from coretap.cli import point_to_hid
 from coretap.device_buttons import resolve_button
-from coretap.device_worker import set_default_device_worker_pool
-from coretap.grounding import prepare_grounding_image, prepare_image_long_side, remap_grounding_to_source_frame
+from coretap.device_worker import is_recoverable_userspace_tunnel_error, set_default_device_worker_pool
+from coretap.grounding import (
+    assess_grounding_tap_safety,
+    prepare_grounding_image,
+    prepare_image_long_side,
+    remap_grounding_to_source_frame,
+    target_text_terms,
+)
 from coretap.model_pack import parse_grounding_output
-from coretap.ocr import DEFAULT_OCR_LANG, find_exact_text_candidates, find_text, missing_tesseract_languages, parse_tesseract_languages, parse_tsv, parse_vision_json
+from coretap.ocr import (
+    DEFAULT_OCR_LANG,
+    OcrToken,
+    find_exact_text_candidates,
+    find_text,
+    missing_tesseract_languages,
+    parse_tesseract_languages,
+    parse_tsv,
+    parse_vision_json,
+)
 from coretap.runtime import Completed, CoretapError, png_size
 from coretap.text_input import validate_hid_text
 
@@ -107,6 +123,19 @@ def test_prepare_image_long_side_writes_requested_output_path(tmp_path: Path) ->
     assert result["sourceWidthPx"] == 1260
     assert result["sourceHeightPx"] == 2736
     assert png_size(output) == (630, 1368)
+
+
+def test_prepare_image_long_side_can_resize_in_place(tmp_path: Path) -> None:
+    from PIL import Image
+
+    source = tmp_path / "source.png"
+    Image.new("RGB", (1260, 2736), color=(255, 255, 255)).save(source)
+
+    result = prepare_image_long_side(source, output_path=source, max_long_side=1368)
+
+    assert result["path"] == str(source)
+    assert result["resized"] is True
+    assert png_size(source) == (630, 1368)
 
 
 def test_remap_grounding_to_source_frame_preserves_normalized_coordinates() -> None:
@@ -256,6 +285,147 @@ def test_coredevice_default_tunnel_mode_uses_userspace() -> None:
     assert backend.coredevice_tunnel_mode == "userspace"
     assert backend.coredevice_device_options("device-udid") == ["--userspace"]
     assert backend.coredevice_env("device-udid")["PYMOBILEDEVICE3_UDID"] == "device-udid"
+
+
+def test_userspace_tunnel_singleton_error_is_recoverable() -> None:
+    error = CoretapError(
+        "COREDEVICE_SCREENSHOT_FAILED",
+        "a userspace tunnel is already active in this process (PyTCP's stack is a process-global singleton)",
+        stage="screenshot",
+        retryable=True,
+    )
+
+    assert is_recoverable_userspace_tunnel_error(error) is True
+
+
+def test_device_backend_tap_falls_back_after_worker_tunnel_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    class FailingPool:
+        def tap_userspace(self, *_args: object) -> dict[str, object]:
+            raise CoretapError(
+                "COREDEVICE_TAP_FAILED",
+                "a userspace tunnel is already active in this process",
+                stage="tap",
+                retryable=True,
+            )
+
+    backend = DeviceBackend()
+    set_default_device_worker_pool(FailingPool())  # type: ignore[arg-type]
+    monkeypatch.setattr(
+        backend,
+        "_tap_userspace_helper",
+        lambda device, x, y, hx, hy: {
+            "attempted": True,
+            "dryRun": False,
+            "normalized": {"x": x, "y": y},
+            "hidU16": {"x": hx, "y": hy},
+            "dispatchStatus": "sent",
+        },
+    )
+    try:
+        result = backend.tap_normalized("device-udid", 0.25, 0.5, dry_run=False)
+    finally:
+        set_default_device_worker_pool(None)
+
+    assert result["dispatchStatus"] == "sent"
+    assert result["workerFallback"] == "coretap-device-hid-helper"
+    assert result["previousError"]["code"] == "COREDEVICE_TAP_FAILED"
+
+
+def test_device_backend_display_info_falls_back_after_worker_tunnel_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    class FailingPool:
+        def display_info_userspace(self, *_args: object) -> dict[str, object]:
+            raise CoretapError(
+                "COREDEVICE_DISPLAY_INFO_FAILED",
+                "Persistent CoreDevice display-info failed: a userspace tunnel is already active in this process "
+                "(PyTCP's stack is a process-global singleton; only one userspace tunnel per process is supported)",
+                stage="display-info",
+                retryable=True,
+                details={"workerRecovered": True},
+            )
+
+    calls: list[Completed] = []
+
+    def fake_run_command(argv: list[str], **_kwargs: object) -> Completed:
+        done = Completed(
+            argv=argv,
+            returncode=0,
+            stdout=json.dumps(
+                {
+                    "displays": [
+                        {
+                            "primary": True,
+                            "external": False,
+                            "currentMode": {"size": [1125, 2436]},
+                        }
+                    ],
+                    "orientation": {"currentDeviceNonFlatOrientation": "portrait"},
+                }
+            ),
+            stderr="",
+            duration_ms=12,
+        )
+        calls.append(done)
+        return done
+
+    backend = DeviceBackend()
+    set_default_device_worker_pool(FailingPool())  # type: ignore[arg-type]
+    monkeypatch.setattr("coretap.backends.run_command", fake_run_command)
+    try:
+        result = backend.display_info("device-udid")
+    finally:
+        set_default_device_worker_pool(None)
+
+    assert result["displays"][0]["currentMode"]["size"] == [1125, 2436]
+    assert result["_coretap"]["fallback"] == "pymobiledevice3-cli-userspace"
+    assert result["_coretap"]["previousError"]["code"] == "COREDEVICE_DISPLAY_INFO_FAILED"
+    assert calls
+    assert calls[0].argv == [
+        "pymobiledevice3",
+        "developer",
+        "core-device",
+        "get-display-info",
+        "--userspace",
+    ]
+
+
+def test_target_text_terms_extracts_specific_app_name() -> None:
+    assert target_text_terms("the ChatGPT app icon") == ["chatgpt"]
+    assert target_text_terms("点击 搜索") == ["搜索"]
+
+
+def test_grounding_tap_safety_rejects_missing_target_text(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    image = tmp_path / "screen.png"
+    image.write_bytes(TINY_PNG)
+    grounded = {
+        "status": "found",
+        "point": {"framePx": {"x": 120, "y": 160}, "normalized": {"x": 0.5, "y": 0.5}},
+        "frame": {"widthPx": 240, "heightPx": 320},
+    }
+    monkeypatch.setattr("coretap.grounding.run_tesseract", lambda *_args, **_kwargs: ([], ""))
+    monkeypatch.setattr("coretap.grounding.run_vision_ocr", lambda *_args, **_kwargs: ([], "[]"))
+
+    safety = assess_grounding_tap_safety(image, "the ChatGPT app icon", grounded)
+
+    assert safety["status"] == "unsafe"
+    assert safety["safeToTap"] is False
+    assert safety["checks"][1]["reason"] == "target text was not visible in the current screenshot"
+
+
+def test_grounding_tap_safety_accepts_visible_nearby_target_text(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    image = tmp_path / "screen.png"
+    image.write_bytes(TINY_PNG)
+    grounded = {
+        "status": "found",
+        "point": {"framePx": {"x": 120, "y": 150}, "normalized": {"x": 0.5, "y": 0.5}},
+        "frame": {"widthPx": 240, "heightPx": 320},
+    }
+    tokens = [OcrToken("ChatGPT", 95.0, 92, 178, 80, 20)]
+    monkeypatch.setattr("coretap.grounding.run_tesseract", lambda *_args, **_kwargs: (tokens, ""))
+
+    safety = assess_grounding_tap_safety(image, "the ChatGPT app icon", grounded)
+
+    assert safety["status"] == "safe"
+    assert safety["safeToTap"] is True
 
 
 def test_coredevice_button_alias_resolves_to_canonical_lock() -> None:

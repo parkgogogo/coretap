@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import shutil
 import subprocess
 import sys
 import time
@@ -14,7 +16,9 @@ from coretap.device_buttons import BUTTON_STATES, button_choices
 from coretap.grounding import (
     DEFAULT_GROUNDING_IMAGE_LONG_SIDE,
     GROUNDING_PROFILES,
+    assess_grounding_tap_safety,
     ground_target,
+    grounding_safety_diagnostics,
     model_cache,
     model_check,
     model_gc,
@@ -27,7 +31,7 @@ from coretap.grounding import (
     warm_model,
 )
 from coretap.model_pack import INTERNAL_FIXTURE_PROFILE, PUBLIC_MODEL_PROFILE
-from coretap.ocr import DEFAULT_OCR_LANG, find_exact_text_candidates, find_text, run_ocr, tesseract_status
+from coretap.ocr import DEFAULT_OCR_LANG, find_exact_text_candidates, find_text, run_tesseract, run_vision_ocr, tesseract_status
 from coretap.runtime import (
     CoretapError,
     artifact_dir,
@@ -86,6 +90,7 @@ EXIT_CODES = {
     "GROUNDING_NOT_FOUND": 30,
     "GROUNDING_AMBIGUOUS": 30,
     "GROUNDING_SCHEMA_INVALID": 30,
+    "GROUNDING_UNSAFE_TO_TAP": 30,
     "INVALID_POINT": 31,
     "FLOW_FAILED": 50,
     "DAEMON_UNAVAILABLE": 14,
@@ -289,12 +294,8 @@ def command_ocr(args: argparse.Namespace) -> dict[str, Any]:
     raise CoretapError("UNKNOWN_OCR_COMMAND", args.ocr_command, category="usage", stage="ocr")
 
 
-def capture(args: argparse.Namespace, *, label: str = "screenshot") -> tuple[Any, Path, Path]:
-    run_dir = artifact_dir(Path(args.artifact_root) if args.artifact_root else None)
-    out = Path(args.out) if getattr(args, "out", None) else run_dir / f"{label}.png"
-    backend = backend_for(args.backend, developer_dir=args.developer_dir, coredevice_tunnel_mode=args.coredevice_tunnel_mode)
-    frame = backend.screenshot(args.device, out)
-    frame_json = {
+def _frame_json(frame: Any) -> dict[str, Any]:
+    return {
         "frameId": frame.frame_id,
         "path": str(frame.path),
         "widthPx": frame.width,
@@ -303,13 +304,39 @@ def capture(args: argparse.Namespace, *, label: str = "screenshot") -> tuple[Any
         "device": frame.device,
         "sha256": sha256_file(frame.path),
     }
-    write_json(run_dir / f"{label}.frame.json", frame_json)
+
+
+def _capture_to(args: argparse.Namespace, *, label: str, run_dir: Path, out: Path, write_frame: bool = True) -> Any:
+    backend = backend_for(args.backend, developer_dir=args.developer_dir, coredevice_tunnel_mode=args.coredevice_tunnel_mode)
+    frame = backend.screenshot(args.device, out)
+    if write_frame:
+        write_json(run_dir / f"{label}.frame.json", _frame_json(frame))
+    return frame
+
+
+def capture(args: argparse.Namespace, *, label: str = "screenshot") -> tuple[Any, Path, Path]:
+    run_dir = artifact_dir(Path(args.artifact_root) if args.artifact_root else None)
+    out = Path(args.out) if getattr(args, "out", None) else run_dir / f"{label}.png"
+    frame = _capture_to(args, label=label, run_dir=run_dir, out=out)
     return frame, run_dir, out
 
 
+def _preserve_source_image(source: Path, preserved: Path) -> None:
+    if source == preserved:
+        return
+    preserved.parent.mkdir(parents=True, exist_ok=True)
+    preserved.unlink(missing_ok=True)
+    try:
+        os.link(source, preserved)
+    except OSError:
+        shutil.copyfile(source, preserved)
+
+
 def command_screenshot(args: argparse.Namespace) -> dict[str, Any]:
+    run_dir = artifact_dir(Path(args.artifact_root) if args.artifact_root else None)
+    output_path = Path(args.out) if args.out else run_dir / f"{args.label}.png"
     if getattr(args, "full_size", False):
-        frame, run_dir, _ = capture(args, label=args.label)
+        frame = _capture_to(args, label=args.label, run_dir=run_dir, out=output_path)
         return {
             "artifactDir": str(run_dir),
             "frame": {
@@ -325,13 +352,24 @@ def command_screenshot(args: argparse.Namespace) -> dict[str, Any]:
             },
         }
 
-    capture_args = argparse.Namespace(**vars(args))
-    capture_args.out = None
-    source_label = f"{args.label}.source"
-    frame, run_dir, source_image = capture(capture_args, label=source_label)
-    output_path = Path(args.out) if args.out else run_dir / f"{args.label}.png"
+    frame = _capture_to(args, label=args.label, run_dir=run_dir, out=output_path, write_frame=False)
     max_long_side = getattr(args, "max_long_side", DEFAULT_GROUNDING_IMAGE_LONG_SIDE)
-    preview = prepare_image_long_side(source_image, output_path=output_path, max_long_side=max_long_side)
+    source_image = output_path
+    source_label = f"{args.label}.source"
+    if max_long_side > 0 and max(frame.width, frame.height) > max_long_side:
+        source_image = run_dir / f"{source_label}.png"
+        _preserve_source_image(output_path, source_image)
+    source_frame_json = {
+        "frameId": f"frame_{source_label}" if source_image != output_path else frame.frame_id,
+        "path": str(source_image),
+        "widthPx": frame.width,
+        "heightPx": frame.height,
+        "backend": frame.backend,
+        "device": frame.device,
+        "sha256": sha256_file(source_image),
+    }
+    write_json(run_dir / f"{source_label}.frame.json", source_frame_json)
+    preview = prepare_image_long_side(output_path, output_path=output_path, max_long_side=max_long_side)
     result = {
         "artifactDir": str(run_dir),
         "frame": {
@@ -346,12 +384,13 @@ def command_screenshot(args: argparse.Namespace) -> dict[str, Any]:
             "scale": preview["scale"],
         },
         "sourceFrame": {
-            "frameId": frame.frame_id,
-            "path": str(frame.path),
+            "frameId": f"frame_{source_label}" if source_image != output_path else frame.frame_id,
+            "path": str(source_image),
             "widthPx": frame.width,
             "heightPx": frame.height,
             "backend": frame.backend,
             "device": frame.device,
+            "preserved": source_image != output_path,
         },
     }
     write_json(run_dir / f"{args.label}.result.json", result)
@@ -491,6 +530,7 @@ def command_locate(args: argparse.Namespace) -> dict[str, Any]:
         "scale": model_input["scale"],
     }
     grounded = remap_grounding_to_source_frame(grounded, source_width=frame.width, source_height=frame.height)
+    grounded["safety"] = grounding_safety_diagnostics(args.target, grounded)
     raw_tsv = grounded.pop("rawTsv", None)
     raw_output = grounded.pop("rawOutput", None)
     if raw_tsv is not None:
@@ -533,9 +573,35 @@ def command_tap_target(args: argparse.Namespace) -> dict[str, Any]:
             category="grounding",
             details={"artifactDir": located["artifactDir"], "grounding": grounded},
         )
+    safety = grounded.get("safety") if args.dry_run else assess_grounding_tap_safety(Path(located["frame"]["path"]), args.target, grounded)
+    if not isinstance(safety, dict):
+        safety = grounding_safety_diagnostics(args.target, grounded)
+    grounded["safety"] = safety
     frame = located["frame"]
     p = grounded["point"]["framePx"]
     point = point_to_hid(p["x"], p["y"], width=frame["widthPx"], height=frame["heightPx"], space="px")
+    if not args.dry_run and not safety["safeToTap"]:
+        result = {
+            "artifactDir": located["artifactDir"],
+            "target": args.target,
+            "profile": args.profile,
+            "frame": frame,
+            "grounding": grounded,
+            "point": point,
+            "tap": {
+                "attempted": False,
+                "dryRun": False,
+                "reason": "unsafe grounding",
+            },
+        }
+        write_json(Path(located["artifactDir"]) / "tap-target.result.json", result)
+        raise CoretapError(
+            "GROUNDING_UNSAFE_TO_TAP",
+            f"Grounding was not trusted enough for a real tap: {args.target}",
+            stage="grounding-safety",
+            category="grounding",
+            details={"artifactDir": located["artifactDir"], "grounding": grounded, "safety": safety},
+        )
     backend = backend_for(args.backend, developer_dir=args.developer_dir, coredevice_tunnel_mode=args.coredevice_tunnel_mode)
     tap = backend.tap_normalized(
         args.device,
@@ -564,10 +630,62 @@ def _text_query(args: argparse.Namespace) -> str:
     return str(text)
 
 
+def _run_ocr_progressive(
+    image: Path,
+    *,
+    lang: str,
+    psm: int,
+    is_match: Any,
+) -> tuple[list[Any], dict[str, Any]]:
+    tokens: list[Any] = []
+    raw: dict[str, Any] = {"engines": [], "errors": []}
+    try:
+        tesseract_tokens, tsv = run_tesseract(image, lang=lang, psm=psm)
+        tokens.extend(tesseract_tokens)
+        raw["engines"].append("tesseract")
+        raw["tesseractTsv"] = tsv
+        if is_match(tokens):
+            return tokens, raw
+    except CoretapError as exc:
+        raw["errors"].append({"engine": "tesseract", "code": exc.code, "message": str(exc), "details": exc.details})
+
+    try:
+        vision_tokens, vision_stdout = run_vision_ocr(image)
+        tokens.extend(vision_tokens)
+        raw["engines"].append("vision")
+        raw["visionJson"] = vision_stdout
+    except CoretapError as exc:
+        raw["errors"].append({"engine": "vision", "code": exc.code, "message": str(exc), "details": exc.details})
+
+    if not raw["engines"]:
+        errors = raw.get("errors") or []
+        first = errors[0] if errors else {}
+        raise CoretapError(
+            first.get("code") or "OCR_UNAVAILABLE",
+            first.get("message") or "No OCR engine is available",
+            stage="ocr",
+            category="environment",
+            details={"image": str(image), "errors": errors},
+        )
+    return tokens, raw
+
+
 def command_tap_text(args: argparse.Namespace) -> dict[str, Any]:
     text = _text_query(args)
     frame, run_dir, image = capture(args, label="text-source")
-    tokens, raw = run_ocr(image, lang=args.lang, psm=args.psm)
+    tokens, raw = _run_ocr_progressive(
+        image,
+        lang=args.lang,
+        psm=args.psm,
+        is_match=lambda current: bool(
+            find_exact_text_candidates(
+                current,
+                text,
+                case_sensitive=args.case_sensitive,
+                min_confidence=args.min_confidence,
+            )
+        ),
+    )
     _write_ocr_artifacts(run_dir, "ocr", raw)
     candidates = find_exact_text_candidates(
         tokens,
@@ -674,7 +792,12 @@ def _verify_type_result(args: argparse.Namespace, text: str, result: dict[str, A
         capture_args = argparse.Namespace(**vars(args))
         capture_args.out = None
         frame, run_dir, image = capture(capture_args, label="type-verify")
-        tokens, raw = run_ocr(image, lang=DEFAULT_OCR_LANG, psm=11)
+        tokens, raw = _run_ocr_progressive(
+            image,
+            lang=DEFAULT_OCR_LANG,
+            psm=11,
+            is_match=lambda current: bool(find_exact_text_candidates(current, text, min_confidence=25.0)),
+        )
         _write_ocr_artifacts(run_dir, "type-verify", raw)
         candidates = find_exact_text_candidates(tokens, text, min_confidence=25.0)
         last = {
@@ -717,7 +840,12 @@ def command_assert_text(args: argparse.Namespace) -> dict[str, Any]:
         attempts += 1
         lang = getattr(args, "lang", DEFAULT_OCR_LANG)
         psm = int(getattr(args, "psm", 11))
-        tokens, raw = run_ocr(image, lang=lang, psm=psm)
+        tokens, raw = _run_ocr_progressive(
+            image,
+            lang=lang,
+            psm=psm,
+            is_match=lambda current: bool(find_text(current, args.text, case_sensitive=args.case_sensitive)),
+        )
         _write_ocr_artifacts(run_dir, f"assert-{attempts:03d}", raw)
         match = find_text(tokens, args.text, case_sensitive=args.case_sensitive)
         last = {
@@ -973,8 +1101,13 @@ def command_daemon(args: argparse.Namespace) -> dict[str, Any]:
                 raise
             return {"running": False, "socket": socket_text, "error": exc.details}
     if args.daemon_command == "stop":
-        data = stop_daemon(socket_path=socket_path, timeout=args.timeout_ms / 1000)
-        return data.get("result", data)
+        try:
+            data = stop_daemon(socket_path=socket_path, timeout=args.timeout_ms / 1000)
+            return data.get("result", data)
+        except CoretapError as exc:
+            if exc.code != "DAEMON_UNAVAILABLE":
+                raise
+            return {"stopping": False, "alreadyStopped": True, "running": False, "socket": socket_text, "error": exc.details}
     raise CoretapError("UNKNOWN_COMMAND", args.daemon_command, category="usage", stage="daemon")
 
 

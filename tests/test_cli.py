@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import argparse
 import json
 import subprocess
 import sys
+from pathlib import Path
 
 import pytest
 
@@ -175,6 +177,72 @@ def test_daemon_on_requires_existing_daemon(monkeypatch, capsys) -> None:
     data = json.loads(capsys.readouterr().out)
     assert data["ok"] is False
     assert data["error"]["code"] == "DAEMON_UNAVAILABLE"
+
+
+def test_daemon_stop_is_idempotent_when_already_stopped(monkeypatch: pytest.MonkeyPatch) -> None:
+    import coretap.daemon
+    from coretap.cli import command_daemon
+
+    def fake_stop_daemon(*, socket_path=None, timeout=2.0):
+        raise CoretapError(
+            "DAEMON_UNAVAILABLE",
+            "not running",
+            stage="daemon",
+            details={"socket": str(socket_path), "error": "missing"},
+        )
+
+    monkeypatch.setattr(coretap.daemon, "stop_daemon", fake_stop_daemon)
+
+    result = command_daemon(argparse.Namespace(daemon_command="stop", socket="/tmp/coretap-test.sock", timeout_ms=10))
+
+    assert result["alreadyStopped"] is True
+    assert result["running"] is False
+    assert result["socket"] == "/tmp/coretap-test.sock"
+
+
+def test_tap_target_real_tap_blocks_unsafe_grounding(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    import coretap.cli
+    from coretap.cli import command_tap_target
+
+    frame_path = tmp_path / "source.png"
+    frame_path.write_bytes(b"\x89PNG\r\n\x1a\n")
+    located = {
+        "artifactDir": str(tmp_path),
+        "target": "the ChatGPT app icon",
+        "profile": "builtin:mai-ui-2b-mlx-6bit@1",
+        "frame": {"path": str(frame_path), "widthPx": 240, "heightPx": 320},
+        "grounding": {
+            "status": "found",
+            "point": {"framePx": {"x": 120, "y": 160}, "normalized": {"x": 0.5, "y": 0.5}},
+            "frame": {"widthPx": 240, "heightPx": 320},
+        },
+    }
+    safety = {
+        "schema": "coretap.grounding.safety.v1",
+        "status": "unsafe",
+        "safeToTap": False,
+        "checks": [{"id": "target-text-evidence", "status": "unsafe"}],
+    }
+    monkeypatch.setattr(coretap.cli, "command_locate", lambda _args: located)
+    monkeypatch.setattr(coretap.cli, "assess_grounding_tap_safety", lambda *_args, **_kwargs: safety)
+    monkeypatch.setattr(coretap.cli, "backend_for", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("tap dispatched")))
+
+    args = argparse.Namespace(
+        target="the ChatGPT app icon",
+        profile="builtin:mai-ui-2b-mlx-6bit@1",
+        backend="device",
+        developer_dir=None,
+        coredevice_tunnel_mode=None,
+        device="device-udid",
+        dry_run=False,
+    )
+    with pytest.raises(CoretapError) as exc:
+        command_tap_target(args)
+
+    assert exc.value.code == "GROUNDING_UNSAFE_TO_TAP"
+    result = json.loads((tmp_path / "tap-target.result.json").read_text(encoding="utf-8"))
+    assert result["tap"]["attempted"] is False
+    assert result["grounding"]["safety"]["safeToTap"] is False
 
 
 def test_text_ocr_commands_default_to_chinese_and_english() -> None:
