@@ -6,6 +6,23 @@ export type CoordinateSpace = "px" | "normalized" | "hid";
 export type ButtonState = "press" | "down" | "up" | "canceled";
 export type CoretapButton = "home" | "lock" | "power" | "volume-up" | "volume-down" | "mute" | "siri";
 export type ScrollDirection = "down" | "up";
+export type ObserveOcrEngine = "auto" | "vision" | "tesseract" | "all";
+export type KeyboardKey = "backspace" | "delete" | "enter" | "return" | "tab" | "escape" | "esc" | "space" | "left" | "right" | "up" | "down";
+
+export type StepPostcondition =
+  | { type: "textVisible"; text: string; caseSensitive?: boolean; minConfidence?: number }
+  | { type: "textAbsent"; text: string; caseSensitive?: boolean; minConfidence?: number }
+  | { type: "screenChanged" };
+
+export type CoretapAction =
+  | { schema: "coretap.action.v2"; type: "tap"; target: string; postconditions?: StepPostcondition[] }
+  | { schema: "coretap.action.v2"; type: "openApp"; name: string; searchTarget?: string; resultTarget?: string; postconditions?: StepPostcondition[] }
+  | { schema: "coretap.action.v2"; type: "typeText"; text: string; charDelayMs?: number; interDelayMs?: number; pasteAt?: Point | string; pasteHoldMs?: number; verifyTimeoutMs?: number; noVerify?: boolean; replace?: boolean; postconditions?: StepPostcondition[] }
+  | { schema: "coretap.action.v2"; type: "key"; key: KeyboardKey | string; count?: number; interDelayMs?: number; postconditions?: StepPostcondition[] }
+  | { schema: "coretap.action.v2"; type: "clear"; count?: number; interDelayMs?: number; postconditions?: StepPostcondition[] }
+  | { schema: "coretap.action.v2"; type: "press"; button: CoretapButton | string; state?: ButtonState; holdMs?: number | null; postconditions?: StepPostcondition[] }
+  | { schema: "coretap.action.v2"; type: "scroll"; direction: ScrollDirection; distance?: number; anchorX?: number; anchorY?: number; steps?: number; durationMs?: number; postconditions?: StepPostcondition[] }
+  | { schema: "coretap.action.v2"; type: "wait"; ms?: number; postconditions?: StepPostcondition[] };
 
 export interface CoretapOptions {
   binary?: string;
@@ -47,14 +64,6 @@ export class Coretap {
     check(options?: CommandOptions & { deep?: boolean }): Promise<unknown>;
     warm(options?: CommandOptions): Promise<unknown>;
     status(options?: CommandOptions): Promise<unknown>;
-    stop(options?: CommandOptions): Promise<unknown>;
-    cache(options?: CommandOptions): Promise<unknown>;
-    run(options: CommandOptions & { image: string; target: string }): Promise<unknown>;
-    gc(options?: CommandOptions & { dryRun?: boolean }): Promise<unknown>;
-  };
-  ocr: {
-    status(options?: CommandOptions): Promise<unknown>;
-    check(options?: CommandOptions): Promise<unknown>;
   };
   daemon: {
     start(options?: DaemonOptions): Promise<unknown>;
@@ -64,11 +73,10 @@ export class Coretap {
   setup(options?: CommandOptions): Promise<unknown>;
   checkEnvironment(options?: CommandOptions): Promise<unknown>;
   status(options?: CommandOptions): Promise<unknown>;
+  observe(options?: ObserveOptions): Promise<unknown>;
+  step(action?: CoretapAction | string | null, options?: StepOptions): Promise<unknown>;
   discover(options?: CommandOptions): Promise<unknown>;
   doctor(options?: CommandOptions): Promise<unknown>;
-  runFlow(flow: string, options?: CommandOptions & FlowOptions): Promise<unknown>;
-  replay(path: string, options?: CommandOptions): Promise<unknown>;
-  raw(args: string[], options?: CommandOptions): Promise<unknown>;
   openRun(options?: unknown): Promise<CoretapRun>;
   withSession<T>(options: unknown, body: (ui: IosVisualUi) => Promise<T>): Promise<T>;
 }
@@ -87,10 +95,6 @@ export interface Point {
   y: number;
 }
 
-export interface TapPoint extends Point {
-  space: CoordinateSpace;
-}
-
 export interface TextOptions extends CommandOptions {
   image?: string;
   timeoutMs?: number;
@@ -100,22 +104,7 @@ export interface TextOptions extends CommandOptions {
   caseSensitive?: boolean;
 }
 
-export interface TapTextOptions extends CommandOptions {
-  dryRun?: boolean;
-  lang?: string;
-  psm?: number;
-  minConfidence?: number;
-  caseSensitive?: boolean;
-}
-
 export interface TapOptions extends CommandOptions {
-  dryRun?: boolean;
-}
-
-export interface TapAtOptions extends CommandOptions {
-  frame?: string;
-  width?: number;
-  height?: number;
   dryRun?: boolean;
 }
 
@@ -136,13 +125,9 @@ export interface TypeTextOptions extends CommandOptions {
   dryRun?: boolean;
 }
 
-export interface DragOptions extends CommandOptions {
-  space?: CoordinateSpace;
-  frame?: string;
-  width?: number;
-  height?: number;
-  steps?: number;
-  durationMs?: number;
+export interface KeyOptions extends CommandOptions {
+  count?: number;
+  interDelayMs?: number;
   dryRun?: boolean;
 }
 
@@ -155,18 +140,35 @@ export interface ScrollOptions extends CommandOptions {
   dryRun?: boolean;
 }
 
-export interface ScreenshotOptions extends CommandOptions {
+export interface ObserveOptions extends CommandOptions {
   label?: string;
   out?: string;
   maxLongSide?: number;
   fullSize?: boolean;
+  lang?: string;
+  psm?: number;
+  ocrEngine?: ObserveOcrEngine;
+  minConfidence?: number;
+  noOcr?: boolean;
 }
 
-export interface FlowOptions {
-  dryRun?: boolean;
-  timeoutMs?: number;
+export interface StepOptions extends CommandOptions {
+  actionFile?: string;
+  postWaitMs?: number;
+  postTimeoutMs?: number;
   pollIntervalMs?: number;
-  caseSensitive?: boolean;
+  expectText?: string | string[];
+  expectNoText?: string | string[];
+  expectChange?: boolean;
+  failOnPostcondition?: boolean;
+  dryRun?: boolean;
+  lang?: string;
+  psm?: number;
+  ocrEngine?: ObserveOcrEngine;
+  minConfidence?: number;
+  maxLongSide?: number;
+  fullSize?: boolean;
+  noOcr?: boolean;
 }
 
 export interface DaemonOptions extends CommandOptions {
@@ -175,25 +177,22 @@ export interface DaemonOptions extends CommandOptions {
 }
 
 export class IosVisualUi {
-  screenshot(options?: ScreenshotOptions): Promise<unknown>;
-  locate(target: string, options?: CommandOptions): Promise<unknown>;
+  observe(options?: ObserveOptions): Promise<unknown>;
+  step(action?: CoretapAction | string | null, options?: StepOptions): Promise<unknown>;
   tap(target: string, options?: TapOptions): Promise<unknown>;
-  tapTarget(target: string, options?: TapOptions): Promise<unknown>;
-  tapText(text: string, options?: TapTextOptions): Promise<unknown>;
-  tapAt(point: TapPoint, options?: TapAtOptions): Promise<unknown>;
+  openApp(name: string, options?: StepOptions & { searchTarget?: string; resultTarget?: string }): Promise<unknown>;
   press(button: CoretapButton, options?: PressOptions): Promise<unknown>;
   pressHome(options?: PressOptions): Promise<unknown>;
   typeText(text: string, options?: TypeTextOptions): Promise<unknown>;
+  key(key: KeyboardKey, options?: KeyOptions): Promise<unknown>;
+  clearText(options?: KeyOptions): Promise<unknown>;
   lock(options?: PressOptions): Promise<unknown>;
   volumeUp(options?: PressOptions): Promise<unknown>;
   volumeDown(options?: PressOptions): Promise<unknown>;
-  drag(from: Point, to: Point, options?: DragOptions): Promise<unknown>;
   scroll(direction: ScrollDirection, options?: ScrollOptions): Promise<unknown>;
   expectText(expected: string, options?: TextOptions): Promise<unknown>;
   waitForText(expected: string, options?: TextOptions): Promise<unknown>;
   wait(ms: number, options?: CommandOptions): Promise<unknown>;
-  waitForStable(): Promise<unknown>;
-  snapshot(name: string): Promise<unknown>;
 }
 
 export { Coretap as CoretapClient };

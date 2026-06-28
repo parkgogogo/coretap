@@ -4,6 +4,7 @@ import csv
 import hashlib
 import io
 import json
+import re
 import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
@@ -13,6 +14,28 @@ from coretap.runtime import CoretapError, cache_root, command_env, require_succe
 
 
 DEFAULT_OCR_LANG = "chi_sim+eng"
+
+_OCR_EQUIVALENCE_TRANSLATION = str.maketrans(
+    {
+        "紅": "红",
+        "書": "书",
+        "門": "门",
+        "開": "开",
+        "應": "应",
+        "設": "设",
+        "訊": "讯",
+        "號": "号",
+        "聯": "联",
+        "絡": "络",
+        "雲": "云",
+        "國": "国",
+        "臺": "台",
+        "灣": "湾",
+        "體": "体",
+        "蘋": "苹",
+        "獲": "获",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -31,7 +54,8 @@ class OcrToken:
 
 
 def normalize_text(text: str) -> str:
-    return " ".join(unicodedata.normalize("NFKC", text).casefold().split())
+    normalized = unicodedata.normalize("NFKC", text).casefold().translate(_OCR_EQUIVALENCE_TRANSLATION)
+    return " ".join(normalized.split())
 
 
 def parse_tesseract_languages(output: str) -> list[str]:
@@ -250,6 +274,19 @@ def find_exact_text_candidates(
     if candidates:
         return candidates
 
+    for idx, hay in enumerate(normalized):
+        if _token_is_exact_with_ui_prefix(hay, needle):
+            match = token_match([tokens[idx]], idx, idx + 1)
+            match["matchedKind"] = "exact"
+            match["exactMatchStrategy"] = "ui-prefix-stripped"
+            if _passes_min_confidence(match, min_confidence):
+                key = (match["matchedTokenRange"]["start"], match["matchedTokenRange"]["endExclusive"])
+                if key not in seen:
+                    candidates.append(match)
+                    seen.add(key)
+    if candidates:
+        return candidates
+
     for idx, token in enumerate(tokens):
         if needle and needle in normalized[idx]:
             match = token_match([token], idx, idx + 1)
@@ -260,6 +297,27 @@ def find_exact_text_candidates(
                     candidates.append(match)
                     seen.add(key)
     return candidates
+
+
+def _token_is_exact_with_ui_prefix(hay: str, needle: str) -> bool:
+    if not hay or not needle or hay == needle:
+        return False
+    if not hay.endswith(needle):
+        return False
+    prefix = hay[: -len(needle)].strip()
+    if not prefix:
+        return False
+    return _is_ocr_ui_prefix(prefix)
+
+
+def _is_ocr_ui_prefix(prefix: str) -> bool:
+    compact = re.sub(r"\s+", "", prefix.casefold())
+    if compact in {"q", "搜索", "search"}:
+        return True
+    if re.fullmatch(r"[0-9]+", compact):
+        return True
+    # OCR often folds search icons, bullets, or counters into the same token.
+    return bool(re.fullmatch(r"[q0-9#•·.,:;!?~_+*/|()（）\\[\\]【】<>《》-]+", compact))
 
 
 def token_match(tokens: list[OcrToken], start: int, end: int) -> dict[str, Any]:

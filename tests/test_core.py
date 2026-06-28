@@ -251,6 +251,25 @@ def test_find_exact_text_candidates_accepts_vision_token_contains() -> None:
     assert matches[0]["matchedEngines"] == ["vision"]
 
 
+def test_find_exact_text_candidates_accepts_search_ui_prefix() -> None:
+    tokens = parse_vision_json('[{"text":"Q 小红书","confidence":30,"left":10,"top":20,"width":100,"height":30}]')
+    matches = find_exact_text_candidates(tokens, "小红书", min_confidence=50)
+
+    assert len(matches) == 1
+    assert matches[0]["matchedText"] == "Q 小红书"
+    assert matches[0]["matchedKind"] == "exact"
+    assert matches[0]["exactMatchStrategy"] == "ui-prefix-stripped"
+
+
+def test_find_exact_text_candidates_accepts_badge_ui_prefix() -> None:
+    tokens = parse_vision_json('[{"text":"⑧ 小红书","confidence":30,"left":10,"top":20,"width":100,"height":30}]')
+    matches = find_exact_text_candidates(tokens, "小红书", min_confidence=50)
+
+    assert len(matches) == 1
+    assert matches[0]["matchedText"] == "⑧ 小红书"
+    assert matches[0]["matchedKind"] == "exact"
+
+
 def test_parse_usbmux_json_devices() -> None:
     devices = parse_usbmux_devices(
         """[
@@ -311,6 +330,19 @@ def test_userspace_tunnel_singleton_error_is_recoverable() -> None:
     )
 
     assert is_recoverable_userspace_tunnel_error(error) is True
+
+
+def test_userspace_tunnel_singleton_error_is_not_display_service_error() -> None:
+    error = CoretapError(
+        "COREDEVICE_TAP_FAILED",
+        "Persistent CoreDevice HID dispatch failed: a userspace tunnel is already active in this process",
+        stage="tap",
+        retryable=True,
+        details={"previousError": "bounded touch session failed during universal-hid-enter: TimeoutError"},
+    )
+
+    assert is_recoverable_userspace_tunnel_error(error) is True
+    assert is_recoverable_coredevice_display_error(error) is False
 
 
 def test_coredevice_display_service_error_is_recoverable() -> None:
@@ -535,6 +567,11 @@ def test_device_backend_display_info_falls_back_after_worker_tunnel_error(monkey
 def test_target_text_terms_extracts_specific_app_name() -> None:
     assert target_text_terms("the ChatGPT app icon") == ["chatgpt"]
     assert target_text_terms("点击 搜索") == ["搜索"]
+    assert target_text_terms("the App Store search tab") == ["store", "search", "搜索"]
+    assert target_text_terms("the App Store search field") == ["store", "search", "搜索", "游戏"]
+    assert target_text_terms("the center of the bottom iOS home screen search field") == ["search", "搜索", "游戏", "故事等"]
+    assert target_text_terms("the retry button") == ["retry", "重试"]
+    assert target_text_terms("the search field labeled 游戏、App、故事等 at the top") == ["search", "搜索", "游戏", "故事等"]
 
 
 def test_grounding_tap_safety_rejects_missing_target_text(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -570,6 +607,80 @@ def test_grounding_tap_safety_accepts_visible_nearby_target_text(monkeypatch: py
 
     assert safety["status"] == "safe"
     assert safety["safeToTap"] is True
+
+
+def test_grounding_tap_safety_uses_nearby_vision_match_when_tesseract_match_is_far(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    image = tmp_path / "screen.png"
+    image.write_bytes(TINY_PNG)
+    grounded = {
+        "status": "found",
+        "point": {"framePx": {"x": 120, "y": 150}, "normalized": {"x": 0.5, "y": 0.5}},
+        "frame": {"widthPx": 240, "heightPx": 320},
+    }
+    tesseract_tokens = [OcrToken("搜索", 95.0, 4, 4, 40, 20)]
+    vision_tokens = [OcrToken("搜索", 95.0, 100, 140, 48, 24, engine="vision")]
+    monkeypatch.setattr("coretap.grounding.run_tesseract", lambda *_args, **_kwargs: (tesseract_tokens, ""))
+    monkeypatch.setattr("coretap.grounding.run_vision_ocr", lambda *_args, **_kwargs: (vision_tokens, "[]"))
+
+    safety = assess_grounding_tap_safety(image, "the App Store search tab", grounded)
+
+    assert safety["status"] == "safe"
+    assert safety["safeToTap"] is True
+    evidence = safety["checks"][1]
+    assert evidence["engines"] == ["tesseract", "vision"]
+    assert evidence["nearestMatch"]["matchedEngines"] == ["vision"]
+
+
+def test_grounding_tap_safety_accepts_app_store_search_placeholder(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    image = tmp_path / "screen.png"
+    image.write_bytes(TINY_PNG)
+    grounded = {
+        "status": "found",
+        "point": {"framePx": {"x": 130, "y": 30}, "normalized": {"x": 0.54, "y": 0.09}},
+        "frame": {"widthPx": 240, "heightPx": 320},
+    }
+    tokens = [OcrToken("游戏、App、故事等", 95.0, 40, 20, 130, 18, engine="vision")]
+    monkeypatch.setattr("coretap.grounding.run_tesseract", lambda *_args, **_kwargs: ([], ""))
+    monkeypatch.setattr("coretap.grounding.run_vision_ocr", lambda *_args, **_kwargs: (tokens, "[]"))
+
+    safety = assess_grounding_tap_safety(image, "the App Store search field", grounded)
+
+    assert safety["status"] == "safe"
+    assert safety["safeToTap"] is True
+    assert safety["checks"][1]["nearestMatch"]["matchedText"] == "游戏、App、故事等"
+
+
+def test_grounding_tap_safety_accepts_search_field_with_existing_query(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    image = tmp_path / "screen.png"
+    image.write_bytes(TINY_PNG)
+    grounded = {
+        "status": "found",
+        "point": {"framePx": {"x": 110, "y": 44}, "normalized": {"x": 0.46, "y": 0.14}},
+        "frame": {"widthPx": 240, "heightPx": 320},
+    }
+    tokens = [OcrToken("xiaohongshu小红书", 95.0, 40, 36, 130, 18, engine="vision")]
+    monkeypatch.setattr("coretap.grounding.run_tesseract", lambda *_args, **_kwargs: ([], ""))
+    monkeypatch.setattr("coretap.grounding.run_vision_ocr", lambda *_args, **_kwargs: (tokens, "[]"))
+
+    safety = assess_grounding_tap_safety(image, "the App Store search field", grounded)
+
+    assert safety["status"] == "safe"
+    assert safety["safeToTap"] is True
+    assert safety["checks"][1]["semanticEvidence"] == "search-field-content"
+    assert safety["checks"][1]["nearestMatch"]["matchedText"] == "xiaohongshu小红书"
+
+
+def test_paste_menu_point_uses_below_anchor_for_top_text_fields() -> None:
+    from coretap.device_worker import _paste_menu_point_for_anchor
+
+    _, top_y = _paste_menu_point_for_anchor(0.34, 0.09)
+    _, middle_y = _paste_menu_point_for_anchor(0.2, 0.54)
+
+    assert top_y > 0.09
+    assert middle_y < 0.54
 
 
 def test_coredevice_button_alias_resolves_to_canonical_lock() -> None:
@@ -837,6 +948,93 @@ def test_coredevice_worker_types_ascii_with_virtual_keyboard(monkeypatch: pytest
     assert result["calls"][2][0] == "send-text"
 
 
+def test_coredevice_worker_types_cjk_with_pinyin_keyboard(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def run() -> dict:
+        pool = CoreDeviceWorkerPool()
+        pool._lock = asyncio.Lock()
+        calls: list[tuple[str, object]] = []
+
+        class FakeService:
+            async def create_keyboard_service(self) -> int:
+                calls.append(("create-keyboard", 123))
+                return 123
+
+            async def send_keyboard(self, keyboard_service_id: int, usages: tuple[int, ...]) -> None:
+                calls.append(("send-keyboard", (keyboard_service_id, usages)))
+
+            async def send_touchscreen(self, state: int, x: int, y: int) -> None:
+                calls.append(("send-touchscreen", (state, x, y)))
+
+        session = SimpleNamespace(
+            device="device-udid",
+            keyboard_service_id=None,
+            service=FakeService(),
+            typed_characters=0,
+            last_used_at=0,
+        )
+
+        async def fake_get_or_open_keyboard_session(device: str) -> tuple[object, str]:
+            calls.append(("open", device))
+            return session, "created"
+
+        async def fake_send_text(
+            target: object,
+            *,
+            text: str,
+            char_delay_ms: int,
+            inter_delay_ms: int,
+        ) -> None:
+            calls.append(("send-text", (target, text, char_delay_ms, inter_delay_ms)))
+
+        monkeypatch.setattr(pool, "_get_or_open_keyboard_session", fake_get_or_open_keyboard_session)
+        monkeypatch.setattr(pool, "_send_text", fake_send_text)
+
+        result = await pool._type_text_userspace(
+            "device-udid",
+            text="小红书",
+            char_delay_ms=1,
+            inter_delay_ms=2,
+            paste_at=None,
+            paste_hold_ms=1300,
+            clear_existing=False,
+        )
+        result["calls"] = calls
+        return result
+
+    result = asyncio.run(run())
+
+    assert result["inputMethod"] == "coredevice-pinyin-keyboard"
+    assert result["convertedText"] == "xiaohongshu"
+    assert result["candidateCommitAction"] == "tap-first-candidate"
+    assert result["candidateSettleMs"] == 500
+    assert result["candidateCommitPoint"]["normalized"] == {"x": 0.2, "y": 0.878}
+    assert result["sessionTypedCharacterCount"] == len("小红书")
+    assert result["calls"][0] == ("open", "device-udid")
+    assert result["calls"][1][0] == "send-text"
+    assert result["calls"][1][1][1] == "xiaohongshu"
+    assert any(call[0] == "send-touchscreen" for call in result["calls"])
+
+
+def test_coredevice_worker_rejects_non_cjk_without_paste_anchor() -> None:
+    async def run() -> None:
+        pool = CoreDeviceWorkerPool()
+        pool._lock = asyncio.Lock()
+        await pool._type_text_userspace(
+            "device-udid",
+            text="こんにちは",
+            char_delay_ms=1,
+            inter_delay_ms=2,
+            paste_at=None,
+            paste_hold_ms=1300,
+            clear_existing=False,
+        )
+
+    with pytest.raises(CoretapError) as exc:
+        asyncio.run(run())
+
+    assert exc.value.code == "TEXT_INPUT_TARGET_UNKNOWN"
+
+
 def test_coredevice_worker_touch_retry_keeps_existing_rsd(monkeypatch: pytest.MonkeyPatch) -> None:
     async def run() -> dict:
         pool = CoreDeviceWorkerPool()
@@ -888,6 +1086,53 @@ def test_coredevice_worker_touch_retry_keeps_existing_rsd(monkeypatch: pytest.Mo
     assert result["dispatchStatus"] == "sent"
     assert result["sessionStatus"] == "recreated_after_display_service_recovery"
     assert [call[0] for call in result["calls"]] == ["open", "close-session", "recover-display", "open", "tap"]
+
+
+def test_coredevice_worker_touch_retry_closes_device_for_userspace_tunnel_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def run() -> dict:
+        pool = CoreDeviceWorkerPool()
+        pool._lock = asyncio.Lock()
+        session = SimpleNamespace(
+            device="device-udid",
+            taps=0,
+            last_used_at=0,
+            last_tap_normalized=None,
+        )
+        calls: list[tuple[str, object]] = []
+
+        async def fake_get_or_open_session(device: str) -> tuple[object, str]:
+            calls.append(("open", device))
+            if sum(call[0] == "open" for call in calls) == 1:
+                raise CoretapError(
+                    "COREDEVICE_TAP_FAILED",
+                    "a userspace tunnel is already active in this process (PyTCP's stack is a process-global singleton)",
+                    stage="tap",
+                    retryable=True,
+                )
+            return session, "created"
+
+        async def fake_send_tap(target: object, hx: int, hy: int) -> None:
+            calls.append(("tap", (target, hx, hy)))
+
+        async def fake_close_device(device: str) -> None:
+            calls.append(("close-device", device))
+
+        monkeypatch.setattr(pool, "_get_or_open_session", fake_get_or_open_session)
+        monkeypatch.setattr(pool, "_send_tap", fake_send_tap)
+        monkeypatch.setattr(pool, "_close_device", fake_close_device)
+
+        result = await pool._tap_userspace("device-udid", 0.25, 0.5, 100, 200)
+        result["calls"] = calls
+        return result
+
+    result = asyncio.run(run())
+
+    assert result["dispatchStatus"] == "sent"
+    assert result["sessionStatus"] == "recreated_after_error"
+    assert result["retryCloseScope"] == "device"
+    assert [call[0] for call in result["calls"]] == ["open", "close-device", "open", "tap"]
 
 
 def test_device_backend_uses_helper_for_userspace_type_without_registered_worker(monkeypatch: pytest.MonkeyPatch) -> None:

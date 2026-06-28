@@ -9,69 +9,45 @@ import uuid
 from contextlib import suppress
 from collections.abc import AsyncIterator
 
+from coretap.runtime import CoretapError
+
 
 def emit(data: dict[str, object]) -> None:
     print(json.dumps(data, ensure_ascii=False), flush=True)
 
 
+def contains_cjk(text: str) -> bool:
+    return any("\u4e00" <= ch <= "\u9fff" for ch in text)
+
+
+def pinyin_keyboard_text(text: str) -> str | None:
+    if not contains_cjk(text):
+        return None
+    from pypinyin import Style, lazy_pinyin
+
+    parts = lazy_pinyin(text, style=Style.NORMAL, errors="default", strict=False)
+    keyboard_text = "".join(parts)
+    if not keyboard_text or not keyboard_text.isascii():
+        return None
+    return keyboard_text
+
+
+def paste_menu_point_for_anchor(anchor_x: float, anchor_y: float) -> tuple[float, float]:
+    paste_x = min(0.92, max(0.08, anchor_x - 0.07))
+    vertical_offset = 0.059 if anchor_y < 0.18 else -0.059
+    paste_y = min(0.95, max(0.05, anchor_y + vertical_offset))
+    return paste_x, paste_y
+
+
 @contextlib.asynccontextmanager
 async def bounded_touch_session(rsd: object, *, display_id: int = 1) -> AsyncIterator[object]:
-    from pymobiledevice3.remote.core_device.display_service import DisplayService
     from pymobiledevice3.remote.core_device.hid_service import UniversalHIDServiceService
-    from pymobiledevice3.remote.core_device.screen_stream import open_media_receiver
-
-    sender_ip = rsd.service.address[0]  # type: ignore[attr-defined]
-    display = DisplayService(rsd)  # type: ignore[arg-type]
-    transport = None
-    drain_task: asyncio.Task[None] | None = None
-    client_session_id: uuid.UUID | None = None
-    phase = "display-enter"
 
     try:
-        await display.__aenter__()
-        phase = "open-media-receiver"
-        transport, receiver_ip = open_media_receiver(display, (1 * 1024 * 1024,))
-
-        async def drain() -> None:
-            try:
-                while True:
-                    await transport.recv()  # type: ignore[union-attr]
-            except (asyncio.CancelledError, OSError):
-                pass
-
-        phase = "start-video-stream"
-        answer = await asyncio.wait_for(
-            display.start_video_stream(
-                receiver_ip=receiver_ip,
-                receiver_port=transport.port,
-                sender_ip=sender_ip,
-                display_id=display_id,
-            ),
-            timeout=12.0,
-        )
-        raw_session_id = answer["connection"]["options"]["avcMediaStreamOptionClientSessionID"]["uuid"]
-        client_session_id = raw_session_id if isinstance(raw_session_id, uuid.UUID) else uuid.UUID(raw_session_id)
-        await asyncio.sleep(0.3)
-        drain_task = asyncio.create_task(drain())
-        phase = "universal-hid-enter"
         async with UniversalHIDServiceService(rsd) as hid:  # type: ignore[arg-type]
-            phase = "yield-hid"
             yield hid
     except BaseException as exc:
-        raise RuntimeError(f"bounded touch session failed during {phase}: {type(exc).__name__}: {exc}") from exc
-    finally:
-        if drain_task is not None:
-            drain_task.cancel()
-            with suppress(BaseException):
-                await asyncio.wait_for(drain_task, timeout=1.0)
-        if client_session_id is not None:
-            with suppress(BaseException):
-                await asyncio.wait_for(display.stop_media_stream(client_session_id), timeout=2.0)
-        if transport is not None:
-            with suppress(BaseException):
-                transport.close()
-        with suppress(BaseException):
-            await asyncio.wait_for(display.__aexit__(None, None, None), timeout=2.0)
+        raise RuntimeError(f"bounded touch session failed during universal-hid-enter: {type(exc).__name__}: {exc}") from exc
 
 
 async def tap_userspace(device: str, x: int, y: int) -> None:
@@ -110,6 +86,7 @@ async def type_text_userspace(
     char_delay_ms: int,
     inter_delay_ms: int,
     paste_at: dict[str, float] | None,
+    paste_mode: str,
     paste_hold_ms: int,
     clear_existing: bool,
 ) -> None:
@@ -172,6 +149,32 @@ async def type_text_userspace(
             if inter_delay:
                 await asyncio.sleep(inter_delay)
 
+    async def type_pinyin(service: object, keyboard_text: str) -> dict[str, object]:
+        nonlocal keyboard_service_id
+        await type_ascii_text(service, keyboard_text)
+        if keyboard_service_id is None:
+            keyboard_service_id = await service.create_keyboard_service()  # type: ignore[attr-defined]
+        await asyncio.sleep(0.5)
+        commit_point = await send_tap(service, 0.2, 0.878)
+        await asyncio.sleep(0.25)
+        return commit_point
+
+    async def type_ascii_text(service: object, keyboard_text: str) -> None:
+        nonlocal keyboard_service_id
+        if keyboard_service_id is None:
+            keyboard_service_id = await service.create_keyboard_service()  # type: ignore[attr-defined]
+        char_delay = char_delay_ms / 1000
+        inter_delay = inter_delay_ms / 1000
+        for ch in keyboard_text:
+            usage, needs_shift = ASCII_TO_HID[ch]
+            usages = (KEY_LEFT_SHIFT, usage) if needs_shift else (usage,)
+            await service.send_keyboard(keyboard_service_id, usages)  # type: ignore[attr-defined]
+            if char_delay:
+                await asyncio.sleep(char_delay)
+            await service.send_keyboard(keyboard_service_id, ())  # type: ignore[attr-defined]
+            if inter_delay:
+                await asyncio.sleep(inter_delay)
+
     stage = "set-pasteboard"
     try:
         ascii_only = all(ch in ASCII_TO_HID for ch in text)
@@ -200,6 +203,35 @@ async def type_text_userspace(
             emit({"event": "result", "result": result})
             return
 
+        pinyin_text = pinyin_keyboard_text(text)
+        if pinyin_text is not None and paste_at is None:
+            stage = "pinyin-keyboard-session"
+            result = {}
+            async with UniversalHIDServiceService(rsd) as service:
+                clear_count = 0
+                if clear_existing:
+                    stage = "clear-existing"
+                    clear_count = await clear_text(service)
+                stage = "type-pinyin"
+                commit_point = await type_pinyin(service, pinyin_text)
+                stage = "emit-result"
+                result = {
+                    "dispatchStatus": "sent",
+                    "confirmationStatus": "dispatched_unverified",
+                    "sessionStatus": "helper-direct",
+                    "sessionTypedCharacterCount": len(text),
+                    "keyboardServiceRegistered": keyboard_service_id is not None,
+                    "pasteboardSet": False,
+                    "inputMethod": "coredevice-pinyin-keyboard",
+                    "convertedText": pinyin_text,
+                    "candidateCommitAction": "tap-first-candidate",
+                    "candidateCommitPoint": commit_point,
+                    "clearExisting": clear_existing,
+                    "clearKeypresses": clear_count,
+                }
+            emit({"event": "result", "result": result})
+            return
+
         async with PasteboardService(rsd) as pasteboard:
             await pasteboard.set_text(text)
 
@@ -212,21 +244,40 @@ async def type_text_userspace(
                 clear_count = await clear_text(service)
 
             if paste_at is None:
-                anchor = {"x": 0.2, "y": 0.54}
-                anchor_source = "ios-spotlight-search-field"
+                raise CoretapError(
+                    "TEXT_INPUT_TARGET_UNKNOWN",
+                    "Non-ASCII text input requires a paste anchor resolved from a visible text field",
+                    category="usage",
+                    stage="type",
+                )
+            if paste_mode == "shortcut":
+                raise CoretapError(
+                    "TEXT_INPUT_UNSUPPORTED",
+                    "CoreDevice keyboard shortcut paste is not supported for iOS text input",
+                    category="usage",
+                    stage="type",
+                    details={"mode": paste_mode},
+                )
             else:
                 anchor = paste_at
-                anchor_source = "explicit"
+                anchor_source = "visible-edit-menu" if paste_mode == "menu" else "explicit"
 
             if inter_delay_ms:
                 await asyncio.sleep(inter_delay_ms / 1000)
-            stage = "open-edit-menu"
-            await send_drag(service, anchor["x"], anchor["y"], paste_hold_ms)
-            await asyncio.sleep(0.5)
-            paste_x = min(0.92, max(0.08, anchor["x"] - 0.07))
-            paste_y = min(0.95, max(0.05, anchor["y"] - 0.059))
-            stage = "tap-paste-menu"
-            paste_menu_tap = await send_tap(service, paste_x, paste_y)
+            paste_menu_tap = None
+            if paste_mode == "menu":
+                assert anchor is not None
+                paste_x, paste_y = anchor["x"], anchor["y"]
+                stage = "tap-paste-menu"
+                paste_menu_tap = await send_tap(service, paste_x, paste_y)
+            else:
+                assert anchor is not None
+                stage = "open-edit-menu"
+                await send_drag(service, anchor["x"], anchor["y"], paste_hold_ms)
+                await asyncio.sleep(0.5)
+                paste_x, paste_y = paste_menu_point_for_anchor(anchor["x"], anchor["y"])
+                stage = "tap-paste-menu"
+                paste_menu_tap = await send_tap(service, paste_x, paste_y)
             if char_delay_ms:
                 await asyncio.sleep(char_delay_ms / 1000)
             stage = "emit-result"
@@ -238,13 +289,98 @@ async def type_text_userspace(
                 "keyboardServiceRegistered": keyboard_service_id is not None,
                 "pasteboardSet": True,
                 "inputMethod": "coredevice-pasteboard-edit-menu",
-                "pasteAnchor": {"source": anchor_source, **anchor},
+                "pasteAnchor": {"source": anchor_source, **anchor} if anchor is not None else {"source": anchor_source},
                 "pasteMenuTap": paste_menu_tap,
+                "pasteMode": paste_mode,
                 "pasteHoldMs": paste_hold_ms,
                 "clearExisting": clear_existing,
                 "clearKeypresses": clear_count,
             }
         emit({"event": "result", "result": result})
+    except BaseException as exc:
+        emit({"event": "error", "errorType": type(exc).__name__, "message": str(exc), "stage": stage})
+        raise
+    finally:
+        close = getattr(rsd, "close", None)
+        if close is not None:
+            with suppress(BaseException):
+                await close()
+
+
+def normalize_keyboard_key(key: str) -> str:
+    aliases = {
+        "delete": "backspace",
+        "return": "enter",
+        "esc": "escape",
+        "arrow-left": "left",
+        "arrow-right": "right",
+        "arrow-up": "up",
+        "arrow-down": "down",
+    }
+    return aliases.get(key.strip().casefold().replace("_", "-"), key.strip().casefold())
+
+
+def keyboard_key_usage(key: str) -> int:
+    from pymobiledevice3.remote.core_device import hid_service
+
+    normalized = normalize_keyboard_key(key)
+    usages = {
+        "backspace": hid_service.KEY_BACKSPACE,
+        "enter": hid_service.KEY_ENTER,
+        "tab": hid_service.KEY_TAB,
+        "escape": hid_service.KEY_ESC,
+        "space": hid_service.KEY_SPACE,
+        "left": hid_service.KEY_LEFT,
+        "right": hid_service.KEY_RIGHT,
+        "up": hid_service.KEY_UP,
+        "down": hid_service.KEY_DOWN,
+    }
+    try:
+        return usages[normalized]
+    except KeyError as exc:
+        raise ValueError(f"unsupported keyboard key: {key}") from exc
+
+
+async def keyboard_key_userspace(
+    device: str,
+    *,
+    key: str,
+    count: int,
+    inter_delay_ms: int,
+) -> None:
+    from pymobiledevice3.remote import userspace_tunnel
+    from pymobiledevice3.remote.core_device.hid_service import UniversalHIDServiceService
+
+    rsd = await userspace_tunnel.establish_userspace_rsd(serial=device)
+    stage = "keyboard-session"
+    keyboard_service_id: int | None = None
+    try:
+        usage = keyboard_key_usage(key)
+        normalized = normalize_keyboard_key(key)
+        async with UniversalHIDServiceService(rsd) as service:
+            keyboard_service_id = await service.create_keyboard_service()  # type: ignore[attr-defined]
+            inter_delay = inter_delay_ms / 1000
+            for _ in range(count):
+                stage = "send-key"
+                await service.send_keyboard(keyboard_service_id, (usage,))  # type: ignore[attr-defined]
+                await service.send_keyboard(keyboard_service_id, ())  # type: ignore[attr-defined]
+                if inter_delay:
+                    await asyncio.sleep(inter_delay)
+        emit(
+            {
+                "event": "result",
+                "result": {
+                    "dispatchStatus": "sent",
+                    "confirmationStatus": "dispatched_unverified",
+                    "sessionStatus": "helper-direct",
+                    "keyboardServiceRegistered": keyboard_service_id is not None,
+                    "inputMethod": "coredevice-virtual-keyboard",
+                    "resolvedKey": normalized,
+                    "hidKeyboardUsage": usage,
+                    "keypressesSent": count,
+                },
+            }
+        )
     except BaseException as exc:
         emit({"event": "error", "errorType": type(exc).__name__, "message": str(exc), "stage": stage})
         raise
@@ -283,8 +419,25 @@ async def run(args: argparse.Namespace) -> None:
             char_delay_ms=args.char_delay_ms,
             inter_delay_ms=args.inter_delay_ms,
             paste_at=parse_paste_at(args.paste_at),
+            paste_mode=args.paste_mode,
             paste_hold_ms=args.paste_hold_ms,
             clear_existing=args.clear_existing,
+        )
+        return
+    if args.action == "key":
+        await keyboard_key_userspace(
+            args.device,
+            key=args.key,
+            count=args.count,
+            inter_delay_ms=args.inter_delay_ms,
+        )
+        return
+    if args.action == "clear":
+        await keyboard_key_userspace(
+            args.device,
+            key="backspace",
+            count=args.count,
+            inter_delay_ms=args.inter_delay_ms,
         )
         return
     raise ValueError(f"unsupported action: {args.action}")
@@ -293,7 +446,7 @@ async def run(args: argparse.Namespace) -> None:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="python -m coretap.device_hid_helper")
     parser.add_argument("--mode", choices=["userspace"], required=True)
-    parser.add_argument("--action", choices=["tap", "type"], default="tap")
+    parser.add_argument("--action", choices=["tap", "type", "key", "clear"], default="tap")
     parser.add_argument("--device", required=True)
     parser.add_argument("--x", type=int, default=None)
     parser.add_argument("--y", type=int, default=None)
@@ -301,8 +454,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--char-delay-ms", type=int, default=40)
     parser.add_argument("--inter-delay-ms", type=int, default=20)
     parser.add_argument("--paste-at", default=None)
+    parser.add_argument("--paste-mode", choices=["anchor", "menu"], default="anchor")
     parser.add_argument("--paste-hold-ms", type=int, default=1600)
     parser.add_argument("--clear-existing", action="store_true")
+    parser.add_argument("--key", default="backspace")
+    parser.add_argument("--count", type=int, default=1)
     return parser
 
 

@@ -73,35 +73,6 @@ async function main() {
   const model = await client.model.status();
   assert(model.profile === "builtin:mai-ui-2b-mlx-6bit@1", "model status did not return the built-in profile");
 
-  const run = await client.openRun({ name: "node-smoke" });
-  await run.test("wait works", async (ui) => {
-    const result = await ui.wait(1);
-    assert(result.waitedMs === 1, "wait result did not round-trip");
-  });
-  await run.close();
-
-  const dryRunDevice = await Coretap.connect({
-    command: pythonCoretapCommand(),
-    backend: "device",
-    device: "device-udid",
-    daemon: "off",
-    cwd: REPO_ROOT,
-  });
-  const dryRun = await dryRunDevice.openRun({ name: "node-device-dry-run" });
-  await dryRun.test("device dry-run gestures work", async (ui) => {
-    const tap = await ui.tapAt({ space: "normalized", x: 0.5, y: 0.5 }, { dryRun: true });
-    assert(tap.tap.dryRun === true, "tapAt dry-run did not round-trip");
-    const press = await ui.pressHome({ dryRun: true });
-    assert(press.dryRun === true && press.button === "home", "pressHome dry-run did not round-trip");
-    const typed = await ui.typeText("hello@example.com", { dryRun: true, charDelayMs: 0, interDelayMs: 0, pasteAt: { x: 0.2, y: 0.54 } });
-    assert(typed.dryRun === true && typed.text.length === "hello@example.com".length, "typeText dry-run did not round-trip");
-    const drag = await ui.drag({ x: 0.5, y: 0.8 }, { x: 0.5, y: 0.2 }, { dryRun: true });
-    assert(drag.drag.dryRun === true, "drag dry-run did not round-trip");
-    const scroll = await ui.scroll("down", { dryRun: true });
-    assert(scroll.drag.dryRun === true, "scroll dry-run did not round-trip");
-  });
-  await dryRun.close();
-
   const fake = await Coretap.connect({
     command: fakeCoretapCommand(),
     backend: "device",
@@ -111,31 +82,109 @@ async function main() {
     daemon: "off",
   });
   const fakeRun = await fake.openRun({ name: "node-argv" });
-  await fakeRun.test("tapText args include OCR options", async (ui) => {
-    const result = await ui.tapText("搜索", {
-      dryRun: true,
-      lang: "chi_sim+eng",
-      psm: 11,
-      minConfidence: 50,
-      caseSensitive: true,
-    });
+  await fakeRun.test("mobile-use helpers route through step", async (ui) => {
+    const tap = await ui.tap("the App Store search field", { dryRun: true, expectChange: true });
     assert(
-      argvIncludesInOrder(result.argv, [
+      argvIncludesInOrder(tap.argv, [
         "--coredevice-tunnel-mode",
         "userspace",
-        "tap",
-        "text",
-        "搜索",
+        "step",
+        "--action",
+        '{"schema":"coretap.action.v2","type":"tap","target":"the App Store search field"}',
+        "--expect-change",
         "--dry-run",
+      ]),
+      `tap argv was not built as expected: ${tap.argv.join(" ")}`,
+    );
+
+    const typed = await ui.typeText("hello@example.com", { dryRun: true, charDelayMs: 0, interDelayMs: 0, pasteAt: { x: 0.2, y: 0.54 } });
+    assert(
+      argvIncludesInOrder(typed.argv, [
+        "step",
+        "--action",
+        '{"schema":"coretap.action.v2","type":"typeText","text":"hello@example.com","charDelayMs":0,"interDelayMs":0,"pasteAt":{"x":0.2,"y":0.54}}',
+        "--dry-run",
+      ]),
+      `typeText argv was not built as expected: ${typed.argv.join(" ")}`,
+    );
+
+    const opened = await ui.openApp("App Store", { dryRun: true });
+    assert(
+      argvIncludesInOrder(opened.argv, [
+        "step",
+        "--action",
+        '{"schema":"coretap.action.v2","type":"openApp","name":"App Store"}',
+        "--dry-run",
+      ]),
+      `openApp argv was not built as expected: ${opened.argv.join(" ")}`,
+    );
+  });
+  await fakeRun.test("observe args use default JSON output", async (ui) => {
+    const result = await ui.observe({
+      label: "agent-eyes",
+      maxLongSide: 1368,
+      lang: "chi_sim+eng",
+      psm: 11,
+      ocrEngine: "vision",
+      minConfidence: 10,
+    });
+    assert(!result.argv.includes("--format"), `observe argv should not include --format: ${result.argv.join(" ")}`);
+    assert(
+      argvIncludesInOrder(result.argv, [
+        "--backend",
+        "device",
+        "--device",
+        "device-udid",
+        "observe",
+        "--label",
+        "agent-eyes",
+        "--max-long-side",
+        "1368",
         "--lang",
         "chi_sim+eng",
         "--psm",
         "11",
+        "--ocr-engine",
+        "vision",
         "--min-confidence",
-        "50",
-        "--case-sensitive",
+        "10",
       ]),
-      `tapText argv was not built as expected: ${result.argv.join(" ")}`,
+      `observe argv was not built as expected: ${result.argv.join(" ")}`,
+    );
+  });
+  await fakeRun.test("step args expose single-action mobile-use runtime", async (ui) => {
+    const result = await ui.step(
+      { schema: "coretap.action.v2", type: "tap", target: "the App Store search field" },
+      {
+        postWaitMs: 500,
+        postTimeoutMs: 1500,
+        pollIntervalMs: 250,
+        expectChange: true,
+        expectText: "搜索",
+        ocrEngine: "vision",
+        maxLongSide: 1368,
+      },
+    );
+    assert(
+      argvIncludesInOrder(result.argv, [
+        "step",
+        "--action",
+        '{"schema":"coretap.action.v2","type":"tap","target":"the App Store search field"}',
+        "--post-wait-ms",
+        "500",
+        "--post-timeout-ms",
+        "1500",
+        "--poll-interval-ms",
+        "250",
+        "--expect-text",
+        "搜索",
+        "--expect-change",
+        "--ocr-engine",
+        "vision",
+        "--max-long-side",
+        "1368",
+      ]),
+      `step argv was not built as expected: ${result.argv.join(" ")}`,
     );
   });
   await fakeRun.close();

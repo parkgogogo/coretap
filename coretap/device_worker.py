@@ -45,6 +45,50 @@ _DISPLAY_SERVICE_RECOVERY_MARKERS = (
 )
 
 
+KEYBOARD_KEY_CHOICES = ("backspace", "delete", "enter", "return", "tab", "escape", "esc", "space", "left", "right", "up", "down")
+
+
+def _normalize_keyboard_key(key: str) -> str:
+    normalized = key.strip().casefold().replace("_", "-")
+    aliases = {
+        "delete": "backspace",
+        "return": "enter",
+        "esc": "escape",
+        "arrow-left": "left",
+        "arrow-right": "right",
+        "arrow-up": "up",
+        "arrow-down": "down",
+    }
+    return aliases.get(normalized, normalized)
+
+
+def _keyboard_key_usage(key: str) -> int:
+    normalized = _normalize_keyboard_key(key)
+    from pymobiledevice3.remote.core_device import hid_service
+
+    usages = {
+        "backspace": hid_service.KEY_BACKSPACE,
+        "enter": hid_service.KEY_ENTER,
+        "tab": hid_service.KEY_TAB,
+        "escape": hid_service.KEY_ESC,
+        "space": hid_service.KEY_SPACE,
+        "left": hid_service.KEY_LEFT,
+        "right": hid_service.KEY_RIGHT,
+        "up": hid_service.KEY_UP,
+        "down": hid_service.KEY_DOWN,
+    }
+    try:
+        return usages[normalized]
+    except KeyError as exc:
+        raise CoretapError(
+            "INVALID_ARGUMENT",
+            f"Unsupported keyboard key: {key}",
+            category="usage",
+            stage="key",
+            details={"key": key, "supportedKeys": list(KEYBOARD_KEY_CHOICES)},
+        ) from exc
+
+
 def set_default_device_worker_pool(pool: "CoreDeviceWorkerPool | None") -> None:
     global _DEFAULT_POOL
     _DEFAULT_POOL = pool
@@ -64,6 +108,8 @@ def is_recoverable_userspace_tunnel_error(exc: BaseException) -> bool:
 
 
 def is_recoverable_coredevice_display_error(exc: BaseException) -> bool:
+    if is_recoverable_userspace_tunnel_error(exc):
+        return False
     if isinstance(exc, TimeoutError):
         return True
     text = _error_text(exc).casefold()
@@ -83,7 +129,7 @@ def _error_text(value: Any) -> str:
         for key, item in value.items():
             parts.append(str(key))
             parts.append(_error_text(item))
-    elif isinstance(value, list | tuple | set):
+    elif isinstance(value, (list, tuple, set)):
         for item in value:
             parts.append(_error_text(item))
     elif value is not None:
@@ -93,6 +139,29 @@ def _error_text(value: Any) -> str:
 
 def _clamp(value: float, lower: float, upper: float) -> float:
     return max(lower, min(upper, value))
+
+
+def _contains_cjk(text: str) -> bool:
+    return any("\u4e00" <= ch <= "\u9fff" for ch in text)
+
+
+def _pinyin_keyboard_text(text: str) -> str | None:
+    if not _contains_cjk(text):
+        return None
+    from pypinyin import Style, lazy_pinyin
+
+    parts = lazy_pinyin(text, style=Style.NORMAL, errors="default", strict=False)
+    keyboard_text = "".join(parts)
+    if not keyboard_text or not keyboard_text.isascii():
+        return None
+    return keyboard_text
+
+
+def _paste_menu_point_for_anchor(anchor_x: float, anchor_y: float) -> tuple[float, float]:
+    paste_x = _clamp(anchor_x - 0.07, 0.08, 0.92)
+    vertical_offset = 0.059 if anchor_y < 0.18 else -0.059
+    paste_y = _clamp(anchor_y + vertical_offset, 0.05, 0.95)
+    return paste_x, paste_y
 
 
 def recover_coredevice_display_service(device: str) -> dict[str, Any]:
@@ -247,6 +316,7 @@ class _KeyboardSession:
     created_at: float
     last_used_at: float
     typed_characters: int = 0
+    keypresses: int = 0
     keyboard_service_id: int | None = None
 
 
@@ -390,6 +460,44 @@ class CoreDeviceWorkerPool:
         )
         return result
 
+    def keyboard_key_userspace(
+        self,
+        device: str,
+        *,
+        key: str,
+        count: int,
+        inter_delay_ms: int = 20,
+    ) -> dict[str, Any]:
+        started = time.monotonic()
+        result = self._run(
+            self._keyboard_key_userspace(
+                device,
+                key=key,
+                count=count,
+                inter_delay_ms=inter_delay_ms,
+            ),
+            stage="key",
+            device=device,
+        )
+        result.update(
+            {
+                "attempted": True,
+                "dryRun": False,
+                "key": key,
+                "count": count,
+                "interDelayMs": inter_delay_ms,
+                "coredeviceTunnelMode": "userspace",
+                "workerKind": "coredevice-userspace-persistent",
+                "durationMs": round((time.monotonic() - started) * 1000),
+            }
+        )
+        return result
+
+    def clear_text_userspace(self, device: str, *, count: int = 80, inter_delay_ms: int = 2) -> dict[str, Any]:
+        result = self.keyboard_key_userspace(device, key="backspace", count=count, inter_delay_ms=inter_delay_ms)
+        result.update({"operation": "clear", "clearKeypresses": count})
+        return result
+
     def capture_screenshot_userspace(self, device: str) -> dict[str, Any]:
         started = time.monotonic()
         result = self._run(self._capture_screenshot_userspace(device), stage="screenshot", device=device)
@@ -452,6 +560,7 @@ class CoreDeviceWorkerPool:
                     "ageMs": round((now - session.created_at) * 1000),
                     "idleMs": round((now - session.last_used_at) * 1000),
                     "typedCharacters": session.typed_characters,
+                    "keypresses": session.keypresses,
                     "keyboardServiceRegistered": session.keyboard_service_id is not None,
                 }
             )
@@ -588,11 +697,12 @@ class CoreDeviceWorkerPool:
         assert self._lock is not None
         async with self._lock:
             display_service_recovery = None
+            retry_close_scope = None
             try:
                 session, status = await self._get_or_open_session(device)
                 await self._send_tap(session, hx, hy)
             except Exception as exc:
-                await self._close_session(device)
+                retry_close_scope = await self._close_for_retry(device, exc, session_kind="touch")
                 display_service_recovery = await self._recover_display_service_for_retry(device, stage="tap", error=exc)
                 try:
                     session, _ = await self._get_or_open_session(device)
@@ -609,6 +719,7 @@ class CoreDeviceWorkerPool:
                             "device": device,
                             "errorType": type(retry_exc).__name__,
                             "previousErrorType": type(exc).__name__,
+                            "retryCloseScope": retry_close_scope,
                             "displayServiceRecovery": display_service_recovery,
                         },
                     ) from retry_exc
@@ -624,6 +735,7 @@ class CoreDeviceWorkerPool:
                 "confirmationStatus": "not_requested",
                 "sessionStatus": status,
                 "sessionTapCount": session.taps,
+                **({"retryCloseScope": retry_close_scope} if retry_close_scope else {}),
                 **({"displayServiceRecovery": display_service_recovery} if display_service_recovery else {}),
             }
 
@@ -641,6 +753,7 @@ class CoreDeviceWorkerPool:
         assert self._lock is not None
         async with self._lock:
             display_service_recovery = None
+            retry_close_scope = None
             try:
                 session, status = await self._get_or_open_session(device)
                 await self._send_drag(
@@ -653,7 +766,7 @@ class CoreDeviceWorkerPool:
                     duration_ms=duration_ms,
                 )
             except Exception as exc:
-                await self._close_session(device)
+                retry_close_scope = await self._close_for_retry(device, exc, session_kind="touch")
                 display_service_recovery = await self._recover_display_service_for_retry(device, stage="drag", error=exc)
                 try:
                     session, _ = await self._get_or_open_session(device)
@@ -678,6 +791,7 @@ class CoreDeviceWorkerPool:
                             "device": device,
                             "errorType": type(retry_exc).__name__,
                             "previousErrorType": type(exc).__name__,
+                            "retryCloseScope": retry_close_scope,
                             "displayServiceRecovery": display_service_recovery,
                         },
                     ) from retry_exc
@@ -692,6 +806,7 @@ class CoreDeviceWorkerPool:
                 "confirmationStatus": "not_requested",
                 "sessionStatus": status,
                 "sessionDragCount": session.drags,
+                **({"retryCloseScope": retry_close_scope} if retry_close_scope else {}),
                 **({"displayServiceRecovery": display_service_recovery} if display_service_recovery else {}),
             }
 
@@ -707,11 +822,12 @@ class CoreDeviceWorkerPool:
     ) -> dict[str, Any]:
         assert self._lock is not None
         async with self._lock:
+            retry_close_scope = None
             try:
                 session, status = await self._get_or_open_button_session(device)
                 await self._send_button(session, state=state, usage_page=usage_page, usage_code=usage_code, hold_ms=hold_ms)
             except Exception as exc:
-                await self._close_button_session(device)
+                retry_close_scope = await self._close_for_retry(device, exc, session_kind="button")
                 try:
                     session, _ = await self._get_or_open_button_session(device)
                     await self._send_button(session, state=state, usage_page=usage_page, usage_code=usage_code, hold_ms=hold_ms)
@@ -729,6 +845,7 @@ class CoreDeviceWorkerPool:
                             "state": state,
                             "errorType": type(retry_exc).__name__,
                             "previousErrorType": type(exc).__name__,
+                            "retryCloseScope": retry_close_scope,
                         },
                     ) from retry_exc
             session.last_used_at = time.monotonic()
@@ -742,6 +859,7 @@ class CoreDeviceWorkerPool:
                 "confirmationStatus": "not_requested",
                 "sessionStatus": status,
                 "sessionPressCount": session.presses,
+                **({"retryCloseScope": retry_close_scope} if retry_close_scope else {}),
             }
 
     async def _type_text_userspace(
@@ -765,8 +883,25 @@ class CoreDeviceWorkerPool:
                     inter_delay_ms=inter_delay_ms,
                     clear_existing=clear_existing,
                 )
+            if paste_at is None and _pinyin_keyboard_text(text):
+                return await self._type_text_with_pinyin_keyboard_session(
+                    device,
+                    text=text,
+                    char_delay_ms=char_delay_ms,
+                    inter_delay_ms=inter_delay_ms,
+                    clear_existing=clear_existing,
+                )
+            if paste_at is None:
+                raise CoretapError(
+                    "TEXT_INPUT_TARGET_UNKNOWN",
+                    "Non-ASCII text input requires a paste anchor resolved from a visible text field",
+                    category="usage",
+                    stage="type",
+                    details={"device": device, "textLength": len(text)},
+                )
 
             display_service_recovery = None
+            retry_close_scope = None
             try:
                 session, status = await self._get_or_open_session(device)
                 input_result = await self._input_text(
@@ -779,7 +914,7 @@ class CoreDeviceWorkerPool:
                     clear_existing=clear_existing,
                 )
             except Exception as exc:
-                await self._close_session(device)
+                retry_close_scope = await self._close_for_retry(device, exc, session_kind="touch")
                 display_service_recovery = await self._recover_display_service_for_retry(device, stage="type", error=exc)
                 try:
                     session, _ = await self._get_or_open_session(device)
@@ -804,6 +939,7 @@ class CoreDeviceWorkerPool:
                             "device": device,
                             "errorType": type(retry_exc).__name__,
                             "previousErrorType": type(exc).__name__,
+                            "retryCloseScope": retry_close_scope,
                             "displayServiceRecovery": display_service_recovery,
                         },
                     ) from retry_exc
@@ -821,6 +957,7 @@ class CoreDeviceWorkerPool:
                 "keyboardServiceRegistered": session.keyboard_service_id is not None,
                 "pasteboardSet": True,
                 **input_result,
+                **({"retryCloseScope": retry_close_scope} if retry_close_scope else {}),
                 **({"displayServiceRecovery": display_service_recovery} if display_service_recovery else {}),
             }
 
@@ -830,6 +967,9 @@ class CoreDeviceWorkerPool:
             try:
                 return await self._capture_screenshot_once(device)
             except Exception as exc:
+                if is_recoverable_userspace_tunnel_error(exc):
+                    await self._close_device(device)
+                    await asyncio.sleep(0.25)
                 try:
                     result = await self._capture_screenshot_once(device)
                     result["sessionStatus"] = "recreated_after_error"
@@ -854,6 +994,9 @@ class CoreDeviceWorkerPool:
             try:
                 return await self._display_info_once(device)
             except Exception as exc:
+                if is_recoverable_userspace_tunnel_error(exc):
+                    await self._close_device(device)
+                    await asyncio.sleep(0.25)
                 try:
                     return await self._display_info_once(device)
                 except Exception as retry_exc:
@@ -924,8 +1067,8 @@ class CoreDeviceWorkerPool:
             with suppress(BaseException):
                 await asyncio.wait_for(context.__aexit__(None, None, None), timeout=2.0)
             raise CoretapError(
-                "COREDEVICE_DISPLAY_SERVICE_FAILED",
-                "CoreDevice DisplayService touch session failed to open",
+                "COREDEVICE_HID_SERVICE_FAILED",
+                "CoreDevice UniversalHID touch session failed to open",
                 stage="touch-session",
                 category="infrastructure",
                 retryable=True,
@@ -987,6 +1130,7 @@ class CoreDeviceWorkerPool:
         inter_delay_ms: int,
         clear_existing: bool,
     ) -> dict[str, Any]:
+        retry_close_scope = None
         try:
             session, status = await self._get_or_open_keyboard_session(device)
             input_result = await self._input_keyboard_text(
@@ -997,7 +1141,7 @@ class CoreDeviceWorkerPool:
                 clear_existing=clear_existing,
             )
         except Exception as exc:
-            await self._close_keyboard_session(device)
+            retry_close_scope = await self._close_for_retry(device, exc, session_kind="keyboard")
             try:
                 session, _ = await self._get_or_open_keyboard_session(device)
                 input_result = await self._input_keyboard_text(
@@ -1019,6 +1163,7 @@ class CoreDeviceWorkerPool:
                         "device": device,
                         "errorType": type(retry_exc).__name__,
                         "previousErrorType": type(exc).__name__,
+                        "retryCloseScope": retry_close_scope,
                     },
                 ) from retry_exc
         session.last_used_at = time.monotonic()
@@ -1034,7 +1179,131 @@ class CoreDeviceWorkerPool:
             "sessionTypedCharacterCount": session.typed_characters,
             "keyboardServiceRegistered": session.keyboard_service_id is not None,
             **input_result,
+            **({"retryCloseScope": retry_close_scope} if retry_close_scope else {}),
         }
+
+    async def _type_text_with_pinyin_keyboard_session(
+        self,
+        device: str,
+        *,
+        text: str,
+        char_delay_ms: int,
+        inter_delay_ms: int,
+        clear_existing: bool,
+    ) -> dict[str, Any]:
+        retry_close_scope = None
+        try:
+            session, status = await self._get_or_open_keyboard_session(device)
+            input_result = await self._input_pinyin_keyboard_text(
+                session,
+                text=text,
+                char_delay_ms=char_delay_ms,
+                inter_delay_ms=inter_delay_ms,
+                clear_existing=clear_existing,
+            )
+        except Exception as exc:
+            retry_close_scope = await self._close_for_retry(device, exc, session_kind="keyboard")
+            try:
+                session, _ = await self._get_or_open_keyboard_session(device)
+                input_result = await self._input_pinyin_keyboard_text(
+                    session,
+                    text=text,
+                    char_delay_ms=char_delay_ms,
+                    inter_delay_ms=inter_delay_ms,
+                    clear_existing=clear_existing,
+                )
+                status = "recreated_after_error"
+            except Exception as retry_exc:
+                raise CoretapError(
+                    "COREDEVICE_TYPE_FAILED",
+                    f"Persistent CoreDevice pinyin text input failed: {retry_exc}",
+                    stage="type",
+                    category="infrastructure",
+                    retryable=True,
+                    details={
+                        "device": device,
+                        "errorType": type(retry_exc).__name__,
+                        "previousErrorType": type(exc).__name__,
+                        "retryCloseScope": retry_close_scope,
+                    },
+                ) from retry_exc
+        session.last_used_at = time.monotonic()
+        session.typed_characters += len(text)
+        rsd_session = self._rsd_sessions.get(device)
+        if rsd_session is not None:
+            rsd_session.last_used_at = session.last_used_at
+            rsd_session.requests += 1
+        return {
+            "dispatchStatus": "sent",
+            "confirmationStatus": "dispatched_unverified",
+            "sessionStatus": status,
+            "sessionTypedCharacterCount": session.typed_characters,
+            "keyboardServiceRegistered": session.keyboard_service_id is not None,
+            **input_result,
+            **({"retryCloseScope": retry_close_scope} if retry_close_scope else {}),
+        }
+
+    async def _keyboard_key_userspace(
+        self,
+        device: str,
+        *,
+        key: str,
+        count: int,
+        inter_delay_ms: int,
+    ) -> dict[str, Any]:
+        assert self._lock is not None
+        async with self._lock:
+            retry_close_scope = None
+            try:
+                session, status = await self._get_or_open_keyboard_session(device)
+                input_result = await self._send_keyboard_key(
+                    session,
+                    key=key,
+                    count=count,
+                    inter_delay_ms=inter_delay_ms,
+                )
+            except Exception as exc:
+                retry_close_scope = await self._close_for_retry(device, exc, session_kind="keyboard")
+                try:
+                    session, _ = await self._get_or_open_keyboard_session(device)
+                    input_result = await self._send_keyboard_key(
+                        session,
+                        key=key,
+                        count=count,
+                        inter_delay_ms=inter_delay_ms,
+                    )
+                    status = "recreated_after_error"
+                except Exception as retry_exc:
+                    raise CoretapError(
+                        "COREDEVICE_KEY_FAILED",
+                        f"Persistent CoreDevice keyboard key input failed: {retry_exc}",
+                        stage="key",
+                        category="infrastructure",
+                        retryable=True,
+                        details={
+                            "device": device,
+                            "key": key,
+                            "count": count,
+                            "errorType": type(retry_exc).__name__,
+                            "previousErrorType": type(exc).__name__,
+                            "retryCloseScope": retry_close_scope,
+                        },
+                    ) from retry_exc
+            session.last_used_at = time.monotonic()
+            session.keypresses += count
+            rsd_session = self._rsd_sessions.get(device)
+            if rsd_session is not None:
+                rsd_session.last_used_at = session.last_used_at
+                rsd_session.requests += 1
+            return {
+                "dispatchStatus": "sent",
+                "confirmationStatus": "dispatched_unverified",
+                "sessionStatus": status,
+                "sessionKeypressCount": session.keypresses,
+                "keyboardServiceRegistered": session.keyboard_service_id is not None,
+                **input_result,
+                **({"retryCloseScope": retry_close_scope} if retry_close_scope else {}),
+            }
 
     async def _send_tap(self, session: _TouchSession, hx: int, hy: int) -> None:
         from pymobiledevice3.remote.core_device.hid_service import TOUCHSCREEN_STATE_CONTACT, TOUCHSCREEN_STATE_RELEASE
@@ -1122,6 +1391,30 @@ class CoreDeviceWorkerPool:
             if inter_delay:
                 await asyncio.sleep(inter_delay)
 
+    async def _send_keyboard_key(
+        self,
+        session: Any,
+        *,
+        key: str,
+        count: int,
+        inter_delay_ms: int,
+    ) -> dict[str, Any]:
+        usage = _keyboard_key_usage(key)
+        if session.keyboard_service_id is None:
+            session.keyboard_service_id = await session.service.create_keyboard_service()
+        inter_delay = inter_delay_ms / 1000
+        for _ in range(count):
+            await session.service.send_keyboard(session.keyboard_service_id, (usage,))
+            await session.service.send_keyboard(session.keyboard_service_id, ())
+            if inter_delay:
+                await asyncio.sleep(inter_delay)
+        return {
+            "inputMethod": "coredevice-virtual-keyboard",
+            "resolvedKey": _normalize_keyboard_key(key),
+            "hidKeyboardUsage": usage,
+            "keypressesSent": count,
+        }
+
     def _supports_virtual_keyboard_text(self, text: str) -> bool:
         from pymobiledevice3.remote.core_device.hid_service import ASCII_TO_HID
 
@@ -1150,6 +1443,57 @@ class CoreDeviceWorkerPool:
         return {
             "inputMethod": "coredevice-virtual-keyboard",
             "pasteboardSet": False,
+            "clearExisting": clear_existing,
+            "clearKeypresses": clear_count,
+        }
+
+    async def _input_pinyin_keyboard_text(
+        self,
+        session: Any,
+        *,
+        text: str,
+        char_delay_ms: int,
+        inter_delay_ms: int,
+        clear_existing: bool,
+    ) -> dict[str, Any]:
+        from pymobiledevice3.remote.core_device.hid_service import TOUCHSCREEN_STATE_CONTACT, TOUCHSCREEN_STATE_RELEASE
+
+        keyboard_text = _pinyin_keyboard_text(text)
+        if keyboard_text is None:
+            raise ValueError(f"text cannot be converted to pinyin keyboard input: {text!r}")
+        clear_count = 0
+        if clear_existing:
+            clear_count = await self._clear_focused_text(session)
+        if inter_delay_ms:
+            await asyncio.sleep(inter_delay_ms / 1000)
+        await self._send_text(
+            session,
+            text=keyboard_text,
+            char_delay_ms=char_delay_ms,
+            inter_delay_ms=inter_delay_ms,
+        )
+        if session.keyboard_service_id is None:
+            session.keyboard_service_id = await session.service.create_keyboard_service()
+        candidate_settle_ms = 500
+        await asyncio.sleep(candidate_settle_ms / 1000)
+        candidate_x = 0.2
+        candidate_y = 0.878
+        candidate_hx = int(round(candidate_x * 65535))
+        candidate_hy = int(round(candidate_y * 65535))
+        await session.service.send_touchscreen(TOUCHSCREEN_STATE_CONTACT, candidate_hx, candidate_hy)
+        await asyncio.sleep(0.05)
+        await session.service.send_touchscreen(TOUCHSCREEN_STATE_RELEASE, candidate_hx, candidate_hy)
+        await asyncio.sleep(0.25)
+        return {
+            "inputMethod": "coredevice-pinyin-keyboard",
+            "pasteboardSet": False,
+            "convertedText": keyboard_text,
+            "candidateSettleMs": candidate_settle_ms,
+            "candidateCommitAction": "tap-first-candidate",
+            "candidateCommitPoint": {
+                "normalized": {"x": candidate_x, "y": candidate_y},
+                "hidU16": {"x": candidate_hx, "y": candidate_hy},
+            },
             "clearExisting": clear_existing,
             "clearKeypresses": clear_count,
         }
@@ -1216,20 +1560,27 @@ class CoreDeviceWorkerPool:
         async with PasteboardService(rsd_session.rsd) as pasteboard:
             await pasteboard.set_text(text)
 
-        anchor, anchor_source = self._resolve_paste_anchor(session, paste_at)
+        anchor, anchor_source, paste_mode = self._resolve_paste_anchor(session, paste_at)
         await asyncio.sleep(inter_delay_ms / 1000)
-        menu_point = await self._paste_via_edit_menu(
-            session,
-            anchor_x=anchor["x"],
-            anchor_y=anchor["y"],
-            hold_ms=paste_hold_ms,
-        )
+        menu_point: dict[str, Any] | None = None
+        if paste_mode == "menu":
+            assert anchor is not None
+            menu_point = await self._tap_visible_paste_menu(session, paste_x=anchor["x"], paste_y=anchor["y"])
+        else:
+            assert anchor is not None
+            menu_point = await self._paste_via_edit_menu(
+                session,
+                anchor_x=anchor["x"],
+                anchor_y=anchor["y"],
+                hold_ms=paste_hold_ms,
+            )
         if char_delay_ms:
             await asyncio.sleep(char_delay_ms / 1000)
         return {
             "inputMethod": "coredevice-pasteboard-edit-menu",
-            "pasteAnchor": {"source": anchor_source, **anchor},
+            "pasteAnchor": {"source": anchor_source, **anchor} if anchor is not None else {"source": anchor_source},
             "pasteMenuTap": menu_point,
+            "pasteMode": paste_mode,
             "pasteHoldMs": paste_hold_ms,
             "clearExisting": clear_existing,
             "clearKeypresses": clear_count,
@@ -1239,17 +1590,44 @@ class CoreDeviceWorkerPool:
         self,
         session: _TouchSession,
         paste_at: dict[str, float] | None,
-    ) -> tuple[dict[str, float], str]:
+    ) -> tuple[dict[str, float] | None, str, str]:
         if paste_at is not None:
-            return paste_at, "explicit"
-        last = session.last_tap_normalized
-        if last is not None:
-            y = last["y"]
-            if y < 0.75 or y >= 0.9:
-                return dict(last), "last-tap"
-        return {"x": 0.2, "y": 0.54}, "ios-spotlight-search-field"
+            mode = str(paste_at.get("mode") or "anchor")
+            if mode == "shortcut":
+                raise CoretapError(
+                    "TEXT_INPUT_UNSUPPORTED",
+                    "CoreDevice keyboard shortcut paste is not supported for iOS text input",
+                    category="usage",
+                    stage="type",
+                    details={"mode": mode},
+                )
+            source = "visible-edit-menu" if mode == "menu" else "explicit"
+            return {"x": float(paste_at["x"]), "y": float(paste_at["y"])}, source, mode
+        raise CoretapError(
+            "TEXT_INPUT_TARGET_UNKNOWN",
+            "Non-ASCII text input requires a paste anchor resolved from a visible text field",
+            category="usage",
+            stage="type",
+        )
 
-    async def _clear_focused_text(self, session: _TouchSession, *, count: int = 80) -> int:
+    async def _tap_visible_paste_menu(
+        self,
+        session: _TouchSession,
+        *,
+        paste_x: float,
+        paste_y: float,
+    ) -> dict[str, Any]:
+        paste_hx = int(round(paste_x * 65535))
+        paste_hy = int(round(paste_y * 65535))
+        await self._send_tap(session, paste_hx, paste_hy)
+        await asyncio.sleep(0.25)
+        return {
+            "normalized": {"x": paste_x, "y": paste_y},
+            "hidU16": {"x": paste_hx, "y": paste_hy},
+            "strategy": "visible-edit-menu",
+        }
+
+    async def _clear_focused_text(self, session: Any, *, count: int = 80) -> int:
         from pymobiledevice3.remote.core_device.hid_service import KEY_BACKSPACE
 
         if session.keyboard_service_id is None:
@@ -1272,8 +1650,7 @@ class CoreDeviceWorkerPool:
         hy = int(round(anchor_y * 65535))
         await self._send_drag(session, hx, hy, hx, hy, steps=12, duration_ms=hold_ms)
         await asyncio.sleep(0.5)
-        paste_x = _clamp(anchor_x - 0.07, 0.08, 0.92)
-        paste_y = _clamp(anchor_y - 0.059, 0.05, 0.95)
+        paste_x, paste_y = _paste_menu_point_for_anchor(anchor_x, anchor_y)
         paste_hx = int(round(paste_x * 65535))
         paste_hy = int(round(paste_y * 65535))
         await self._send_tap(session, paste_hx, paste_hy)
@@ -1296,6 +1673,21 @@ class CoreDeviceWorkerPool:
             return
         with suppress(BaseException):
             await session.context.__aexit__(None, None, None)
+
+    async def _close_for_retry(self, device: str, error: BaseException, *, session_kind: str) -> str:
+        if is_recoverable_userspace_tunnel_error(error):
+            await self._close_device(device)
+            await asyncio.sleep(0.25)
+            return "device"
+        if session_kind == "touch":
+            await self._close_session(device)
+        elif session_kind == "button":
+            await self._close_button_session(device)
+        elif session_kind == "keyboard":
+            await self._close_keyboard_session(device)
+        else:
+            await self._close_device(device)
+        return session_kind
 
     async def _close_session(self, device: str) -> None:
         session = self._sessions.pop(device, None)

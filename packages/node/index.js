@@ -72,26 +72,6 @@ class Coretap {
       },
       warm: (options = {}) => this._run(["model", "warm"], options),
       status: (options = {}) => this._run(["model", "status"], options),
-      stop: (options = {}) => this._run(["model", "stop"], options),
-      cache: (options = {}) => this._run(["model", "cache"], options),
-      run: (options = {}) => {
-        const args = ["model", "run"];
-        if (options.image) args.push("--image", options.image);
-        if (options.target) args.push("--target", options.target);
-        return this._run(args, options);
-      },
-      gc: (options = {}) => {
-        const args = ["model", "gc"];
-        if (options.dryRun) args.push("--dry-run");
-        return this._run(args, options);
-      },
-    };
-  }
-
-  get ocr() {
-    return {
-      status: (options = {}) => this._run(["ocr", "status"], options),
-      check: (options = {}) => this._run(["ocr", "check"], options),
     };
   }
 
@@ -111,29 +91,20 @@ class Coretap {
     return this._run(["status"], options);
   }
 
+  observe(options = {}) {
+    return this._run(observeArgs(options), options);
+  }
+
+  step(action, options = {}) {
+    return this._run(stepArgs(action, options), options);
+  }
+
   discover(options = {}) {
     return this._run(["discover"], options);
   }
 
   doctor(options = {}) {
     return this._run(["doctor"], options);
-  }
-
-  runFlow(flow, options = {}) {
-    const args = ["run", flow];
-    if (options.dryRun) args.push("--dry-run");
-    if (hasOption(options, "timeoutMs")) args.push("--timeout-ms", String(options.timeoutMs));
-    if (hasOption(options, "pollIntervalMs")) args.push("--poll-interval-ms", String(options.pollIntervalMs));
-    if (options.caseSensitive) args.push("--case-sensitive");
-    return this._run(args, options);
-  }
-
-  replay(path, options = {}) {
-    return this._run(["replay", path], options);
-  }
-
-  raw(args, options = {}) {
-    return this._run(args, options);
   }
 
   _run(args, options = {}) {
@@ -187,7 +158,7 @@ class Coretap {
     const artifactRoot = options.artifactRoot || this.artifactRoot;
     const profile = options.profile || this.profile;
     const daemon = options.daemon || this.daemonMode;
-    const full = ["--format", "json", "--backend", backend, "--device", device];
+    const full = ["--backend", backend, "--device", device];
     if (developerDir) full.push("--developer-dir", developerDir);
     if (coredeviceTunnelMode) full.push("--coredevice-tunnel-mode", coredeviceTunnelMode);
     if (artifactRoot) full.push("--artifact-root", artifactRoot);
@@ -222,62 +193,42 @@ class IosVisualUi {
     this.client = client;
   }
 
-  async screenshot(options = {}) {
-    const args = ["screenshot", "--label", options.label || "screenshot"];
-    if (options.out) args.push("--out", options.out);
-    if (hasOption(options, "maxLongSide")) args.push("--max-long-side", String(options.maxLongSide));
-    if (options.fullSize) args.push("--full-size");
-    return this.client._run(args, options);
+  async observe(options = {}) {
+    return this.client._run(observeArgs(options), options);
   }
 
-  async locate(target, options = {}) {
-    return this.client._run(["locate", "--target", target], options);
+  async step(action, options = {}) {
+    return this.client.step(action, options);
   }
 
   async tap(target, options = {}) {
-    return this.tapTarget(target, options);
+    return this.step({ schema: "coretap.action.v2", type: "tap", target }, options);
   }
 
-  async tapTarget(target, options = {}) {
-    const args = ["tap", "target", "--target", target];
-    if (options.dryRun) args.push("--dry-run");
-    return this.client._run(args, options);
-  }
-
-  async tapText(text, options = {}) {
-    const args = ["tap", "text", text];
-    if (options.dryRun) args.push("--dry-run");
-    if (options.lang) args.push("--lang", options.lang);
-    if (hasOption(options, "psm")) args.push("--psm", String(options.psm));
-    if (hasOption(options, "minConfidence")) args.push("--min-confidence", String(options.minConfidence));
-    if (options.caseSensitive) args.push("--case-sensitive");
-    return this.client._run(args, options);
-  }
-
-  async tapAt(point, options = {}) {
-    const args = [
-      "tap",
-      "point",
-      "--space",
-      point.space,
-      "--x",
-      String(point.x),
-      "--y",
-      String(point.y),
-    ];
-    if (options.frame) args.push("--frame", options.frame);
-    if (hasOption(options, "width")) args.push("--width", String(options.width));
-    if (hasOption(options, "height")) args.push("--height", String(options.height));
-    if (options.dryRun) args.push("--dry-run");
-    return this.client._run(args, options);
+  async openApp(name, options = {}) {
+    return this.step(
+      {
+        schema: "coretap.action.v2",
+        type: "openApp",
+        name,
+        searchTarget: options.searchTarget,
+        resultTarget: options.resultTarget,
+      },
+      options,
+    );
   }
 
   async press(button, options = {}) {
-    const args = ["press", button];
-    if (options.state) args.push("--state", options.state);
-    if (hasOption(options, "holdMs")) args.push("--hold-ms", String(options.holdMs));
-    if (options.dryRun) args.push("--dry-run");
-    return this.client._run(args, options);
+    return this.step(
+      {
+        schema: "coretap.action.v2",
+        type: "press",
+        button,
+        state: options.state,
+        holdMs: hasOption(options, "holdMs") ? options.holdMs : null,
+      },
+      options,
+    );
   }
 
   async pressHome(options = {}) {
@@ -285,16 +236,46 @@ class IosVisualUi {
   }
 
   async typeText(text, options = {}) {
-    const args = ["type", text];
-    if (hasOption(options, "charDelayMs")) args.push("--char-delay-ms", String(options.charDelayMs));
-    if (hasOption(options, "interDelayMs")) args.push("--inter-delay-ms", String(options.interDelayMs));
-    if (options.pasteAt) args.push("--paste-at", pointToPair(options.pasteAt));
-    if (hasOption(options, "pasteHoldMs")) args.push("--paste-hold-ms", String(options.pasteHoldMs));
-    if (hasOption(options, "verifyTimeoutMs")) args.push("--verify-timeout-ms", String(options.verifyTimeoutMs));
-    if (options.noVerify) args.push("--no-verify");
-    if (options.replace) args.push("--replace");
-    if (options.dryRun) args.push("--dry-run");
-    return this.client._run(args, options);
+    return this.step(
+      {
+        schema: "coretap.action.v2",
+        type: "typeText",
+        text,
+        charDelayMs: options.charDelayMs,
+        interDelayMs: options.interDelayMs,
+        pasteAt: options.pasteAt,
+        pasteHoldMs: options.pasteHoldMs,
+        verifyTimeoutMs: options.verifyTimeoutMs,
+        noVerify: options.noVerify,
+        replace: options.replace,
+      },
+      options,
+    );
+  }
+
+  async key(key, options = {}) {
+    return this.step(
+      {
+        schema: "coretap.action.v2",
+        type: "key",
+        key,
+        count: options.count,
+        interDelayMs: options.interDelayMs,
+      },
+      options,
+    );
+  }
+
+  async clearText(options = {}) {
+    return this.step(
+      {
+        schema: "coretap.action.v2",
+        type: "clear",
+        count: options.count,
+        interDelayMs: options.interDelayMs,
+      },
+      options,
+    );
   }
 
   async lock(options = {}) {
@@ -309,35 +290,20 @@ class IosVisualUi {
     return this.press("volume-down", options);
   }
 
-  async drag(from, to, options = {}) {
-    const space = options.space || from.space || to.space || "normalized";
-    const args = [
-      "drag",
-      "--space",
-      space,
-      "--from",
-      formatPointPair(from),
-      "--to",
-      formatPointPair(to),
-    ];
-    if (options.frame) args.push("--frame", options.frame);
-    if (hasOption(options, "width")) args.push("--width", String(options.width));
-    if (hasOption(options, "height")) args.push("--height", String(options.height));
-    if (hasOption(options, "steps")) args.push("--steps", String(options.steps));
-    if (hasOption(options, "durationMs")) args.push("--duration-ms", String(options.durationMs));
-    if (options.dryRun) args.push("--dry-run");
-    return this.client._run(args, options);
-  }
-
   async scroll(direction, options = {}) {
-    const args = ["scroll", direction];
-    if (hasOption(options, "distance")) args.push("--distance", String(options.distance));
-    if (hasOption(options, "anchorX")) args.push("--anchor-x", String(options.anchorX));
-    if (hasOption(options, "anchorY")) args.push("--anchor-y", String(options.anchorY));
-    if (hasOption(options, "steps")) args.push("--steps", String(options.steps));
-    if (hasOption(options, "durationMs")) args.push("--duration-ms", String(options.durationMs));
-    if (options.dryRun) args.push("--dry-run");
-    return this.client._run(args, options);
+    return this.step(
+      {
+        schema: "coretap.action.v2",
+        type: "scroll",
+        direction,
+        distance: options.distance,
+        anchorX: options.anchorX,
+        anchorY: options.anchorY,
+        steps: options.steps,
+        durationMs: options.durationMs,
+      },
+      options,
+    );
   }
 
   async expectText(expected, options = {}) {
@@ -363,15 +329,7 @@ class IosVisualUi {
   }
 
   async wait(ms, options = {}) {
-    return this.client._run(["wait", "--ms", String(ms)], options);
-  }
-
-  async waitForStable() {
-    return this.screenshot({ label: "stable" });
-  }
-
-  async snapshot(name) {
-    return this.screenshot({ label: name });
+    return this.step({ schema: "coretap.action.v2", type: "wait", ms }, options);
   }
 }
 
@@ -379,6 +337,49 @@ function daemonOptions(options = {}) {
   const args = [];
   if (options.socket) args.push("--socket", options.socket);
   if (hasOption(options, "timeoutMs")) args.push("--timeout-ms", String(options.timeoutMs));
+  return args;
+}
+
+function observeArgs(options = {}) {
+  const args = ["observe"];
+  if (options.label) args.push("--label", options.label);
+  if (options.out) args.push("--out", options.out);
+  if (hasOption(options, "maxLongSide")) args.push("--max-long-side", String(options.maxLongSide));
+  if (options.fullSize) args.push("--full-size");
+  if (options.lang) args.push("--lang", options.lang);
+  if (hasOption(options, "psm")) args.push("--psm", String(options.psm));
+  if (options.ocrEngine) args.push("--ocr-engine", options.ocrEngine);
+  if (hasOption(options, "minConfidence")) args.push("--min-confidence", String(options.minConfidence));
+  if (options.noOcr) args.push("--no-ocr");
+  return args;
+}
+
+function stepArgs(action, options = {}) {
+  const args = ["step"];
+  if (options.actionFile) {
+    args.push("--action-file", options.actionFile);
+  } else {
+    if (action === undefined || action === null) {
+      throw new TypeError("Coretap step requires an action object, JSON string, or { actionFile } option.");
+    }
+    const payload = typeof action === "string" ? action : JSON.stringify(action);
+    args.push("--action", payload);
+  }
+  if (hasOption(options, "postWaitMs")) args.push("--post-wait-ms", String(options.postWaitMs));
+  if (hasOption(options, "postTimeoutMs")) args.push("--post-timeout-ms", String(options.postTimeoutMs));
+  if (hasOption(options, "pollIntervalMs")) args.push("--poll-interval-ms", String(options.pollIntervalMs));
+  for (const text of listOption(options.expectText)) args.push("--expect-text", text);
+  for (const text of listOption(options.expectNoText)) args.push("--expect-no-text", text);
+  if (options.expectChange) args.push("--expect-change");
+  if (options.failOnPostcondition) args.push("--fail-on-postcondition");
+  if (options.dryRun) args.push("--dry-run");
+  if (options.lang) args.push("--lang", options.lang);
+  if (hasOption(options, "psm")) args.push("--psm", String(options.psm));
+  if (options.ocrEngine) args.push("--ocr-engine", options.ocrEngine);
+  if (hasOption(options, "minConfidence")) args.push("--min-confidence", String(options.minConfidence));
+  if (hasOption(options, "maxLongSide")) args.push("--max-long-side", String(options.maxLongSide));
+  if (options.fullSize) args.push("--full-size");
+  if (options.noOcr) args.push("--no-ocr");
   return args;
 }
 
@@ -447,17 +448,13 @@ function looksLikeMissingPythonModule(output) {
   return /No module named coretap/.test(output || "");
 }
 
-function formatPointPair(point) {
-  return `${point.x},${point.y}`;
-}
-
 function hasOption(options, key) {
   return Object.prototype.hasOwnProperty.call(options, key) && options[key] !== undefined && options[key] !== null;
 }
 
-function pointToPair(point) {
-  if (typeof point === "string") return point;
-  return `${point.x},${point.y}`;
+function listOption(value) {
+  if (value === undefined || value === null) return [];
+  return Array.isArray(value) ? value : [value];
 }
 
 module.exports = {

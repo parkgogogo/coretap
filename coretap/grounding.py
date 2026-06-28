@@ -10,14 +10,11 @@ from coretap.ocr import find_text, normalize_text, run_tesseract, run_vision_ocr
 from coretap.model_pack import (
     INTERNAL_FIXTURE_PROFILE,
     PUBLIC_MODEL_PROFILE,
-    cache_status,
     check_model,
-    gc_model,
     install_model,
     internal_profiles,
     public_profiles,
     run_grounding_model,
-    stop_model,
     warm_model as warm_public_model,
 )
 from coretap.runtime import CoretapError
@@ -32,27 +29,57 @@ _TARGET_TEXT_STOP_WORDS = {
     "an",
     "and",
     "app",
+    "at",
     "button",
+    "bottom",
+    "center",
     "click",
     "control",
     "field",
+    "home",
     "icon",
     "image",
+    "in",
     "ios",
     "label",
+    "labeled",
+    "left",
     "named",
+    "near",
+    "middle",
+    "of",
+    "on",
     "open",
     "press",
+    "right",
     "screen",
+    "shown",
     "tap",
     "target",
+    "tab",
     "text",
     "the",
     "to",
+    "top",
     "ui",
+    "visible",
     "with",
 }
-_TARGET_TEXT_CJK_STOP_WORDS = {"点击", "轻点", "按下", "打开", "图标", "按钮", "文本", "目标", "应用"}
+_TARGET_TEXT_CJK_STOP_WORDS = {"点击", "轻点", "按下", "打开", "图标", "按钮", "文本", "目标", "应用", "底部", "顶部", "左上", "右上", "左下", "右下"}
+_TARGET_TEXT_SYNONYMS = {
+    "allow": ["允许"],
+    "cancel": ["取消"],
+    "cloud": ["下载", "获取"],
+    "download": ["下载", "获取"],
+    "done": ["完成"],
+    "get": ["获取"],
+    "open": ["打开"],
+    "paste": ["粘贴"],
+    "retry": ["重试"],
+    "search": ["搜索"],
+    "settings": ["设置"],
+    "xiaohongshu": ["小红书"],
+}
 
 
 def prepare_image_long_side(
@@ -164,7 +191,7 @@ def assess_grounding_tap_safety(image: Path, target: str, grounded: dict[str, An
     checks = [_coordinate_safety_check(grounded)]
     terms = target_text_terms(target)
     if terms:
-        checks.append(_target_text_safety_check(image, grounded, terms))
+        checks.append(_target_text_safety_check(image, target, grounded, terms))
     else:
         checks.append(
             {
@@ -179,17 +206,30 @@ def assess_grounding_tap_safety(image: Path, target: str, grounded: dict[str, An
 
 def target_text_terms(target: str) -> list[str]:
     normalized = normalize_text(target)
-    latin_terms = [
-        token
-        for token in re.findall(r"[a-z0-9][a-z0-9._+-]*", normalized)
-        if len(token) >= 2 and token not in _TARGET_TEXT_STOP_WORDS
-    ]
+    latin_terms: list[str] = []
+    for token in re.findall(r"[a-z0-9][a-z0-9._+-]*", normalized):
+        if len(token) < 2:
+            continue
+        if token not in _TARGET_TEXT_STOP_WORDS:
+            latin_terms.append(token)
+        latin_terms.extend(_TARGET_TEXT_SYNONYMS.get(token, []))
     cjk_terms = [term for term in re.findall(r"[\u3400-\u9fff]{1,}", target) if term not in _TARGET_TEXT_CJK_STOP_WORDS]
     terms: list[str] = []
-    for term in [*latin_terms, *cjk_terms]:
+    semantic_terms = _target_semantic_terms(normalized)
+    for term in [*latin_terms, *cjk_terms, *semantic_terms]:
         if term not in terms:
             terms.append(term)
     return terms[:4]
+
+
+def _target_semantic_terms(normalized_target: str) -> list[str]:
+    terms: list[str] = []
+    if "search" in normalized_target and "field" in normalized_target:
+        # iOS/App Store search fields often expose placeholder copy instead of
+        # a literal "Search" label in OCR. Treat the placeholder as local text
+        # evidence for the semantic search-field target.
+        terms.extend(["游戏", "故事等"])
+    return terms
 
 
 def _coordinate_safety_check(grounded: dict[str, Any]) -> dict[str, Any]:
@@ -220,10 +260,28 @@ def _coordinate_safety_check(grounded: dict[str, Any]) -> dict[str, Any]:
     return {"id": "coordinate", "status": "pass", "normalized": {"x": x, "y": y}}
 
 
-def _target_text_safety_check(image: Path, grounded: dict[str, Any], terms: list[str]) -> dict[str, Any]:
+def _target_text_safety_check(image: Path, target: str, grounded: dict[str, Any], terms: list[str]) -> dict[str, Any]:
     tokens: list[Any] = []
     engines: list[str] = []
     errors: list[dict[str, Any]] = []
+
+    point = grounded.get("point", {}).get("framePx", {})
+    try:
+        point_x = float(point["x"])
+        point_y = float(point["y"])
+    except (KeyError, TypeError, ValueError):
+        return {
+            "id": "target-text-evidence",
+            "status": "unsafe",
+            "terms": terms,
+            "reason": "grounding did not include frame pixel coordinates for text proximity validation",
+        }
+
+    frame = grounded.get("frame") if isinstance(grounded.get("frame"), dict) else {}
+    width = float(frame.get("widthPx") or 0)
+    height = float(frame.get("heightPx") or 0)
+    max_distance = max(80.0, min(max(width, height) * 0.13, 360.0))
+
     try:
         tesseract_tokens, _ = run_tesseract(image)
         tokens.extend(tesseract_tokens)
@@ -232,14 +290,28 @@ def _target_text_safety_check(image: Path, grounded: dict[str, Any], terms: list
         errors.append({"engine": "tesseract", "code": exc.code, "message": str(exc), "details": exc.details})
 
     matches = _text_matches(tokens, terms)
-    if not matches:
-        try:
-            vision_tokens, _ = run_vision_ocr(image)
-            tokens.extend(vision_tokens)
-            engines.append("vision")
-            matches = _text_matches(tokens, terms)
-        except CoretapError as exc:
-            errors.append({"engine": "vision", "code": exc.code, "message": str(exc), "details": exc.details})
+    if matches and _nearest_match_distance(point_x, point_y, matches) <= max_distance:
+        return _target_text_safety_result(
+            terms=terms,
+            engines=engines,
+            tokens=tokens,
+            matches=matches,
+            errors=errors,
+            point_x=point_x,
+            point_y=point_y,
+            max_distance=max_distance,
+        )
+
+    # Tesseract can find a far duplicate before Vision sees the actual nearby
+    # text, especially for mixed Chinese/English iOS UI. If the first engine
+    # does not produce nearby evidence, merge Vision before deciding unsafe.
+    try:
+        vision_tokens, _ = run_vision_ocr(image)
+        tokens.extend(vision_tokens)
+        engines.append("vision")
+        matches = _text_matches(tokens, terms)
+    except CoretapError as exc:
+        errors.append({"engine": "vision", "code": exc.code, "message": str(exc), "details": exc.details})
 
     if not engines:
         return {
@@ -247,6 +319,29 @@ def _target_text_safety_check(image: Path, grounded: dict[str, Any], terms: list
             "status": "unsafe",
             "terms": terms,
             "reason": "OCR was unavailable, so text-like target visibility could not be verified",
+            "errors": errors,
+        }
+    search_field_match = _search_field_semantic_match(
+        target,
+        tokens,
+        point_x=point_x,
+        point_y=point_y,
+        frame_height=height,
+        max_distance=max_distance,
+    )
+    if search_field_match is not None:
+        return {
+            "id": "target-text-evidence",
+            "status": "pass",
+            "terms": terms,
+            "reason": "search field content is visible near the grounded point",
+            "engines": engines,
+            "tokenCount": len(tokens),
+            "nearestDistancePx": search_field_match["distance"],
+            "maxDistancePx": search_field_match["maxDistance"],
+            "nearestMatch": search_field_match["match"],
+            "matchCount": 1,
+            "semanticEvidence": "search-field-content",
             "errors": errors,
         }
     if not matches:
@@ -259,24 +354,29 @@ def _target_text_safety_check(image: Path, grounded: dict[str, Any], terms: list
             "errors": errors,
             "tokenCount": len(tokens),
         }
+    return _target_text_safety_result(
+        terms=terms,
+        engines=engines,
+        tokens=tokens,
+        matches=matches,
+        errors=errors,
+        point_x=point_x,
+        point_y=point_y,
+        max_distance=max_distance,
+    )
 
-    point = grounded.get("point", {}).get("framePx", {})
-    try:
-        point_x = float(point["x"])
-        point_y = float(point["y"])
-    except (KeyError, TypeError, ValueError):
-        return {
-            "id": "target-text-evidence",
-            "status": "unsafe",
-            "terms": terms,
-            "reason": "grounding did not include frame pixel coordinates for text proximity validation",
-            "matches": matches[:3],
-        }
 
-    frame = grounded.get("frame") if isinstance(grounded.get("frame"), dict) else {}
-    width = float(frame.get("widthPx") or 0)
-    height = float(frame.get("heightPx") or 0)
-    max_distance = max(80.0, min(max(width, height) * 0.13, 360.0))
+def _target_text_safety_result(
+    *,
+    terms: list[str],
+    engines: list[str],
+    tokens: list[Any],
+    matches: list[dict[str, Any]],
+    errors: list[dict[str, Any]],
+    point_x: float,
+    point_y: float,
+    max_distance: float,
+) -> dict[str, Any]:
     nearest = min(matches, key=lambda match: _box_distance(point_x, point_y, match["matchedBoxPx"]))
     distance = _box_distance(point_x, point_y, nearest["matchedBoxPx"])
     status = "pass" if distance <= max_distance else "unsafe"
@@ -296,21 +396,99 @@ def _target_text_safety_check(image: Path, grounded: dict[str, Any], terms: list
     }
 
 
+def _search_field_semantic_match(
+    target: str,
+    tokens: list[Any],
+    *,
+    point_x: float,
+    point_y: float,
+    frame_height: float,
+    max_distance: float,
+) -> dict[str, Any] | None:
+    normalized_target = normalize_text(target)
+    if "search" not in normalized_target or ("field" not in normalized_target and "bar" not in normalized_target):
+        return None
+
+    search_tokens: list[dict[str, Any]] = []
+    for index, token in enumerate(tokens):
+        normalized = normalize_text(getattr(token, "text", ""))
+        token_top = float(getattr(token, "top", 0))
+        is_search_prefix = normalized == "q" or normalized.startswith("q ") or normalized.startswith("◎") or normalized.startswith("〇 ") or normalized.startswith("搜索")
+        is_top_search_content = bool(normalized) and frame_height * 0.055 <= token_top <= frame_height * 0.14
+        if is_search_prefix or is_top_search_content:
+            search_tokens.append(_token_match_slice(tokens, index, index + 1))
+    if not search_tokens:
+        return None
+
+    semantic_max_distance = max(48.0, min(max_distance, 160.0))
+    nearest = min(search_tokens, key=lambda match: _box_distance(point_x, point_y, match["matchedBoxPx"]))
+    distance = _box_distance(point_x, point_y, nearest["matchedBoxPx"])
+    if distance > semantic_max_distance:
+        return None
+    return {"match": nearest, "distance": distance, "maxDistance": semantic_max_distance}
+
+
+def _nearest_match_distance(point_x: float, point_y: float, matches: list[dict[str, Any]]) -> float:
+    if not matches:
+        return math.inf
+    return min(_box_distance(point_x, point_y, match["matchedBoxPx"]) for match in matches)
+
+
 def _text_matches(tokens: list[Any], terms: list[str]) -> list[dict[str, Any]]:
     matches: list[dict[str, Any]] = []
-    seen: set[tuple[int, int]] = set()
+    seen: set[tuple[str, int, int, int, int, int, int]] = set()
     for term in terms:
-        match = find_text(tokens, term)
-        if not match:
-            continue
-        token_range = match.get("matchedTokenRange", {})
-        key = (int(token_range.get("start", -1)), int(token_range.get("endExclusive", -1)))
-        if key in seen:
-            continue
-        match["matchedTerm"] = term
-        matches.append(match)
-        seen.add(key)
+        for match in _all_text_matches_for_term(tokens, term):
+            token_range = match.get("matchedTokenRange", {})
+            box = match.get("matchedBoxPx", {})
+            key = (
+                ",".join(match.get("matchedEngines", [])),
+                int(token_range.get("start", -1)),
+                int(token_range.get("endExclusive", -1)),
+                int(box.get("x", -1)),
+                int(box.get("y", -1)),
+                int(box.get("width", -1)),
+                int(box.get("height", -1)),
+            )
+            if key in seen:
+                continue
+            match["matchedTerm"] = term
+            matches.append(match)
+            seen.add(key)
     return matches
+
+
+def _all_text_matches_for_term(tokens: list[Any], term: str) -> list[dict[str, Any]]:
+    if not term:
+        return []
+    needle = normalize_text(term)
+    normalized = [normalize_text(token.text) for token in tokens]
+    matches: list[dict[str, Any]] = []
+    seen: set[tuple[int, int]] = set()
+    for idx, hay in enumerate(normalized):
+        if needle in hay:
+            matches.append(_token_match_slice(tokens, idx, idx + 1))
+            seen.add((idx, idx + 1))
+
+    for start in range(len(tokens)):
+        acc = ""
+        for end in range(start, len(tokens)):
+            acc = (acc + " " + normalized[end]).strip()
+            if needle in acc:
+                key = (start, end + 1)
+                if key not in seen:
+                    matches.append(_token_match_slice(tokens, start, end + 1))
+                    seen.add(key)
+                break
+            if len(acc) > len(needle) + 80:
+                break
+    return matches
+
+
+def _token_match_slice(tokens: list[Any], start: int, end: int) -> dict[str, Any]:
+    from coretap.ocr import token_match
+
+    return token_match(tokens[start:end], start, end)
 
 
 def _box_distance(x: float, y: float, box: dict[str, Any]) -> float:
@@ -420,15 +598,3 @@ def model_install(profile: str = PUBLIC_MODEL_PROFILE, *, force: bool = False, d
 
 def model_check(profile: str = PUBLIC_MODEL_PROFILE, *, deep: bool = False) -> dict[str, Any]:
     return check_model(profile, deep=deep)
-
-
-def model_cache() -> dict[str, Any]:
-    return cache_status()
-
-
-def model_gc(*, dry_run: bool = False) -> dict[str, Any]:
-    return gc_model(dry_run=dry_run)
-
-
-def model_stop() -> dict[str, Any]:
-    return stop_model()

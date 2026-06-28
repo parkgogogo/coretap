@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from coretap.device_worker import CoreDeviceWorkerPool, set_default_device_worker_pool
-from coretap.model_pack import model_worker_status
+from coretap.model_pack import close_model_worker, model_worker_status
 from coretap.runtime import CoretapError, ensure_state, response_error, response_ok, run_id
 
 
@@ -51,6 +51,56 @@ def ping_daemon(*, socket_path: str | Path | None = None, timeout: float = 2.0) 
 
 def stop_daemon(*, socket_path: str | Path | None = None, timeout: float = 2.0) -> dict[str, Any]:
     return _send_request({"schema": REQUEST_SCHEMA, "action": "shutdown"}, socket_path=socket_path, timeout=timeout)
+
+
+def _stale_daemon_pids_from_ps(output: str, *, socket_path: Path, current_pid: int | None = None) -> list[int]:
+    socket_text = str(socket_path)
+    current = current_pid or os.getpid()
+    pids: list[int] = []
+    for line in output.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        pid_text, _, command = stripped.partition(" ")
+        try:
+            pid = int(pid_text)
+        except ValueError:
+            continue
+        if pid == current:
+            continue
+        if "coretap.daemon" not in command or " serve " not in f" {command} ":
+            continue
+        if f"--socket {socket_text}" in command or command.endswith(f"--socket {socket_text}"):
+            pids.append(pid)
+    return pids
+
+
+def _stale_daemon_pids(socket_path: Path) -> list[int]:
+    done = subprocess.run(["ps", "-axo", "pid=,command="], capture_output=True, text=True, check=False)
+    if done.returncode != 0:
+        return []
+    return _stale_daemon_pids_from_ps(done.stdout, socket_path=socket_path)
+
+
+def _cleanup_stale_daemons(socket_path: Path) -> list[int]:
+    pids = _stale_daemon_pids(socket_path)
+    for pid in pids:
+        with suppress(OSError):
+            os.kill(pid, signal.SIGTERM)
+    deadline = time.monotonic() + 2.0
+    remaining = set(pids)
+    while remaining and time.monotonic() < deadline:
+        for pid in list(remaining):
+            try:
+                os.kill(pid, 0)
+            except OSError:
+                remaining.discard(pid)
+        if remaining:
+            time.sleep(0.05)
+    for pid in remaining:
+        with suppress(OSError):
+            os.kill(pid, signal.SIGKILL)
+    return pids
 
 
 def _send_request(payload: dict[str, Any], *, socket_path: str | Path | None, timeout: float) -> dict[str, Any]:
@@ -101,6 +151,7 @@ def start_daemon(*, socket_path: str | Path | None = None, timeout: float = 5.0)
         status = ping_daemon(socket_path=path, timeout=0.5)
         return {"started": False, "alreadyRunning": True, "socket": str(path), "status": status.get("result")}
 
+    cleaned_stale_pids = _cleanup_stale_daemons(path)
     log_path = default_log_path()
     pid_path = default_pid_path()
     log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -128,6 +179,7 @@ def start_daemon(*, socket_path: str | Path | None = None, timeout: float = 5.0)
                 "socket": str(path),
                 "pidFile": str(pid_path),
                 "log": str(log_path),
+                "cleanedStalePids": cleaned_stale_pids,
                 "status": status.get("result"),
             }
         except CoretapError as exc:
@@ -243,6 +295,7 @@ def serve(*, socket_path: str | Path | None = None) -> int:
                         shutting_down = True
     finally:
         set_default_device_worker_pool(None)
+        close_model_worker()
         DEVICE_WORKER_POOL.close()
         signal.signal(signal.SIGTERM, old_term)
         signal.signal(signal.SIGINT, old_int)

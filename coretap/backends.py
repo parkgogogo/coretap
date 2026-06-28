@@ -188,6 +188,39 @@ class SimulatorBackend:
             details={"backend": self.name},
         )
 
+    def keyboard_key(
+        self,
+        device: str,
+        key: str,
+        *,
+        count: int = 1,
+        inter_delay_ms: int = 20,
+        dry_run: bool = False,
+    ) -> dict[str, Any]:
+        raise CoretapError(
+            "SIMULATOR_KEY_UNSUPPORTED",
+            "CoreDevice keyboard key events are only supported for real devices",
+            category="usage",
+            stage="key",
+            details={"backend": self.name, "key": key, "count": count},
+        )
+
+    def clear_text(
+        self,
+        device: str,
+        *,
+        count: int = 80,
+        inter_delay_ms: int = 2,
+        dry_run: bool = False,
+    ) -> dict[str, Any]:
+        raise CoretapError(
+            "SIMULATOR_KEY_UNSUPPORTED",
+            "CoreDevice text clearing is only supported for real devices",
+            category="usage",
+            stage="clear",
+            details={"backend": self.name, "count": count},
+        )
+
     def drag_normalized(
         self,
         device: str,
@@ -535,11 +568,25 @@ class DeviceBackend:
                     raise
                 if not (exc.retryable or is_recoverable_userspace_tunnel_error(exc)):
                     raise
+                fallback_error = exc
+                try:
+                    result = pool.tap_userspace(device, x, y, hx, hy)
+                    return {
+                        **result,
+                        "workerRetry": "after-recovery",
+                        "previousError": _previous_error_metadata(exc),
+                    }
+                except CoretapError as retry_exc:
+                    if is_recoverable_coredevice_display_error(retry_exc):
+                        raise
+                    if not (retry_exc.retryable or is_recoverable_userspace_tunnel_error(retry_exc)):
+                        raise
+                    fallback_error = retry_exc
                 result = self._tap_userspace_helper(device, x, y, hx, hy)
                 return {
                     **result,
                     "workerFallback": "coretap-device-hid-helper",
-                    "previousError": _previous_error_metadata(exc),
+                    "previousError": _previous_error_metadata(fallback_error),
                 }
 
         return self._tap_userspace_helper(device, x, y, hx, hy)
@@ -860,6 +907,113 @@ class DeviceBackend:
             details={"coredeviceTunnelMode": self.coredevice_tunnel_mode},
         )
 
+    def keyboard_key(
+        self,
+        device: str,
+        key: str,
+        *,
+        count: int = 1,
+        inter_delay_ms: int = 20,
+        dry_run: bool = False,
+    ) -> dict[str, Any]:
+        if count <= 0:
+            raise CoretapError("INVALID_ARGUMENT", "key --count must be > 0", category="usage", stage="key")
+        if count > 500:
+            raise CoretapError("INVALID_ARGUMENT", "key --count must be <= 500", category="usage", stage="key")
+        if inter_delay_ms < 0:
+            raise CoretapError("INVALID_ARGUMENT", "key --inter-delay-ms must be >= 0", category="usage", stage="key")
+        base = {
+            "key": key,
+            "count": count,
+            "interDelayMs": inter_delay_ms,
+            "inputMethod": "coredevice-virtual-keyboard",
+            "coredeviceTunnelMode": self.coredevice_tunnel_mode,
+        }
+        if dry_run:
+            return {**base, "attempted": False, "dryRun": True, "reason": "dry-run requested"}
+        if self.coredevice_tunnel_mode == "userspace":
+            from coretap.device_worker import (
+                get_default_device_worker_pool,
+                is_recoverable_userspace_tunnel_error,
+            )
+
+            pool = get_default_device_worker_pool()
+            if pool is not None:
+                try:
+                    result = pool.keyboard_key_userspace(
+                        device,
+                        key=key,
+                        count=count,
+                        inter_delay_ms=inter_delay_ms,
+                    )
+                    return {**base, **result, "attempted": True, "dryRun": False}
+                except CoretapError as exc:
+                    if not (exc.retryable or is_recoverable_userspace_tunnel_error(exc)):
+                        raise
+                    try:
+                        result = pool.keyboard_key_userspace(
+                            device,
+                            key=key,
+                            count=count,
+                            inter_delay_ms=inter_delay_ms,
+                        )
+                        return {
+                            **base,
+                            **result,
+                            "attempted": True,
+                            "dryRun": False,
+                            "workerRetry": "after-recovery",
+                            "previousError": _previous_error_metadata(exc),
+                        }
+                    except CoretapError as retry_exc:
+                        if not (retry_exc.retryable or is_recoverable_userspace_tunnel_error(retry_exc)):
+                            raise
+                        previous_error = retry_exc
+            else:
+                previous_error = None
+            result = self._keyboard_key_userspace_helper(
+                device,
+                key=key,
+                count=count,
+                inter_delay_ms=inter_delay_ms,
+                action="key",
+            )
+            return {
+                **base,
+                **result,
+                "attempted": True,
+                "dryRun": False,
+                **(
+                    {"workerFallback": "coretap-device-hid-helper", "previousError": _previous_error_metadata(previous_error)}
+                    if previous_error is not None
+                    else {}
+                ),
+            }
+        raise CoretapError(
+            "COREDEVICE_KEY_FAILED",
+            "Keyboard key input requires CoreDevice userspace mode",
+            category="usage",
+            stage="key",
+            details={"coredeviceTunnelMode": self.coredevice_tunnel_mode},
+        )
+
+    def clear_text(
+        self,
+        device: str,
+        *,
+        count: int = 80,
+        inter_delay_ms: int = 2,
+        dry_run: bool = False,
+    ) -> dict[str, Any]:
+        result = self.keyboard_key(
+            device,
+            "backspace",
+            count=count,
+            inter_delay_ms=inter_delay_ms,
+            dry_run=dry_run,
+        )
+        return {**result, "operation": "clear", "clearKeypresses": count}
+
     def drag_normalized(
         self,
         device: str,
@@ -1006,6 +1160,8 @@ class DeviceBackend:
         ]
         if paste_at is not None:
             argv.extend(["--paste-at", f"{paste_at['x']},{paste_at['y']}"])
+            if paste_at.get("mode") == "menu":
+                argv.extend(["--paste-mode", "menu"])
         if clear_existing:
             argv.append("--clear-existing")
         proc = subprocess.Popen(
@@ -1050,6 +1206,88 @@ class DeviceBackend:
                     "COREDEVICE_TYPE_FAILED",
                     "Timed out waiting for CoreDevice text input helper",
                     stage="type",
+                    retryable=True,
+                    details={"timeoutMs": round(timeout * 1000), "stderr": stderr},
+                )
+            try:
+                proc.wait(timeout=1.0)
+            except subprocess.TimeoutExpired:
+                _terminate_process(proc)
+            result["durationMs"] = round((time.monotonic() - started) * 1000)
+            return result
+        finally:
+            selector.close()
+
+    def _keyboard_key_userspace_helper(
+        self,
+        device: str,
+        *,
+        key: str,
+        count: int,
+        inter_delay_ms: int,
+        action: str,
+    ) -> dict[str, Any]:
+        timeout = max(10.0, (count * max(inter_delay_ms, 0) / 1000) + 8.0)
+        started = time.monotonic()
+        argv = [
+            sys.executable,
+            "-m",
+            "coretap.device_hid_helper",
+            "--mode",
+            "userspace",
+            "--action",
+            action,
+            "--device",
+            device,
+            "--key",
+            key,
+            "--count",
+            str(count),
+            "--inter-delay-ms",
+            str(inter_delay_ms),
+        ]
+        proc = subprocess.Popen(
+            argv,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=self.coredevice_env(device),
+        )
+        assert proc.stdout is not None
+        selector = selectors.DefaultSelector()
+        selector.register(proc.stdout, selectors.EVENT_READ)
+        result: dict[str, Any] | None = None
+        try:
+            while time.monotonic() - started < timeout:
+                remaining = max(0.0, timeout - (time.monotonic() - started))
+                events = selector.select(timeout=remaining)
+                if not events:
+                    break
+                line = proc.stdout.readline()
+                if not line:
+                    break
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if event.get("event") == "result" and isinstance(event.get("result"), dict):
+                    result = event["result"]
+                    break
+                if event.get("event") == "error":
+                    stderr = _terminate_process(proc)
+                    raise CoretapError(
+                        "COREDEVICE_KEY_FAILED",
+                        "CoreDevice keyboard helper failed before dispatch",
+                        stage="key",
+                        retryable=True,
+                        details={"helperEvent": event, "stderr": stderr},
+                    )
+            if result is None:
+                stderr = _terminate_process(proc)
+                raise CoretapError(
+                    "COREDEVICE_KEY_FAILED",
+                    "Timed out waiting for CoreDevice keyboard helper",
+                    stage="key",
                     retryable=True,
                     details={"timeoutMs": round(timeout * 1000), "stderr": stderr},
                 )

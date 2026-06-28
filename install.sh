@@ -43,7 +43,7 @@ Usage:
 
 Options:
   --skip-model          Install the CLI but do not download/check/warm MAI-UI.
-  --skip-ocr            Do not install/check Tesseract OCR.
+  --skip-ocr            Do not install Tesseract OCR.
   --skip-simulator      Do not install/check Simulator tap support.
   --skip-device         Do not install/check pymobiledevice3.
   --skip-node-smoke     Do not run the Node test-kit smoke check from a checkout.
@@ -205,7 +205,7 @@ install_coretap_cli() {
 stop_existing_daemon() {
   coretap_bin="$1"
   log "Stopping any existing coretap daemon"
-  if "$coretap_bin" --daemon off --format json daemon stop >/dev/null 2>&1; then
+  if "$coretap_bin" --daemon off daemon stop >/dev/null 2>&1; then
     log "Stopped existing coretap daemon"
   else
     log "No running coretap daemon detected"
@@ -290,29 +290,23 @@ run_coretap_setup() {
   coretap_bin="$1"
   tmp_doctor=""
   log "Running coretap setup"
-  "$coretap_bin" --daemon off --format json setup >/dev/null
+  "$coretap_bin" --daemon off setup >/dev/null
 
   if [ "$SKIP_MODEL" -eq 0 ]; then
     log "Installing built-in MAI-UI model pack"
-    "$coretap_bin" --daemon off --format json model install
+    "$coretap_bin" --daemon off model install
     log "Checking model pack"
-    "$coretap_bin" --daemon off --format json model check --deep
+    "$coretap_bin" --daemon off model check --deep
     if [ "$NO_WARM" -eq 0 ]; then
       log "Warming model pack"
-      "$coretap_bin" --daemon off --format json model warm
+      "$coretap_bin" --daemon off model warm
     fi
   else
     log "Skipping model install"
   fi
 
-  if [ "$SKIP_OCR" -eq 0 ]; then
-    if ! "$coretap_bin" --daemon off --format json ocr check; then
-      warn "OCR check failed. Install Tesseract if you need assert text / wait text."
-    fi
-  fi
-
   tmp_doctor="$(mktemp)"
-  if "$coretap_bin" --daemon off --format json doctor >"$tmp_doctor"; then
+  if "$coretap_bin" --daemon off doctor >"$tmp_doctor"; then
     cat "$tmp_doctor"
     if have python3 && python3 - "$tmp_doctor" <<'PY'
 import json

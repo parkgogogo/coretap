@@ -3,7 +3,12 @@ from __future__ import annotations
 import json
 import os
 import re
+import selectors
+import subprocess
+import sys
+import threading
 import time
+from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -22,6 +27,10 @@ PUBLIC_RUNTIME_ID = "mlx-vlm-process-worker-v1"
 INTERNAL_FIXTURE_PROFILE = "internal:test-fixture-grounder"
 
 _MODEL_CACHE: dict[str, tuple[Any, Any]] = {}
+
+
+def _is_model_worker_process() -> bool:
+    return os.environ.get("CORETAP_MODEL_WORKER") == "1"
 
 
 @dataclass(frozen=True)
@@ -232,47 +241,194 @@ def check_model(profile: str = PUBLIC_MODEL_PROFILE, *, deep: bool = False) -> d
     }
 
 
-def cache_status() -> dict[str, Any]:
-    roots = ensure_state()
-    paths = model_paths()
+def _error_payload(exc: CoretapError) -> dict[str, Any]:
     return {
-        "profile": PUBLIC_MODEL_PROFILE,
-        "modelRoot": str(roots["models"]),
-        "cacheRoot": str(roots["cache"]),
-        "active": str(paths.active) if paths.active.exists() else None,
-        "installed": model_installed(),
-        "packDir": str(paths.root),
-        "modelDir": str(paths.model),
+        "code": exc.code,
+        "message": str(exc),
+        "category": exc.category,
+        "stage": exc.stage,
+        "details": exc.details,
+        "retryable": exc.retryable,
     }
 
 
-def gc_model(*, dry_run: bool = False) -> dict[str, Any]:
-    roots = ensure_state()
-    downloads = roots["downloads"]
-    candidates = [p for p in downloads.rglob("*.part") if p.is_file()] if downloads.exists() else []
-    total = sum(p.stat().st_size for p in candidates)
-    if not dry_run:
-        for path in candidates:
-            path.unlink(missing_ok=True)
-    return {"dryRun": dry_run, "deletedCount": 0 if dry_run else len(candidates), "candidateCount": len(candidates), "bytes": total}
+class _ModelProcessClient:
+    def __init__(self) -> None:
+        self._proc: subprocess.Popen[str] | None = None
+        self._lock = threading.Lock()
+        self.loaded_profiles: set[str] = set()
+
+    def status(self) -> dict[str, Any]:
+        proc = self._proc
+        running = proc is not None and proc.poll() is None
+        if not running:
+            self.loaded_profiles.clear()
+        return {
+            "kind": "mlx-vlm-process-resident",
+            "runtime": PUBLIC_RUNTIME_ID,
+            "running": running,
+            "pid": proc.pid if running and proc is not None else None,
+            "loaded": bool(self.loaded_profiles),
+            "loadedProfiles": sorted(self.loaded_profiles),
+        }
+
+    def close(self) -> None:
+        proc = self._proc
+        self._proc = None
+        self.loaded_profiles.clear()
+        if proc is None or proc.poll() is not None:
+            return
+        with suppress(Exception):
+            proc.terminate()
+            proc.wait(timeout=2)
+        if proc.poll() is None:
+            with suppress(Exception):
+                proc.kill()
+                proc.wait(timeout=2)
+
+    def request(self, payload: dict[str, Any], *, timeout: float) -> dict[str, Any]:
+        with self._lock:
+            proc = self._ensure_started()
+            assert proc.stdin is not None
+            assert proc.stdout is not None
+            try:
+                proc.stdin.write(json.dumps(payload, ensure_ascii=False) + "\n")
+                proc.stdin.flush()
+                line = self._readline(proc, timeout=timeout)
+            except (BrokenPipeError, OSError, ValueError) as exc:
+                self._mark_crashed(proc)
+                raise CoretapError(
+                    "MODEL_WORKER_CRASHED",
+                    f"MAI-UI model worker crashed while handling request: {exc}",
+                    stage="model-worker",
+                    category="model",
+                    retryable=True,
+                    details={"action": payload.get("action")},
+                ) from exc
+            if not line:
+                returncode = proc.poll()
+                self._mark_crashed(proc)
+                raise CoretapError(
+                    "MODEL_WORKER_CRASHED",
+                    "MAI-UI model worker exited without returning a response",
+                    stage="model-worker",
+                    category="model",
+                    retryable=True,
+                    details={"action": payload.get("action"), "returncode": returncode},
+                )
+            try:
+                response = json.loads(line)
+            except json.JSONDecodeError as exc:
+                self._mark_crashed(proc)
+                raise CoretapError(
+                    "MODEL_WORKER_PROTOCOL_ERROR",
+                    "MAI-UI model worker returned invalid JSON",
+                    stage="model-worker",
+                    category="model",
+                    retryable=True,
+                    details={"raw": line[:1000]},
+                ) from exc
+            if response.get("ok"):
+                profile = str(payload.get("profile") or PUBLIC_MODEL_PROFILE)
+                self.loaded_profiles.add(profile)
+                return response["result"]
+            error = response.get("error") if isinstance(response, dict) else None
+            if isinstance(error, dict):
+                raise CoretapError(
+                    str(error.get("code") or "MODEL_RUN_FAILED"),
+                    str(error.get("message") or "MAI-UI model request failed"),
+                    category=str(error.get("category") or "model"),
+                    stage=str(error.get("stage") or "model-worker"),
+                    retryable=bool(error.get("retryable")),
+                    details=error.get("details") if isinstance(error.get("details"), dict) else {},
+                )
+            raise CoretapError(
+                "MODEL_WORKER_PROTOCOL_ERROR",
+                "MAI-UI model worker returned an invalid error response",
+                stage="model-worker",
+                category="model",
+                details={"response": response},
+            )
+
+    def _ensure_started(self) -> subprocess.Popen[str]:
+        if self._proc is not None and self._proc.poll() is None:
+            return self._proc
+        self.loaded_profiles.clear()
+        env = os.environ.copy()
+        env["CORETAP_MODEL_WORKER"] = "1"
+        env.setdefault("PYTHONUNBUFFERED", "1")
+        self._proc = subprocess.Popen(
+            [sys.executable, "-m", "coretap.model_pack", "model-worker"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            text=True,
+            bufsize=1,
+            env=env,
+        )
+        return self._proc
+
+    def _readline(self, proc: subprocess.Popen[str], *, timeout: float) -> str:
+        assert proc.stdout is not None
+        selector = selectors.DefaultSelector()
+        selector.register(proc.stdout, selectors.EVENT_READ)
+        try:
+            events = selector.select(timeout)
+            if not events:
+                self._mark_crashed(proc, kill=True)
+                raise CoretapError(
+                    "MODEL_WORKER_TIMEOUT",
+                    f"MAI-UI model worker did not respond within {timeout:.0f}s",
+                    stage="model-worker",
+                    category="model",
+                    retryable=True,
+                )
+            return proc.stdout.readline()
+        finally:
+            selector.close()
+
+    def _mark_crashed(self, proc: subprocess.Popen[str], *, kill: bool = False) -> None:
+        if self._proc is proc:
+            self._proc = None
+        self.loaded_profiles.clear()
+        if kill and proc.poll() is None:
+            with suppress(Exception):
+                proc.kill()
+                proc.wait(timeout=2)
 
 
-def stop_model() -> dict[str, Any]:
-    stopped = len(_MODEL_CACHE)
-    _MODEL_CACHE.clear()
-    return {"stopped": stopped, "profile": PUBLIC_MODEL_PROFILE, "worker": {"kind": "process-local"}}
+_MODEL_PROCESS_CLIENT = _ModelProcessClient()
+
+
+def close_model_worker() -> None:
+    _MODEL_PROCESS_CLIENT.close()
 
 
 def model_worker_status() -> dict[str, Any]:
-    return {
-        "kind": "mlx-vlm-process-resident",
-        "runtime": PUBLIC_RUNTIME_ID,
-        "loaded": bool(_MODEL_CACHE),
-        "loadedProfiles": sorted(_MODEL_CACHE),
-    }
+    if _is_model_worker_process():
+        return {
+            "kind": "mlx-vlm-process-local",
+            "runtime": PUBLIC_RUNTIME_ID,
+            "loaded": bool(_MODEL_CACHE),
+            "loadedProfiles": sorted(_MODEL_CACHE),
+        }
+    return _MODEL_PROCESS_CLIENT.status()
 
 
 def warm_model(profile: str = PUBLIC_MODEL_PROFILE) -> dict[str, Any]:
+    if not _is_model_worker_process():
+        result = _MODEL_PROCESS_CLIENT.request({"action": "warm", "profile": profile}, timeout=90.0)
+        return {
+            **result,
+            "worker": {
+                "kind": "process-resident-child",
+                "runtime": PUBLIC_RUNTIME_ID,
+                "pid": _MODEL_PROCESS_CLIENT.status().get("pid"),
+            },
+        }
+    return _warm_model_inprocess(profile)
+
+
+def _warm_model_inprocess(profile: str = PUBLIC_MODEL_PROFILE) -> dict[str, Any]:
     _require_public_profile(profile)
     status = check_model(profile)
     if not status["ready"]:
@@ -324,15 +480,7 @@ def _load_model() -> tuple[Any, Any]:
 
 
 def grounding_prompt(target: str, width: int, height: int) -> str:
-    return (
-        "You are a GUI grounding agent.\n"
-        "Given an iOS screenshot and the user's grounding instruction, locate exactly one UI element.\n"
-        "Return only a JSON object with this exact shape: {\"coordinate\": [x, y]}.\n"
-        "The coordinate MUST use the model coordinate space where x and y are numbers from 0 to 1000, "
-        f"with origin at the top-left of the full screenshot. The original screenshot is {width}x{height} pixels.\n"
-        "If the target is not visible or ambiguous, return only: {\"status\":\"not_found\"}.\n"
-        f"Instruction: {target}"
-    )
+    return f'Locate {target}. Output only {{"coordinate":[x,y]}} in 0-1000 coordinates.'
 
 
 def _extract_json_object(raw: str) -> dict[str, Any] | None:
@@ -344,14 +492,42 @@ def _extract_json_object(raw: str) -> dict[str, Any] | None:
         pass
     start = raw.find("{")
     end = raw.rfind("}")
+    if start >= 0:
+        segment = raw[start:]
+        try:
+            data, _ = json.JSONDecoder().raw_decode(segment)
+            if isinstance(data, dict):
+                return data
+        except json.JSONDecodeError:
+            repaired = _repair_json_like_object(segment)
+            try:
+                data, _ = json.JSONDecoder().raw_decode(repaired)
+                if isinstance(data, dict):
+                    return data
+            except json.JSONDecodeError:
+                pass
     if start >= 0 and end > start:
         try:
             data = json.loads(raw[start : end + 1])
             if isinstance(data, dict):
                 return data
         except json.JSONDecodeError:
-            return None
+            repaired = _repair_json_like_object(raw[start : end + 1])
+            try:
+                data = json.loads(repaired)
+                if isinstance(data, dict):
+                    return data
+            except json.JSONDecodeError:
+                return None
     return None
+
+
+def _repair_json_like_object(raw: str) -> str:
+    repaired = raw
+    repaired = re.sub(r'"([xy])\s*(-?\d+(?:\.\d+)?)', r'"\1":\2', repaired)
+    repaired = re.sub(r"([,{]\s*)([A-Za-z_][A-Za-z0-9_-]*)\s*=", r'\1"\2":', repaired)
+    repaired = re.sub(r"([,{]\s*)([A-Za-z_][A-Za-z0-9_-]*)\s*:", r'\1"\2":', repaired)
+    return repaired
 
 
 def parse_grounding_output(raw: str, *, width: int, height: int) -> dict[str, Any]:
@@ -365,6 +541,8 @@ def parse_grounding_output(raw: str, *, width: int, height: int) -> dict[str, An
         if coordinate is None and isinstance(data.get("point"), dict):
             point = data["point"]
             coordinate = [point.get("x"), point.get("y")]
+        if coordinate is None and isinstance(data.get("point_2d"), list) and len(data["point_2d"]) == 2:
+            coordinate = data["point_2d"]
         if coordinate is None and isinstance(data.get("bbox_2d"), list) and len(data["bbox_2d"]) == 4:
             x1, y1, x2, y2 = data["bbox_2d"]
             coordinate = [(float(x1) + float(x2)) / 2, (float(y1) + float(y2)) / 2]
@@ -406,13 +584,10 @@ def parse_grounding_output(raw: str, *, width: int, height: int) -> dict[str, An
     }
 
 
-def run_grounding_model(image: Path, target: str, *, profile: str = PUBLIC_MODEL_PROFILE) -> dict[str, Any]:
+def _run_model_prompt(image: Path, prompt: str, *, profile: str, max_tokens: int) -> str:
     _require_public_profile(profile)
-    width, height = png_size(image)
     _load_model()
     model, processor = _MODEL_CACHE[PUBLIC_MODEL_PROFILE]
-    prompt = grounding_prompt(target, width, height)
-    started = time.monotonic()
     try:
         from mlx_vlm import generate
         from mlx_vlm.prompt_utils import apply_chat_template
@@ -420,16 +595,33 @@ def run_grounding_model(image: Path, target: str, *, profile: str = PUBLIC_MODEL
 
         config = load_config(str(model_paths().model))
         formatted_prompt = apply_chat_template(processor, config, prompt, num_images=1)
-        output = generate(model, processor, prompt=formatted_prompt, image=str(image), max_tokens=96, temp=0.0, verbose=False)
+        output = generate(model, processor, prompt=formatted_prompt, image=str(image), max_tokens=max_tokens, temp=0.0, verbose=False)
     except Exception as exc:
         raise CoretapError(
             "MODEL_RUN_FAILED",
-            f"MAI-UI grounding request failed: {exc}",
+            f"MAI-UI model request failed: {exc}",
             stage="model-run",
             category="model",
-            details={"image": str(image), "target": target},
+            details={"image": str(image)},
         ) from exc
-    raw = getattr(output, "text", str(output)).strip()
+    return getattr(output, "text", str(output)).strip()
+
+
+def run_grounding_model(image: Path, target: str, *, profile: str = PUBLIC_MODEL_PROFILE) -> dict[str, Any]:
+    if not _is_model_worker_process():
+        return _MODEL_PROCESS_CLIENT.request(
+            {"action": "ground", "profile": profile, "image": str(image), "target": target},
+            timeout=45.0,
+        )
+    return _run_grounding_model_inprocess(image, target, profile=profile)
+
+
+def _run_grounding_model_inprocess(image: Path, target: str, *, profile: str = PUBLIC_MODEL_PROFILE) -> dict[str, Any]:
+    _require_public_profile(profile)
+    width, height = png_size(image)
+    prompt = grounding_prompt(target, width, height)
+    started = time.monotonic()
+    raw = _run_model_prompt(image, prompt, profile=profile, max_tokens=16)
     parsed = parse_grounding_output(raw, width=width, height=height)
     parsed.update(
         {
@@ -446,3 +638,52 @@ def model_root_from_env() -> None:
     # Keep Hugging Face cache under Coretap unless the user deliberately overrides it.
     roots = ensure_state()
     os.environ.setdefault("HF_HOME", str(roots["cache"] / "huggingface"))
+
+
+def _model_worker_loop() -> int:
+    os.environ["CORETAP_MODEL_WORKER"] = "1"
+    for line in sys.stdin:
+        try:
+            request = json.loads(line)
+            action = request.get("action")
+            profile = str(request.get("profile") or PUBLIC_MODEL_PROFILE)
+            if action == "warm":
+                result = _warm_model_inprocess(profile)
+            elif action == "ground":
+                image = Path(str(request.get("image") or ""))
+                target = str(request.get("target") or "")
+                result = _run_grounding_model_inprocess(image, target, profile=profile)
+            else:
+                raise CoretapError(
+                    "MODEL_WORKER_INVALID_REQUEST",
+                    f"Unsupported model worker action: {action}",
+                    stage="model-worker",
+                    category="usage",
+                    details={"action": action},
+                )
+            response = {"ok": True, "result": result}
+        except CoretapError as exc:
+            response = {"ok": False, "error": _error_payload(exc)}
+        except Exception as exc:
+            error = CoretapError(
+                "MODEL_WORKER_FAILED",
+                f"MAI-UI model worker request failed: {exc}",
+                stage="model-worker",
+                category="model",
+                details={"errorType": type(exc).__name__},
+            )
+            response = {"ok": False, "error": _error_payload(error)}
+        print(json.dumps(response, ensure_ascii=False), flush=True)
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = list(argv if argv is not None else sys.argv[1:])
+    if args == ["model-worker"]:
+        return _model_worker_loop()
+    print("usage: python -m coretap.model_pack model-worker", file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

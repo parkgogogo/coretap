@@ -527,6 +527,7 @@ dependencies = [
     { name = "mlx-vlm" },
     { name = "pillow" },
     { name = "pymobiledevice3" },
+    { name = "pypinyin" },
 ]
 
 [package.optional-dependencies]
@@ -540,6 +541,7 @@ requires-dist = [
     { name = "mlx-vlm", specifier = ">=0.3.12" },
     { name = "pillow", specifier = ">=11.0.0" },
     { name = "pymobiledevice3", specifier = ">=9.30.1,<10" },
+    { name = "pypinyin", specifier = ">=0.55.0" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0" },
 ]
 provides-extras = ["dev"]
@@ -2541,6 +2543,15 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/87/71/96a2972317a7828ebbc159572db479df1d0953a49250b973f6ccf8315120/pymobiledevice3-9.30.1.tar.gz", hash = "sha256:f0a3cf1cb5ab480dfae7363b32a653679b1d464fc2783755d08ee2fa94227502", size = 955824, upload-time = "2026-06-23T21:17:20.914Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/b9/a7/54eec985faf05d4ab8f095008a9ba02420e819c1c050756ef69e4c6c200b/pymobiledevice3-9.30.1-py3-none-any.whl", hash = "sha256:506f6bad6874eb4c238f731f83681fb1c64777068324b6050628acf4042f8657", size = 975794, upload-time = "2026-06-23T21:17:19.026Z" },
+]
+
+[[package]]
+name = "pypinyin"
+version = "0.55.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/b4/a4/784cf98c09e0dc22776b0d7d8a4a5b761218bcae4608c2416ce1e167c8af/pypinyin-0.55.0.tar.gz", hash = "sha256:b5711b3a0c6f76e67408ec6b2e3c4987a3a806b7c528076e7c7b86fcf0eaa66b", size = 839836, upload-time = "2025-07-20T12:01:50.657Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/b9/7b/4cabc76fcc21c3c7d5c671d8783984d30ac9d3bb387c4ba784fca3cdfa3a/pypinyin-0.55.0-py2.py3-none-any.whl", hash = "sha256:d53b1e8ad2cdb815fb2cb604ed3123372f5a28c6f447571244aca36fc62a286f", size = 840203, upload-time = "2025-07-20T12:01:48.535Z" },
 ]
 
 [[package]]
