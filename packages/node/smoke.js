@@ -93,6 +93,11 @@ async function main() {
     argvIncludesInOrder(artifactObserve.argv, ["--keep-artifacts", "--no-artifacts", "observe", "--no-vlm"]),
     `artifact argv was not built as expected: ${artifactObserve.argv.join(" ")}`,
   );
+  const screenshot = await artifactFake.screenshot({ label: "raw", out: "/tmp/coretap-node-shot.png" });
+  assert(
+    argvIncludesInOrder(screenshot.argv, ["--keep-artifacts", "screenshot", "--label", "raw", "--out", "/tmp/coretap-node-shot.png"]),
+    `screenshot argv was not built as expected: ${screenshot.argv.join(" ")}`,
+  );
 
   const fakeRun = await fake.openRun({ name: "node-argv" });
   await fakeRun.test("mobile-use helpers route through step", async (ui) => {
@@ -222,6 +227,8 @@ async function main() {
       {
         pageWaitMs: 2000,
         maxLongSide: 1368,
+        noRefine: true,
+        refineCropRatio: 0.42,
         noVlm: true,
       },
     );
@@ -234,6 +241,9 @@ async function main() {
         "2000",
         "--max-long-side",
         "1368",
+        "--no-refine",
+        "--refine-crop-ratio",
+        "0.42",
         "--no-vlm",
       ]),
       `step argv was not built as expected: ${result.argv.join(" ")}`,

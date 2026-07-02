@@ -99,6 +99,10 @@ class Coretap {
     return this._run(observeArgs(options), options);
   }
 
+  screenshot(options = {}) {
+    return this._run(screenshotArgs(options), options);
+  }
+
   step(action, options = {}) {
     return this._run(stepArgs(action, options), options);
   }
@@ -223,6 +227,10 @@ class IosVisualUi {
 
   async observe(options = {}) {
     return this.client._run(observeArgs(options), this._options(options));
+  }
+
+  async screenshot(options = {}) {
+    return this.client._run(screenshotArgs(options), this._options(options));
   }
 
   async step(action, options = {}) {
@@ -431,6 +439,13 @@ function observeArgs(options = {}) {
   return args;
 }
 
+function screenshotArgs(options = {}) {
+  const args = ["screenshot"];
+  if (options.label) args.push("--label", options.label);
+  if (options.out) args.push("--out", options.out);
+  return args;
+}
+
 function stepArgs(action, options = {}) {
   const args = ["step"];
   if (options.actionFile) {
@@ -447,6 +462,8 @@ function stepArgs(action, options = {}) {
   if (options.noPage) args.push("--no-page");
   if (hasOption(options, "minConfidence")) args.push("--min-confidence", String(options.minConfidence));
   if (hasOption(options, "maxLongSide")) args.push("--max-long-side", String(options.maxLongSide));
+  if (options.noRefine) args.push("--no-refine");
+  if (hasOption(options, "refineCropRatio")) args.push("--refine-crop-ratio", String(options.refineCropRatio));
   if (options.fullSize) args.push("--full-size");
   if (options.noOcr) args.push("--no-ocr");
   if (options.noVlm) args.push("--no-vlm");

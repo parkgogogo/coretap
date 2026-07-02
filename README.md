@@ -73,6 +73,7 @@ coretap model status
 Mobile-use and test surface:
 
 ```bash
+coretap --backend device --device "$UDID" screenshot --out ./iphone.png
 coretap --backend device --device "$UDID" observe
 
 coretap --backend device --device "$UDID" \
@@ -110,9 +111,13 @@ the app process by bundle id and verifying the PID is no longer running.
 
 `tap` is the primary semantic click path. It uses the built-in VLM grounding
 model, maps the model point back to the source screenshot, and dispatches
-through CoreDevice HID. The VLM coordinate is the final tap coordinate when the
-target is found. `tapPoint` and `longPress` are explicit point primitives for
-cases where the caller already has a trusted coordinate.
+through CoreDevice HID. By default, `tap` runs two grounding passes: a full
+screenshot coarse pass, then a local crop refinement pass around the coarse
+point. The refined coordinate is used when found; otherwise Coretap falls back
+to the coarse coordinate. Use `step --no-refine` to run a single grounding pass,
+or `step --refine-crop-ratio 0.38` to tune the crop size. `tapPoint` and
+`longPress` are explicit point primitives for cases where the caller already has
+a trusted coordinate.
 
 `step` captures the before frame when the action needs screen context, executes
 the action, waits `--page-wait-ms` milliseconds, then returns a compact page
@@ -164,6 +169,17 @@ coretap --trace-id "$TRACE" step --action '{"type":"press","button":"home"}'
 ```
 
 ## Observe
+
+`screenshot` captures a raw full-size PNG only. It does not run OCR, VLM, page
+summary, or long-side compression:
+
+```bash
+coretap --backend device --device "$UDID" screenshot --out ./iphone.png
+```
+
+When `--out` is omitted, Coretap writes the PNG under its cache artifact root and
+returns the path in JSON. Use `--out` when the caller needs a stable explicit
+file path.
 
 `observe` captures a screenshot and returns a structured page view:
 
@@ -255,9 +271,13 @@ install command and `CORETAP_BIN` override hint.
 share one chain log under Coretap's cache artifact root unless `artifactRoot` is
 provided.
 
+Node `ui.tap()` uses the same default two-step VLM refinement as `coretap step`.
+Pass `{ noRefine: true }` to disable refinement for one call, or
+`{ refineCropRatio: 0.42 }` to tune the local crop size.
+
 ## Intentional Cuts
 
-Coretap no longer exposes standalone coordinate tap, OCR tap, locate,
-screenshot, act loop, replay, JSON flow runner, direct press/type/key/clear/
-drag/scroll, or OCR status subcommands. Use `observe` plus `step` actions
-instead.
+Coretap no longer exposes standalone coordinate tap, OCR tap, locate, act loop,
+replay, JSON flow runner, direct press/type/key/clear/drag/scroll, or OCR status
+subcommands. Use `screenshot` for raw PNG capture, and `observe` plus `step`
+actions for mobile-use automation.

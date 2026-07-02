@@ -2134,6 +2134,23 @@ def _check_coredevice_result(done: Completed, *, code: str, stage: str) -> Compl
                 "suggestedCommand": "sudo pymobiledevice3 remote tunneld --daemonize",
             },
         )
+    if "Failed to start service" in combined:
+        raise CoretapError(
+            code,
+            "pymobiledevice3 could not start the CoreDevice developer service; run `pymobiledevice3 mounter auto-mount --userspace` and restart coretapd",
+            category="environment",
+            stage=stage,
+            retryable=True,
+            details={
+                "argv": done.argv,
+                "stdout": done.stdout,
+                "stderr": done.stderr,
+                "suggestedCommands": [
+                    "PYMOBILEDEVICE3_UDID=<UDID> pymobiledevice3 mounter auto-mount --userspace",
+                    "coretap daemon stop && coretap daemon start",
+                ],
+            },
+        )
     return done
 
 

@@ -440,7 +440,6 @@ def test_step_action_accepts_mobile_use_actions_without_schema() -> None:
 @pytest.mark.parametrize(
     "argv",
     [
-        ["screenshot"],
         ["tap", "target", "--target", "Search"],
         ["tap", "text", "Search"],
         ["locate", "--target", "Search"],
@@ -462,6 +461,83 @@ def test_removed_public_commands_are_not_registered(argv: list[str]) -> None:
 
     with pytest.raises(SystemExit):
         build_parser().parse_args(normalize_global_args(argv))
+
+
+def test_screenshot_command_writes_full_size_out(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    import coretap.cli
+    from coretap.cli import command_screenshot
+
+    captured: dict[str, object] = {}
+
+    def fake_capture_to(args: argparse.Namespace, *, label: str, run_dir: Path, out: Path, write_frame: bool = True) -> argparse.Namespace:
+        captured["label"] = label
+        captured["runDir"] = run_dir
+        captured["out"] = out
+        captured["writeFrame"] = write_frame
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_bytes(b"full-size-png")
+        return argparse.Namespace(frame_id=f"frame_{out.stem}", path=out, width=1260, height=2736, backend=args.backend, device=args.device)
+
+    monkeypatch.setattr(coretap.cli, "_capture_to", fake_capture_to)
+    out = tmp_path / "shot.png"
+    args = argparse.Namespace(
+        backend="device",
+        device="device-udid",
+        developer_dir=None,
+        coredevice_tunnel_mode="userspace",
+        label="shot",
+        out=str(out),
+        no_artifacts=False,
+        keep_artifacts=False,
+        artifact_root=None,
+        trace_id=None,
+    )
+
+    result = command_screenshot(args)
+
+    assert out.exists()
+    assert captured["out"] == out
+    assert result["schema"] == "coretap.screenshot.result.v1"
+    assert result["frame"]["path"] == str(out)
+    assert result["frame"]["widthPx"] == 1260
+    assert result["frame"]["heightPx"] == 2736
+    assert result["frame"]["resized"] is False
+    assert result["frame"]["maxLongSidePx"] is None
+    assert result["frame"]["scale"] == 1.0
+    assert "artifactDir" not in result
+
+
+def test_screenshot_command_defaults_to_cache_artifact_when_out_is_missing(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    import coretap.cli
+    from coretap.cli import command_screenshot
+
+    def fake_capture_to(args: argparse.Namespace, *, label: str, run_dir: Path, out: Path, write_frame: bool = True) -> argparse.Namespace:
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_bytes(b"full-size-png")
+        return argparse.Namespace(frame_id=f"frame_{out.stem}", path=out, width=1125, height=2436, backend=args.backend, device=args.device)
+
+    monkeypatch.setattr(coretap.cli, "_capture_to", fake_capture_to)
+    args = argparse.Namespace(
+        backend="device",
+        device="device-udid",
+        developer_dir=None,
+        coredevice_tunnel_mode="userspace",
+        label="screenshot",
+        out=None,
+        no_artifacts=False,
+        keep_artifacts=False,
+        artifact_root=str(tmp_path),
+        trace_id=None,
+    )
+
+    result = command_screenshot(args)
+
+    frame_path = Path(result["frame"]["path"])
+    assert frame_path.exists()
+    assert frame_path.name == "screenshot.png"
+    assert str(frame_path).startswith(str(tmp_path))
+    assert result["artifactDir"].startswith(str(tmp_path))
+    assert result["frame"]["resized"] is False
 
 
 def test_observe_returns_structured_ocr_tokens(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -511,6 +587,15 @@ def test_observe_returns_structured_ocr_tokens(monkeypatch: pytest.MonkeyPatch, 
                     "confidence": 0.8,
                     "center": {"x": 0.8, "y": 0.5},
                     "bbox": {"x": 0.72, "y": 0.44, "width": 0.16, "height": 0.12},
+                },
+                {
+                    "type": "visual",
+                    "source": "vlm",
+                    "label": "Search text label",
+                    "role": "button",
+                    "confidence": 0.7,
+                    "center": {"x": 0.6, "y": 0.625},
+                    "bbox": {"x": 0.5, "y": 0.6, "width": 0.2, "height": 0.05},
                 }
             ],
         },
@@ -544,8 +629,33 @@ def test_observe_returns_structured_ocr_tokens(monkeypatch: pytest.MonkeyPatch, 
     assert result["ocr"]["tokens"][0]["normalized"] == {"x": 0.6, "y": 0.625}
     assert result["visual"]["enabled"] is True
     assert result["visual"]["summary"] == "Home screen with icons"
-    assert result["visual"]["elements"][0]["label"] == "ChatGPT app icon"
+    assert [item["label"] for item in result["visual"]["elements"]] == ["ChatGPT app icon"]
+    assert result["visual"]["ocrFilteredElementCount"] == 1
     assert (tmp_path / "observe.result.json").exists()
+
+
+def test_visual_ocr_filter_keeps_icon_adjacent_to_text() -> None:
+    from coretap.cli import _filter_visual_elements_against_ocr
+
+    visual = {
+        "enabled": True,
+        "elements": [
+            {
+                "type": "visual",
+                "source": "vlm",
+                "label": "Search icon",
+                "role": "button",
+                "center": {"x": 0.46, "y": 0.56},
+                "bbox": {"x": 0.42, "y": 0.52, "width": 0.08, "height": 0.08},
+            }
+        ],
+    }
+    ocr_tokens = [{"text": "搜索", "bboxNormalized": {"x": 0.5, "y": 0.6, "width": 0.2, "height": 0.05}}]
+
+    result = _filter_visual_elements_against_ocr(visual, ocr_tokens)
+
+    assert result["elements"][0]["label"] == "Search icon"
+    assert "ocrFilteredElementCount" not in result
 
 
 def test_observe_no_vlm_skips_visual_model(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -606,7 +716,16 @@ def test_observe_no_ocr_still_runs_visual_model(monkeypatch: pytest.MonkeyPatch,
             "profile": profile,
             "promptVersion": "visual-observe-v1",
             "summary": "Icon-only page",
-            "elements": [],
+            "elements": [
+                {
+                    "type": "visual",
+                    "source": "vlm",
+                    "label": "Text-shaped visual still present without OCR",
+                    "role": "button",
+                    "center": {"x": 0.6, "y": 0.625},
+                    "bbox": {"x": 0.5, "y": 0.6, "width": 0.2, "height": 0.05},
+                }
+            ],
         },
     )
 
@@ -629,6 +748,8 @@ def test_observe_no_ocr_still_runs_visual_model(monkeypatch: pytest.MonkeyPatch,
     assert result["ocr"] == {"enabled": False}
     assert result["visual"]["enabled"] is True
     assert result["visual"]["summary"] == "Icon-only page"
+    assert result["visual"]["elements"][0]["label"] == "Text-shaped visual still present without OCR"
+    assert "ocrFilteredElementCount" not in result["visual"]
 
 
 def test_observe_default_artifacts_are_temporary(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1294,6 +1415,7 @@ def test_step_tap_uses_vlm_for_search_field_target(monkeypatch: pytest.MonkeyPat
     from coretap.model_pack import PUBLIC_MODEL_PROFILE
 
     captured = {}
+    calls = {"ground": 0}
 
     class FakeBackend:
         def tap_normalized(self, device: str, x: float, y: float, **kwargs: object) -> dict:
@@ -1301,6 +1423,7 @@ def test_step_tap_uses_vlm_for_search_field_target(monkeypatch: pytest.MonkeyPat
             return {"attempted": True, "dryRun": False}
 
     def fake_ground_target(*_args: object, **_kwargs: object) -> dict:
+        calls["ground"] += 1
         return {
             "schema": "coretap.ground.result.v1",
             "status": "found",
@@ -1323,6 +1446,8 @@ def test_step_tap_uses_vlm_for_search_field_target(monkeypatch: pytest.MonkeyPat
         developer_dir=None,
         coredevice_tunnel_mode="userspace",
         max_long_side=512,
+        no_refine=True,
+        refine_crop_ratio=0.38,
     )
 
     result = _execute_step_tap(args, {"schema": "coretap.action.v2", "type": "tap", "target": "the App Store search field"}, before, tmp_path)
@@ -1330,6 +1455,121 @@ def test_step_tap_uses_vlm_for_search_field_target(monkeypatch: pytest.MonkeyPat
     assert result["status"] == "executed"
     assert result["strategy"] == "vlm_grounding"
     assert captured["tap"]["x"] == pytest.approx(0.5)
+    assert calls["ground"] == 1
+
+
+def test_step_tap_defaults_to_two_step_refinement(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    import coretap.cli
+    from coretap.cli import _execute_step_tap
+    from coretap.model_pack import PUBLIC_MODEL_PROFILE
+    from PIL import Image
+
+    captured = {}
+    calls: list[str] = []
+
+    class FakeBackend:
+        def tap_normalized(self, device: str, x: float, y: float, **kwargs: object) -> dict:
+            captured["tap"] = {"device": device, "x": x, "y": y, "kwargs": kwargs}
+            return {"attempted": True, "dryRun": False}
+
+    def fake_ground_target(image: Path, *_args: object, **_kwargs: object) -> dict:
+        calls.append(Path(image).name)
+        if len(calls) == 1:
+            return {
+                "schema": "coretap.ground.result.v1",
+                "status": "found",
+                "point": {"framePx": {"x": 500, "y": 600}, "normalized": {"x": 0.5, "y": 0.5}},
+                "frame": {"widthPx": 1000, "heightPx": 1200},
+            }
+        return {
+            "schema": "coretap.ground.result.v1",
+            "status": "found",
+            "point": {"framePx": {"x": 114, "y": 228}, "normalized": {"x": 0.25, "y": 0.5}},
+            "frame": {"widthPx": 456, "heightPx": 456},
+        }
+
+    monkeypatch.setattr(coretap.cli, "warm_model", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(coretap.cli, "ground_target", fake_ground_target)
+    monkeypatch.setattr(coretap.cli, "backend_for", lambda *_args, **_kwargs: FakeBackend())
+    source = tmp_path / "source.png"
+    Image.new("RGB", (1000, 1200), color=(255, 255, 255)).save(source)
+    before = {"frame": {"path": str(source), "widthPx": 1000, "heightPx": 1200}, "sourceFrame": {"path": str(source), "widthPx": 1000, "heightPx": 1200}}
+    args = argparse.Namespace(
+        profile=PUBLIC_MODEL_PROFILE,
+        dry_run=False,
+        backend="device",
+        device="device-udid",
+        developer_dir=None,
+        coredevice_tunnel_mode="userspace",
+        max_long_side=1200,
+        no_refine=False,
+        refine_crop_ratio=0.38,
+    )
+
+    result = _execute_step_tap(args, {"schema": "coretap.action.v2", "type": "tap", "target": "Search"}, before, tmp_path)
+
+    assert result["status"] == "executed"
+    assert result["strategy"] == "vlm_grounding_refined"
+    assert result["grounding"]["source"] == "refined"
+    assert result["point"]["normalized"]["x"] == pytest.approx(0.386)
+    assert result["point"]["normalized"]["y"] == pytest.approx(0.5)
+    assert captured["tap"]["x"] == pytest.approx(0.386)
+    assert calls == ["source.model-input.png", "step-grounding-refine-model-input.png"]
+    assert (tmp_path / "step-grounding-coarse.json").exists()
+    assert (tmp_path / "step-grounding-refined.json").exists()
+    assert (tmp_path / "step-grounding-final.json").exists()
+
+
+def test_step_tap_refinement_falls_back_to_coarse_when_refined_not_found(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    import coretap.cli
+    from coretap.cli import _execute_step_tap
+    from coretap.model_pack import PUBLIC_MODEL_PROFILE
+    from PIL import Image
+
+    captured = {}
+    calls = {"ground": 0}
+
+    class FakeBackend:
+        def tap_normalized(self, _device: str, x: float, y: float, **_kwargs: object) -> dict:
+            captured["tap"] = {"x": x, "y": y}
+            return {"attempted": True, "dryRun": False}
+
+    def fake_ground_target(*_args: object, **_kwargs: object) -> dict:
+        calls["ground"] += 1
+        if calls["ground"] == 1:
+            return {
+                "schema": "coretap.ground.result.v1",
+                "status": "found",
+                "point": {"framePx": {"x": 500, "y": 600}, "normalized": {"x": 0.5, "y": 0.5}},
+                "frame": {"widthPx": 1000, "heightPx": 1200},
+            }
+        return {"schema": "coretap.ground.result.v1", "status": "not_found", "target": {"description": "Search"}}
+
+    monkeypatch.setattr(coretap.cli, "warm_model", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(coretap.cli, "ground_target", fake_ground_target)
+    monkeypatch.setattr(coretap.cli, "backend_for", lambda *_args, **_kwargs: FakeBackend())
+    source = tmp_path / "source.png"
+    Image.new("RGB", (1000, 1200), color=(255, 255, 255)).save(source)
+    before = {"frame": {"path": str(source), "widthPx": 1000, "heightPx": 1200}, "sourceFrame": {"path": str(source), "widthPx": 1000, "heightPx": 1200}}
+    args = argparse.Namespace(
+        profile=PUBLIC_MODEL_PROFILE,
+        dry_run=False,
+        backend="device",
+        device="device-udid",
+        developer_dir=None,
+        coredevice_tunnel_mode="userspace",
+        max_long_side=1200,
+        no_refine=False,
+        refine_crop_ratio=0.38,
+    )
+
+    result = _execute_step_tap(args, {"schema": "coretap.action.v2", "type": "tap", "target": "Search"}, before, tmp_path)
+
+    assert result["status"] == "executed"
+    assert result["strategy"] == "vlm_grounding_coarse_fallback"
+    assert result["grounding"]["source"] == "coarse_fallback"
+    assert captured["tap"] == pytest.approx({"x": 0.5, "y": 0.5})
+    assert calls["ground"] == 2
 
 
 def test_step_tap_uses_requested_max_long_side_for_model_input(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -1381,13 +1621,16 @@ def test_step_tap_uses_requested_max_long_side_for_model_input(monkeypatch: pyte
         developer_dir=None,
         coredevice_tunnel_mode="userspace",
         max_long_side=512,
+        no_refine=True,
+        refine_crop_ratio=0.38,
     )
 
     result = _execute_step_tap(args, {"schema": "coretap.action.v2", "type": "tap", "target": "Search"}, before, tmp_path)
 
     assert result["status"] == "executed"
     assert captured["maxLongSide"] == 512
-    assert result["modelInput"]["maxLongSidePx"] == 512
+    coarse = json.loads((tmp_path / "step-grounding-coarse.json").read_text(encoding="utf-8"))
+    assert coarse["modelInput"]["maxLongSidePx"] == 512
 
 
 def test_step_tap_top_search_field_target_records_active_text_anchor(
@@ -1426,6 +1669,8 @@ def test_step_tap_top_search_field_target_records_active_text_anchor(
         developer_dir=None,
         coredevice_tunnel_mode="userspace",
         max_long_side=1368,
+        no_refine=True,
+        refine_crop_ratio=0.38,
     )
 
     result = _execute_step_tap(
@@ -1479,6 +1724,8 @@ def test_step_tap_search_suggestion_row_does_not_record_text_entry_anchor(
         developer_dir=None,
         coredevice_tunnel_mode="userspace",
         max_long_side=1368,
+        no_refine=True,
+        refine_crop_ratio=0.38,
     )
 
     result = _execute_step_tap(
@@ -1533,6 +1780,8 @@ def test_step_tap_bottom_visible_search_field_records_keyboard_adjacent_anchor(
         developer_dir=None,
         coredevice_tunnel_mode="userspace",
         max_long_side=1368,
+        no_refine=True,
+        refine_crop_ratio=0.38,
     )
 
     result = _execute_step_tap(
@@ -1597,6 +1846,8 @@ def test_step_tap_recovers_once_when_model_worker_crashes(monkeypatch: pytest.Mo
         developer_dir=None,
         coredevice_tunnel_mode="userspace",
         max_long_side=512,
+        no_refine=True,
+        refine_crop_ratio=0.38,
     )
 
     result = _execute_step_tap(args, {"schema": "coretap.action.v2", "type": "tap", "target": "Search"}, before, tmp_path)
@@ -1949,6 +2200,8 @@ def _step_args(**overrides: object) -> argparse.Namespace:
         "no_page": True,
         "min_confidence": 0.0,
         "max_long_side": 512,
+        "no_refine": False,
+        "refine_crop_ratio": 0.38,
         "full_size": False,
         "backend": "device",
         "device": "device-udid",

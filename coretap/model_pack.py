@@ -25,6 +25,8 @@ PUBLIC_PROMPT_VERSION = "grounding-v1"
 PUBLIC_VISUAL_OBSERVE_PROMPT_VERSION = "visual-observe-v1"
 PUBLIC_RUNTIME_ID = "mlx-vlm-process-worker-v1"
 VISUAL_OBSERVE_ROLES = {"appIcon", "button", "tab", "input", "toggle", "image", "navigation", "unknown"}
+DEFAULT_VISUAL_OBSERVE_MAX_ELEMENTS = 12
+DEFAULT_VISUAL_OBSERVE_MAX_TOKENS = 256
 
 INTERNAL_FIXTURE_PROFILE = "internal:test-fixture-grounder"
 
@@ -482,21 +484,27 @@ def _load_model() -> tuple[Any, Any]:
 
 
 def grounding_prompt(target: str, width: int, height: int) -> str:
-    return f'Locate {target}. Output only {{"coordinate":[x,y]}} in 0-1000 coordinates.'
-
-
-def visual_observe_prompt(width: int, height: int, *, max_elements: int = 40) -> str:
     return (
-        "Inspect this mobile UI screenshot and list the important visible interactive visual elements, "
-        "especially icons or controls that may not have OCR text. "
+        f'Locate {target}. Output only one JSON object: {{"coordinate":[x,y]}}. '
+        "Use 0-1000 coordinates. Do not output a box, prose, Markdown, or extra keys."
+    )
+
+
+def visual_observe_prompt(width: int, height: int, *, max_elements: int = DEFAULT_VISUAL_OBSERVE_MAX_ELEMENTS) -> str:
+    return (
+        "Inspect this mobile UI screenshot and list only non-text visual UI elements that OCR would miss. "
+        "Return pure icons, icon-only buttons, app icons, tab icons, image-like buttons, toggles, and visual-only controls. "
+        "Do not return plain text, text lines, text labels, OCR-readable text buttons, captions, or decorative backgrounds. "
         "Return only one JSON object with keys summary and elements. "
         f"elements must contain at most {max_elements} items. "
         "Each item must use: label, role, center, bbox, confidence. "
         "role must be one of appIcon, button, tab, input, toggle, image, navigation, unknown. "
         "center must be [x,y] in 0-1000 coordinates. "
         "bbox, when known, must be [x1,y1,x2,y2] in 0-1000 coordinates. "
+        "When an icon has a nearby text label, bbox should cover the icon/control itself and exclude the text label. "
         "confidence is a number from 0 to 1. "
-        "Focus on actionable icons/buttons/tabs/inputs and major visual cards; skip decorative backgrounds. "
+        "Focus on the most actionable non-text elements only. "
+        "summary should describe the non-text visual controls, not OCR-readable text. "
         f"The screenshot size is {width}x{height}px."
     )
 
@@ -540,6 +548,38 @@ def _extract_json_object(raw: str) -> dict[str, Any] | None:
     return None
 
 
+def _extract_json_value(raw: str) -> Any | None:
+    text = raw.strip()
+    if not text:
+        return None
+    try:
+        data = json.loads(text)
+        if isinstance(data, dict | list):
+            return data
+    except json.JSONDecodeError:
+        pass
+
+    starts = [index for index, char in enumerate(raw) if char in "{["]
+    decoder = json.JSONDecoder()
+    for start in starts:
+        segment = raw[start:].strip()
+        try:
+            data, _ = decoder.raw_decode(segment)
+            if isinstance(data, dict | list):
+                return data
+        except json.JSONDecodeError:
+            if not segment.startswith("{"):
+                continue
+            repaired = _repair_json_like_object(segment)
+            try:
+                data, _ = decoder.raw_decode(repaired)
+                if isinstance(data, dict | list):
+                    return data
+            except json.JSONDecodeError:
+                continue
+    return None
+
+
 def _repair_json_like_object(raw: str) -> str:
     repaired = raw
     repaired = re.sub(r'"([xy])\s*(-?\d+(?:\.\d+)?)', r'"\1":\2', repaired)
@@ -548,45 +588,155 @@ def _repair_json_like_object(raw: str) -> str:
     return repaired
 
 
+@dataclass(frozen=True)
+class _GroundingShapeCandidate:
+    kind: str
+    values: tuple[float, ...]
+    source: str
+
+
+_NUMBER_TOKEN_PATTERN = re.compile(r"^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?$")
+
+
+def _as_coordinate_float(value: Any) -> float | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _numeric_shape_array(value: Any) -> tuple[float, ...] | None:
+    if not isinstance(value, list | tuple) or len(value) not in {2, 4}:
+        return None
+    numbers: list[float] = []
+    for item in value:
+        number = _as_coordinate_float(item)
+        if number is None:
+            return None
+        numbers.append(number)
+    return tuple(numbers)
+
+
+def _shape_candidate(values: tuple[float, ...], *, source: str) -> _GroundingShapeCandidate:
+    if len(values) == 2:
+        return _GroundingShapeCandidate(kind="point", values=values, source=source)
+    return _GroundingShapeCandidate(kind="rect", values=values, source=source)
+
+
+def _json_shape_candidates(value: Any) -> list[_GroundingShapeCandidate]:
+    candidates: list[_GroundingShapeCandidate] = []
+
+    def visit(node: Any) -> None:
+        values = _numeric_shape_array(node)
+        if values is not None:
+            candidates.append(_shape_candidate(values, source="json"))
+            return
+        if isinstance(node, dict):
+            for child in node.values():
+                visit(child)
+        elif isinstance(node, list | tuple):
+            for child in node:
+                visit(child)
+
+    visit(value)
+    return candidates
+
+
+def _parse_numeric_array_body(body: str) -> tuple[float, ...] | None:
+    parts = [part.strip() for part in body.split(",")]
+    if len(parts) not in {2, 4} or any(not part for part in parts):
+        return None
+    numbers: list[float] = []
+    for part in parts:
+        if not _NUMBER_TOKEN_PATTERN.fullmatch(part):
+            return None
+        numbers.append(float(part))
+    return tuple(numbers)
+
+
+def _raw_shape_candidates(raw: str) -> list[_GroundingShapeCandidate]:
+    candidates: list[_GroundingShapeCandidate] = []
+    for match in re.finditer(r"\[([^\[\]\n]+)\]", raw):
+        values = _parse_numeric_array_body(match.group(1))
+        if values is not None:
+            candidates.append(_shape_candidate(values, source="raw_array"))
+
+    last_open = raw.rfind("[")
+    last_close = raw.rfind("]")
+    if last_open > last_close:
+        values = _parse_numeric_array_body(raw[last_open + 1 :].strip())
+        if values is not None:
+            candidates.append(_shape_candidate(values, source="raw_array"))
+    return candidates
+
+
+def _choose_shape_candidate(
+    json_candidates: list[_GroundingShapeCandidate],
+    raw_candidates: list[_GroundingShapeCandidate],
+) -> _GroundingShapeCandidate | None:
+    for candidates in (json_candidates, raw_candidates):
+        points = [candidate for candidate in candidates if candidate.kind == "point"]
+        if points:
+            return points[-1]
+        rects = [candidate for candidate in candidates if candidate.kind == "rect"]
+        if rects:
+            return rects[-1]
+    return None
+
+
+def _resolve_shape_candidate(candidate: _GroundingShapeCandidate) -> dict[str, Any]:
+    if candidate.kind == "point":
+        x, y = candidate.values
+        return {"x": x, "y": y, "pointSource": "point"}
+
+    x1, y1, x2, y2 = candidate.values
+    left = min(x1, x2)
+    top = min(y1, y2)
+    right = max(x1, x2)
+    bottom = max(y1, y2)
+    return {
+        "x": (left + right) / 2,
+        "y": (top + bottom) / 2,
+        "pointSource": "rect_center",
+        "rectModel1000": {"x1": left, "y1": top, "x2": right, "y2": bottom},
+    }
+
+
 def parse_grounding_output(raw: str, *, width: int, height: int) -> dict[str, Any]:
-    data = _extract_json_object(raw)
-    coordinate: Any = None
-    if data:
+    data = _extract_json_value(raw)
+    if isinstance(data, dict):
         status = data.get("status")
         if status in {"not_found", "ambiguous"}:
             return {"status": status, "rawOutput": raw}
-        coordinate = data.get("coordinate")
-        if coordinate is None and isinstance(data.get("point"), dict):
-            point = data["point"]
-            coordinate = [point.get("x"), point.get("y")]
-        if coordinate is None and isinstance(data.get("point_2d"), list) and len(data["point_2d"]) == 2:
-            coordinate = data["point_2d"]
-        if coordinate is None and isinstance(data.get("bbox_2d"), list) and len(data["bbox_2d"]) == 4:
-            x1, y1, x2, y2 = data["bbox_2d"]
-            coordinate = [(float(x1) + float(x2)) / 2, (float(y1) + float(y2)) / 2]
-    if coordinate is None:
-        match = re.search(r"\[\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*\]", raw)
-        if match:
-            coordinate = [float(match.group(1)), float(match.group(2))]
-    if not isinstance(coordinate, list | tuple) or len(coordinate) != 2:
+
+    json_candidates = _json_shape_candidates(data) if isinstance(data, dict | list) else []
+    raw_candidates = _raw_shape_candidates(raw)
+    candidate = _choose_shape_candidate(json_candidates, raw_candidates)
+    if candidate is None:
         return {"status": "invalid", "rawOutput": raw, "reason": "no coordinate"}
-    try:
-        x = float(coordinate[0])
-        y = float(coordinate[1])
-    except (TypeError, ValueError):
-        return {"status": "invalid", "rawOutput": raw, "reason": "non-numeric coordinate"}
-    if not (0 <= x <= 1000 and 0 <= y <= 1000):
+
+    resolved = _resolve_shape_candidate(candidate)
+    x = resolved["x"]
+    y = resolved["y"]
+    values_in_bounds = all(0 <= value <= 1000 for value in candidate.values)
+    if not values_in_bounds:
         return {
             "status": "invalid",
             "rawOutput": raw,
             "reason": "coordinate outside model-1000 space",
             "pointModel1000": {"x": x, "y": y},
+            "pointSource": resolved["pointSource"],
+            **({"rectModel1000": resolved["rectModel1000"]} if "rectModel1000" in resolved else {}),
         }
     frame_x = (x / 1000) * width
     frame_y = (y / 1000) * height
     return {
         "status": "found",
         "rawOutput": raw,
+        "pointSource": resolved["pointSource"],
+        **({"rectModel1000": resolved["rectModel1000"]} if "rectModel1000" in resolved else {}),
         "point": {
             "model1000": {"x": x, "y": y},
             "framePx": {"x": frame_x, "y": frame_y},
@@ -657,7 +807,13 @@ def _confidence(value: Any) -> float | None:
     return max(0.0, min(1.0, confidence))
 
 
-def parse_visual_observe_output(raw: str, *, width: int, height: int, max_elements: int = 40) -> dict[str, Any]:
+def parse_visual_observe_output(
+    raw: str,
+    *,
+    width: int,
+    height: int,
+    max_elements: int = DEFAULT_VISUAL_OBSERVE_MAX_ELEMENTS,
+) -> dict[str, Any]:
     data = _extract_json_object(raw)
     if not isinstance(data, dict):
         return {
@@ -784,7 +940,12 @@ def run_grounding_model(image: Path, target: str, *, profile: str = PUBLIC_MODEL
     return _run_grounding_model_inprocess(image, target, profile=profile)
 
 
-def run_visual_observe_model(image: Path, *, profile: str = PUBLIC_MODEL_PROFILE, max_elements: int = 40) -> dict[str, Any]:
+def run_visual_observe_model(
+    image: Path,
+    *,
+    profile: str = PUBLIC_MODEL_PROFILE,
+    max_elements: int = DEFAULT_VISUAL_OBSERVE_MAX_ELEMENTS,
+) -> dict[str, Any]:
     if not _is_model_worker_process():
         return _MODEL_PROCESS_CLIENT.request(
             {"action": "observe", "profile": profile, "image": str(image), "maxElements": max_elements},
@@ -811,12 +972,17 @@ def _run_grounding_model_inprocess(image: Path, target: str, *, profile: str = P
     return parsed
 
 
-def _run_visual_observe_model_inprocess(image: Path, *, profile: str = PUBLIC_MODEL_PROFILE, max_elements: int = 40) -> dict[str, Any]:
+def _run_visual_observe_model_inprocess(
+    image: Path,
+    *,
+    profile: str = PUBLIC_MODEL_PROFILE,
+    max_elements: int = DEFAULT_VISUAL_OBSERVE_MAX_ELEMENTS,
+) -> dict[str, Any]:
     _require_public_profile(profile)
     width, height = png_size(image)
     prompt = visual_observe_prompt(width, height, max_elements=max_elements)
     started = time.monotonic()
-    raw = _run_model_prompt(image, prompt, profile=profile, max_tokens=768)
+    raw = _run_model_prompt(image, prompt, profile=profile, max_tokens=DEFAULT_VISUAL_OBSERVE_MAX_TOKENS)
     parsed = parse_visual_observe_output(raw, width=width, height=height, max_elements=max_elements)
     parsed.update(
         {
@@ -848,7 +1014,7 @@ def _model_worker_loop() -> int:
                 result = _run_grounding_model_inprocess(image, target, profile=profile)
             elif action == "observe":
                 image = Path(str(request.get("image") or ""))
-                max_elements = int(request.get("maxElements") or 40)
+                max_elements = int(request.get("maxElements") or DEFAULT_VISUAL_OBSERVE_MAX_ELEMENTS)
                 result = _run_visual_observe_model_inprocess(image, profile=profile, max_elements=max_elements)
             else:
                 raise CoretapError(

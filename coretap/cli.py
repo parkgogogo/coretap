@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 from contextlib import contextmanager, suppress
 import json
 import os
@@ -17,13 +18,16 @@ from coretap.backends import backend_for
 from coretap.device_buttons import BUTTON_STATES, button_choices
 from coretap.grounding import (
     DEFAULT_GROUNDING_IMAGE_LONG_SIDE,
+    DEFAULT_REFINEMENT_CROP_RATIO,
     GROUNDING_PROFILES,
     ground_target,
     model_check,
     model_install,
     model_status,
+    prepare_refinement_crop,
     prepare_image_long_side,
     prepare_grounding_image,
+    remap_crop_grounding_to_source_frame,
     remap_grounding_to_source_frame,
     warm_model,
 )
@@ -608,6 +612,7 @@ def _compact_execution(execution: Any) -> dict[str, Any] | None:
         gpoint = grounding.get("point") if isinstance(grounding.get("point"), dict) else {}
         compact["grounding"] = {
             "status": grounding.get("status"),
+            "source": grounding.get("source"),
             "point": {
                 key: gpoint.get(key)
                 for key in ("normalized", "framePx")
@@ -702,6 +707,9 @@ def compact_response(data: dict[str, Any]) -> dict[str, Any]:
 
     if data.get("command") == "step" and isinstance(result, dict):
         compact.update(_compact_step_response(data, result))
+    elif data.get("command") == "screenshot" and isinstance(result, dict):
+        compact["frame"] = _compact_frame(result.get("frame"))
+        compact["artifactDir"] = result.get("artifactDir")
     elif data.get("command") == "observe" and isinstance(result, dict):
         compact["observation"] = page_observation_summary(result)
         compact["artifactDir"] = result.get("artifactDir")
@@ -1563,6 +1571,91 @@ def _run_observe_visual(image: Path, args: argparse.Namespace) -> dict[str, Any]
         return result
 
 
+VISUAL_OCR_TEXT_OVERLAP_DROP_RATIO = 0.45
+
+
+def _as_rect_number(value: Any) -> float | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _normalized_rect(value: Any) -> tuple[float, float, float, float] | None:
+    if not isinstance(value, dict):
+        return None
+    x = _as_rect_number(value.get("x"))
+    y = _as_rect_number(value.get("y"))
+    width = _as_rect_number(value.get("width"))
+    height = _as_rect_number(value.get("height"))
+    if x is None or y is None or width is None or height is None:
+        return None
+    if width <= 0 or height <= 0:
+        return None
+    left = max(0.0, min(1.0, x))
+    top = max(0.0, min(1.0, y))
+    right = max(0.0, min(1.0, x + width))
+    bottom = max(0.0, min(1.0, y + height))
+    if right <= left or bottom <= top:
+        return None
+    return left, top, right, bottom
+
+
+def _rect_area(rect: tuple[float, float, float, float]) -> float:
+    return max(0.0, rect[2] - rect[0]) * max(0.0, rect[3] - rect[1])
+
+
+def _rect_overlap_area(a: tuple[float, float, float, float], b: tuple[float, float, float, float]) -> float:
+    left = max(a[0], b[0])
+    top = max(a[1], b[1])
+    right = min(a[2], b[2])
+    bottom = min(a[3], b[3])
+    if right <= left or bottom <= top:
+        return 0.0
+    return (right - left) * (bottom - top)
+
+
+def _filter_visual_elements_against_ocr(visual: dict[str, Any], ocr_tokens: list[dict[str, Any]]) -> dict[str, Any]:
+    elements = visual.get("elements")
+    if not isinstance(elements, list) or not elements or not ocr_tokens:
+        return visual
+    text_rects = [
+        rect
+        for token in ocr_tokens
+        if isinstance(token, dict)
+        for rect in [_normalized_rect(token.get("bboxNormalized"))]
+        if rect is not None
+    ]
+    if not text_rects:
+        return visual
+
+    kept: list[Any] = []
+    removed_count = 0
+    for element in elements:
+        if not isinstance(element, dict):
+            kept.append(element)
+            continue
+        rect = _normalized_rect(element.get("bbox"))
+        if rect is None:
+            kept.append(element)
+            continue
+        area = _rect_area(rect)
+        overlap = min(area, sum(_rect_overlap_area(rect, text_rect) for text_rect in text_rects))
+        if area > 0 and overlap / area >= VISUAL_OCR_TEXT_OVERLAP_DROP_RATIO:
+            removed_count += 1
+            continue
+        kept.append(element)
+
+    if removed_count == 0:
+        return visual
+    filtered = dict(visual)
+    filtered["elements"] = kept
+    filtered["ocrFilteredElementCount"] = removed_count
+    return filtered
+
+
 def _observe_into(
     args: argparse.Namespace,
     *,
@@ -1584,6 +1677,7 @@ def _observe_into(
         **_artifact_result(args, run_dir),
     }
     should_skip_ocr = bool(getattr(args, "no_ocr", False) if no_ocr is None else no_ocr)
+    token_json: list[dict[str, Any]] = []
     if should_skip_ocr:
         result["ocr"] = {"enabled": False}
     else:
@@ -1615,6 +1709,8 @@ def _observe_into(
         result["visual"] = {"enabled": False}
     else:
         visual = _run_observe_visual(image, args)
+        if not should_skip_ocr:
+            visual = _filter_visual_elements_against_ocr(visual, token_json)
         result["visual"] = visual
         write_json(run_dir / f"{label}.visual.json", visual)
     write_json(run_dir / f"{label}.observe.result.json", result)
@@ -1625,6 +1721,60 @@ def command_observe(args: argparse.Namespace) -> dict[str, Any]:
     with _command_artifacts(args) as run_dir:
         result = _observe_into(args, run_dir=run_dir, label=args.label)
         write_json(run_dir / "observe.result.json", result)
+        return result
+
+
+@contextmanager
+def _screenshot_artifacts(args: argparse.Namespace):
+    if getattr(args, "out", None):
+        with _command_artifacts(args) as run_dir:
+            yield run_dir
+        return
+    if getattr(args, "no_artifacts", False):
+        raise CoretapError(
+            "SCREENSHOT_OUTPUT_REQUIRED",
+            "screenshot requires --out when --no-artifacts is set",
+            category="usage",
+            stage="screenshot",
+        )
+    root = _persistent_artifact_root(args) or ensure_state()["artifacts"]
+    run_dir = artifact_dir(root)
+    previous_dir = getattr(args, "_artifact_run_dir", None)
+    previous_persistent = getattr(args, "_artifacts_persistent", None)
+    args._artifact_run_dir = str(run_dir)
+    args._artifacts_persistent = True
+    try:
+        yield run_dir
+    finally:
+        if previous_dir is None:
+            with suppress(AttributeError):
+                delattr(args, "_artifact_run_dir")
+        else:
+            args._artifact_run_dir = previous_dir
+        if previous_persistent is None:
+            with suppress(AttributeError):
+                delattr(args, "_artifacts_persistent")
+        else:
+            args._artifacts_persistent = previous_persistent
+
+
+def command_screenshot(args: argparse.Namespace) -> dict[str, Any]:
+    label = str(getattr(args, "label", None) or "screenshot")
+    with _screenshot_artifacts(args) as run_dir:
+        output_path = Path(args.out).expanduser() if getattr(args, "out", None) else run_dir / f"{label}.png"
+        frame = _capture_to(args, label=label, run_dir=run_dir, out=output_path)
+        frame_json = {
+            **_frame_json(frame),
+            "resized": False,
+            "maxLongSidePx": None,
+            "scale": 1.0,
+        }
+        result = {
+            "schema": "coretap.screenshot.result.v1",
+            **_artifact_result(args, run_dir),
+            "frame": frame_json,
+        }
+        write_json(run_dir / f"{label}.screenshot.result.json", result)
         return result
 
 
@@ -2836,8 +2986,103 @@ def _ground_target_with_recovery(image: Path, target: str, *, profile: str) -> d
         return result
 
 
+def _model_input_summary(model_input: dict[str, Any]) -> dict[str, Any]:
+    return {
+        key: model_input.get(key)
+        for key in ("path", "widthPx", "heightPx", "resized", "maxLongSidePx", "scale")
+        if key in model_input
+    }
+
+
+def _grounding_response_summary(grounded: dict[str, Any], *, source: str) -> dict[str, Any]:
+    point = grounded.get("point") if isinstance(grounded.get("point"), dict) else {}
+    summary: dict[str, Any] = {
+        "schema": grounded.get("schema") or "coretap.ground.result.v1",
+        "status": grounded.get("status"),
+        "source": source,
+        "point": {
+            key: point.get(key)
+            for key in ("normalized", "framePx", "modelInputFramePx", "cropFramePx")
+            if key in point
+        },
+        "frame": grounded.get("frame"),
+    }
+    for key in ("target", "model", "reason", "modelRecovery"):
+        if key in grounded:
+            summary[key] = grounded.get(key)
+    return {key: value for key, value in summary.items() if value is not None}
+
+
+def _refinement_edge_warning(grounded: dict[str, Any], crop: dict[str, Any], *, margin: float = 0.03) -> dict[str, Any] | None:
+    point = grounded.get("point") if isinstance(grounded.get("point"), dict) else {}
+    crop_frame_px = point.get("cropFramePx") if isinstance(point.get("cropFramePx"), dict) else None
+    if not crop_frame_px:
+        return None
+    try:
+        x = float(crop_frame_px["x"])
+        y = float(crop_frame_px["y"])
+        width = float(crop["width"])
+        height = float(crop["height"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    margin_x = width * margin
+    margin_y = height * margin
+    near = x <= margin_x or x >= width - margin_x or y <= margin_y or y >= height - margin_y
+    if not near:
+        return None
+    return {
+        "code": "REFINED_POINT_NEAR_CROP_EDGE",
+        "message": "refined grounding point is close to the crop edge",
+        "margin": margin,
+        "cropFramePx": {"x": x, "y": y},
+        "cropSizePx": {"width": width, "height": height},
+    }
+
+
+def _refinement_error_summary(exc: CoretapError) -> dict[str, Any]:
+    return {
+        "code": exc.code,
+        "category": exc.category,
+        "stage": exc.stage,
+        "message": str(exc),
+        "retryable": exc.retryable,
+        "details": exc.details,
+    }
+
+
+def _write_step_grounding_final(
+    run_dir: Path,
+    *,
+    target: str,
+    strategy: str,
+    final_grounding: dict[str, Any],
+    coarse: dict[str, Any],
+    crop: dict[str, Any] | None = None,
+    refined: dict[str, Any] | None = None,
+    refine_error: dict[str, Any] | None = None,
+    warning: dict[str, Any] | None = None,
+) -> None:
+    write_json(
+        run_dir / "step-grounding-final.json",
+        {
+            "schema": "coretap.step.tap-refinement.v1",
+            "target": target,
+            "strategy": strategy,
+            "final": final_grounding,
+            "coarse": _grounding_response_summary(coarse, source="coarse"),
+            "crop": crop,
+            "refined": _grounding_response_summary(refined, source="refined") if isinstance(refined, dict) else None,
+            "refineError": refine_error,
+            "warning": warning,
+        },
+    )
+
+
 def _execute_step_tap(args: argparse.Namespace, action: dict[str, Any], before: dict[str, Any], run_dir: Path) -> dict[str, Any]:
     target = action["target"]
+    refine_crop_ratio = float(getattr(args, "refine_crop_ratio", DEFAULT_REFINEMENT_CROP_RATIO) or DEFAULT_REFINEMENT_CROP_RATIO)
+    if refine_crop_ratio <= 0:
+        raise CoretapError("INVALID_ARGUMENT", "step --refine-crop-ratio must be > 0", category="usage", stage="step-action")
     warm_model(args.profile)
     source_frame = _observation_frame(before, reference="source")
     source_image = Path(source_frame["path"])
@@ -2853,29 +3098,80 @@ def _execute_step_tap(args: argparse.Namespace, action: dict[str, Any], before: 
     else:
         model_input = prepare_grounding_image(source_image, output_dir=run_dir, max_long_side=args.max_long_side)
     grounded = _ground_target_with_recovery(Path(model_input["path"]), target, profile=args.profile)
-    grounded["modelInput"] = {
-        "path": model_input["path"],
-        "widthPx": model_input["widthPx"],
-        "heightPx": model_input["heightPx"],
-        "resized": model_input["resized"],
-        "maxLongSidePx": model_input["maxLongSidePx"],
-        "scale": model_input["scale"],
-    }
+    grounded["modelInput"] = _model_input_summary(model_input)
     grounded = remap_grounding_to_source_frame(
         grounded,
         source_width=int(source_frame["widthPx"]),
         source_height=int(source_frame["heightPx"]),
     )
     if grounded.get("status") != "found":
-        _write_grounding_artifacts(run_dir, grounded, stem="step-grounding")
+        _write_grounding_artifacts(run_dir, copy.deepcopy(grounded), stem="step-grounding-coarse")
+        final_grounding = _grounding_response_summary(grounded, source="coarse")
+        _write_step_grounding_final(run_dir, target=target, strategy="vlm_grounding", final_grounding=final_grounding, coarse=grounded)
         return _step_blocked(
             action,
             _grounding_error_code(str(grounded.get("status") or "invalid")),
             f"Target was not found: {target}",
             details={"grounding": grounded, "modelInput": model_input},
         )
-    _write_grounding_artifacts(run_dir, grounded, stem="step-grounding")
-    point_px = grounded["point"]["framePx"]
+    _write_grounding_artifacts(run_dir, copy.deepcopy(grounded), stem="step-grounding-coarse")
+
+    final_grounded = grounded
+    final_grounding_source = "coarse"
+    strategy = "vlm_grounding"
+    refinement_crop: dict[str, Any] | None = None
+    refined_grounded: dict[str, Any] | None = None
+    refine_error: dict[str, Any] | None = None
+    refine_warning: dict[str, Any] | None = None
+    if not bool(getattr(args, "no_refine", False)):
+        try:
+            refinement_crop = prepare_refinement_crop(
+                source_image,
+                center=grounded["point"]["framePx"],
+                output_dir=run_dir,
+                crop_ratio=refine_crop_ratio,
+            )
+            refined_model_input = prepare_image_long_side(
+                Path(refinement_crop["path"]),
+                output_path=run_dir / "step-grounding-refine-model-input.png",
+                max_long_side=args.max_long_side,
+                stage="grounding-refine-preprocess",
+            )
+            refined_raw = _ground_target_with_recovery(Path(refined_model_input["path"]), target, profile=args.profile)
+            refined_raw["modelInput"] = _model_input_summary(refined_model_input)
+            refined_in_crop = remap_grounding_to_source_frame(
+                refined_raw,
+                source_width=int(refinement_crop["width"]),
+                source_height=int(refinement_crop["height"]),
+            )
+            refined_grounded = remap_crop_grounding_to_source_frame(refined_in_crop, crop=refinement_crop)
+            _write_grounding_artifacts(run_dir, copy.deepcopy(refined_grounded), stem="step-grounding-refined")
+            if refined_grounded.get("status") == "found":
+                final_grounded = refined_grounded
+                final_grounding_source = "refined"
+                strategy = "vlm_grounding_refined"
+                refine_warning = _refinement_edge_warning(refined_grounded, refinement_crop)
+            else:
+                final_grounding_source = "coarse_fallback"
+                strategy = "vlm_grounding_coarse_fallback"
+        except CoretapError as exc:
+            refine_error = _refinement_error_summary(exc)
+            final_grounding_source = "coarse_fallback"
+            strategy = "vlm_grounding_coarse_fallback"
+
+    final_grounding = _grounding_response_summary(final_grounded, source=final_grounding_source)
+    _write_step_grounding_final(
+        run_dir,
+        target=target,
+        strategy=strategy,
+        final_grounding=final_grounding,
+        coarse=grounded,
+        crop=refinement_crop,
+        refined=refined_grounded,
+        refine_error=refine_error,
+        warning=refine_warning,
+    )
+    point_px = final_grounded["point"]["framePx"]
     point = point_to_hid(
         point_px["x"],
         point_px["y"],
@@ -2897,11 +3193,10 @@ def _execute_step_tap(args: argparse.Namespace, action: dict[str, Any], before: 
         "schema": "coretap.step.execution.v1",
         "status": "executed",
         "actionType": "tap",
-        "strategy": "vlm_grounding",
+        "strategy": strategy,
         "target": target,
         "profile": args.profile,
-        "modelInput": grounded.get("modelInput"),
-        "grounding": grounded,
+        "grounding": final_grounding,
         "point": point,
         "textEntryAnchor": anchor,
         "tap": tap,
@@ -3591,6 +3886,10 @@ def build_parser() -> argparse.ArgumentParser:
     observe.add_argument("--no-ocr", action="store_true")
     observe.add_argument("--no-vlm", action="store_true")
 
+    screenshot = sub.add_parser("screenshot")
+    screenshot.add_argument("--label", default="screenshot")
+    screenshot.add_argument("--out", default=None)
+
     step = sub.add_parser("step")
     step.add_argument("--action", default=None, help="Single Coretap step action JSON object")
     step.add_argument("--action-file", default=None, help="Path to a single Coretap step action JSON object")
@@ -3599,6 +3898,8 @@ def build_parser() -> argparse.ArgumentParser:
     step.add_argument("--no-page", action="store_true")
     step.add_argument("--min-confidence", type=float, default=0.0)
     step.add_argument("--max-long-side", type=int, default=DEFAULT_STEP_MODEL_INPUT_LONG_SIDE)
+    step.add_argument("--no-refine", action="store_true")
+    step.add_argument("--refine-crop-ratio", type=float, default=DEFAULT_REFINEMENT_CROP_RATIO)
     step.add_argument("--full-size", action="store_true")
     step.add_argument("--no-ocr", action="store_true")
     step.add_argument("--no-vlm", action="store_true")
@@ -3681,6 +3982,8 @@ def dispatch(args: argparse.Namespace) -> dict[str, Any]:
         return command_daemon(args)
     if args.command == "model":
         return command_model(args)
+    if args.command == "screenshot":
+        return command_screenshot(args)
     if args.command == "observe":
         return command_observe(args)
     if args.command == "step":

@@ -81,6 +81,7 @@ export class Coretap {
   setup(options?: CommandOptions): Promise<unknown>;
   checkEnvironment(options?: CommandOptions): Promise<unknown>;
   status(options?: CommandOptions): Promise<unknown>;
+  screenshot(options?: ScreenshotOptions): Promise<unknown>;
   observe(options?: ObserveOptions): Promise<unknown>;
   step(action?: CoretapAction | string | null, options?: StepOptions): Promise<unknown>;
   discover(options?: CommandOptions): Promise<unknown>;
@@ -200,6 +201,11 @@ export interface ObserveOptions extends CommandOptions {
   noVlm?: boolean;
 }
 
+export interface ScreenshotOptions extends CommandOptions {
+  label?: string;
+  out?: string;
+}
+
 export interface StepOptions extends CommandOptions {
   actionFile?: string;
   dryRun?: boolean;
@@ -207,6 +213,8 @@ export interface StepOptions extends CommandOptions {
   noPage?: boolean;
   minConfidence?: number;
   maxLongSide?: number;
+  noRefine?: boolean;
+  refineCropRatio?: number;
   fullSize?: boolean;
   noOcr?: boolean;
   noVlm?: boolean;
@@ -218,6 +226,7 @@ export interface DaemonOptions extends CommandOptions {
 }
 
 export class IosVisualUi {
+  screenshot(options?: ScreenshotOptions): Promise<unknown>;
   observe(options?: ObserveOptions): Promise<unknown>;
   step(action?: CoretapAction | string | null, options?: StepOptions): Promise<unknown>;
   tap(target: string, options?: TapOptions): Promise<unknown>;

@@ -7,6 +7,7 @@ from types import SimpleNamespace
 
 import pytest
 
+import coretap.model_pack as model_pack
 from coretap.backends import (
     DeviceBackend,
     SimulatorBackend,
@@ -26,11 +27,21 @@ from coretap.device_worker import (
     set_default_device_worker_pool,
 )
 from coretap.grounding import (
+    compute_refinement_crop,
     prepare_grounding_image,
     prepare_image_long_side,
+    prepare_refinement_crop,
+    remap_crop_grounding_to_source_frame,
     remap_grounding_to_source_frame,
 )
-from coretap.model_pack import parse_grounding_output, parse_visual_observe_output
+from coretap.model_pack import (
+    DEFAULT_VISUAL_OBSERVE_MAX_ELEMENTS,
+    DEFAULT_VISUAL_OBSERVE_MAX_TOKENS,
+    PUBLIC_MODEL_PROFILE,
+    parse_grounding_output,
+    parse_visual_observe_output,
+    visual_observe_prompt,
+)
 from coretap.ocr import (
     DEFAULT_OCR_LANG,
     OcrToken,
@@ -103,6 +114,54 @@ def test_parse_visual_observe_output_accepts_center_and_bbox() -> None:
     assert result["elements"][1]["confidence"] == 1.0
 
 
+def test_visual_observe_prompt_limits_scope_to_non_text_elements() -> None:
+    prompt = visual_observe_prompt(1000, 2000)
+
+    assert f"at most {DEFAULT_VISUAL_OBSERVE_MAX_ELEMENTS} items" in prompt
+    assert "only non-text visual UI elements" in prompt
+    assert "Do not return plain text" in prompt
+    assert "OCR-readable text buttons" in prompt
+    assert "exclude the text label" in prompt
+
+
+def test_parse_visual_observe_output_default_limit_is_twelve_elements() -> None:
+    raw = json.dumps(
+        {
+            "summary": "Many icons",
+            "elements": [
+                {"label": f"Icon {index}", "role": "button", "center": [100 + index, 100], "confidence": 0.7}
+                for index in range(20)
+            ],
+        }
+    )
+
+    result = parse_visual_observe_output(raw, width=1000, height=2000)
+
+    assert len(result["elements"]) == DEFAULT_VISUAL_OBSERVE_MAX_ELEMENTS == 12
+    assert result["rawElementCount"] == 20
+
+
+def test_visual_observe_model_uses_short_generation_budget(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_run_model_prompt(image: Path, prompt: str, *, profile: str, max_tokens: int) -> str:
+        captured["image"] = image
+        captured["prompt"] = prompt
+        captured["profile"] = profile
+        captured["maxTokens"] = max_tokens
+        return '{"summary":"","elements":[]}'
+
+    monkeypatch.setattr(model_pack, "_require_public_profile", lambda _profile: None)
+    monkeypatch.setattr(model_pack, "png_size", lambda _image: (1000, 2000))
+    monkeypatch.setattr(model_pack, "_run_model_prompt", fake_run_model_prompt)
+
+    result = model_pack._run_visual_observe_model_inprocess(tmp_path / "screen.png", profile=PUBLIC_MODEL_PROFILE)
+
+    assert result["status"] == "ready"
+    assert captured["maxTokens"] == DEFAULT_VISUAL_OBSERVE_MAX_TOKENS == 256
+    assert f"at most {DEFAULT_VISUAL_OBSERVE_MAX_ELEMENTS} items" in str(captured["prompt"])
+
+
 def test_parse_visual_observe_output_drops_invalid_and_duplicate_elements() -> None:
     raw = json.dumps(
         {
@@ -151,9 +210,75 @@ def test_parse_grounding_output_json_coordinate() -> None:
     result = parse_grounding_output('{"coordinate":[250, 500]}', width=100, height=200)
 
     assert result["status"] == "found"
+    assert result["pointSource"] == "point"
     assert result["point"]["model1000"] == {"x": 250.0, "y": 500.0}
     assert result["point"]["framePx"] == {"x": 25.0, "y": 100.0}
     assert result["point"]["normalized"] == {"x": 0.25, "y": 0.5}
+
+
+def test_parse_grounding_output_accepts_point_array_under_any_key() -> None:
+    result = parse_grounding_output('{"any_key":[503,675]}', width=1000, height=2000)
+
+    assert result["status"] == "found"
+    assert result["pointSource"] == "point"
+    assert result["point"]["model1000"] == {"x": 503.0, "y": 675.0}
+    assert result["point"]["normalized"] == {"x": 0.503, "y": 0.675}
+
+
+def test_parse_grounding_output_accepts_rect_array_under_any_key() -> None:
+    result = parse_grounding_output('{"foo":[458,669,548,681]}', width=1000, height=2000)
+
+    assert result["status"] == "found"
+    assert result["pointSource"] == "rect_center"
+    assert result["rectModel1000"] == {"x1": 458.0, "y1": 669.0, "x2": 548.0, "y2": 681.0}
+    assert result["point"]["model1000"] == {"x": 503.0, "y": 675.0}
+    assert result["point"]["normalized"] == {"x": 0.503, "y": 0.675}
+
+
+def test_parse_grounding_output_accepts_bare_point_array() -> None:
+    result = parse_grounding_output("[503,675]", width=1000, height=2000)
+
+    assert result["status"] == "found"
+    assert result["pointSource"] == "point"
+    assert result["point"]["model1000"] == {"x": 503.0, "y": 675.0}
+
+
+def test_parse_grounding_output_accepts_bare_rect_array() -> None:
+    result = parse_grounding_output("[458,669,548,681]", width=1000, height=2000)
+
+    assert result["status"] == "found"
+    assert result["pointSource"] == "rect_center"
+    assert result["point"]["model1000"] == {"x": 503.0, "y": 675.0}
+
+
+def test_parse_grounding_output_accepts_truncated_bare_rect_array() -> None:
+    result = parse_grounding_output("[458,669,548,681", width=1000, height=2000)
+
+    assert result["status"] == "found"
+    assert result["pointSource"] == "rect_center"
+    assert result["point"]["model1000"] == {"x": 503.0, "y": 675.0}
+
+
+def test_parse_grounding_output_does_not_parse_scattered_numbers() -> None:
+    result = parse_grounding_output("target is around 458 669 548 681", width=1000, height=2000)
+
+    assert result["status"] == "invalid"
+    assert result["reason"] == "no coordinate"
+
+
+def test_parse_grounding_output_prefers_point_over_rect_candidates() -> None:
+    result = parse_grounding_output('{"rect":[458,669,548,681],"final":[503,675]}', width=1000, height=2000)
+
+    assert result["status"] == "found"
+    assert result["pointSource"] == "point"
+    assert result["point"]["model1000"] == {"x": 503.0, "y": 675.0}
+
+
+def test_parse_grounding_output_uses_last_candidate_in_same_priority_group() -> None:
+    result = parse_grounding_output('{"first":[111,222],"final":[503,675]}', width=1000, height=2000)
+
+    assert result["status"] == "found"
+    assert result["point"]["model1000"] == {"x": 503.0, "y": 675.0}
 
 
 def test_parse_grounding_output_rejects_out_of_bounds() -> None:
@@ -161,6 +286,14 @@ def test_parse_grounding_output_rejects_out_of_bounds() -> None:
 
     assert result["status"] == "invalid"
     assert result["reason"] == "coordinate outside model-1000 space"
+
+
+def test_parse_grounding_output_rejects_out_of_bounds_rect() -> None:
+    result = parse_grounding_output("[458,669,1201,681]", width=100, height=200)
+
+    assert result["status"] == "invalid"
+    assert result["reason"] == "coordinate outside model-1000 space"
+    assert result["pointSource"] == "rect_center"
 
 
 def test_prepare_grounding_image_downscales_to_default_long_side(tmp_path: Path) -> None:
@@ -209,6 +342,57 @@ def test_prepare_image_long_side_can_resize_in_place(tmp_path: Path) -> None:
     assert result["path"] == str(source)
     assert result["resized"] is True
     assert png_size(source) == (630, 1368)
+
+
+def test_compute_refinement_crop_centers_and_clamps() -> None:
+    centered = compute_refinement_crop(source_width=1125, source_height=2436, center_x=560, center_y=1200, crop_ratio=0.38)
+    near_edge = compute_refinement_crop(source_width=1125, source_height=2436, center_x=20, center_y=30, crop_ratio=0.38)
+
+    assert centered["width"] == 900
+    assert centered["height"] == 900
+    assert centered["x"] == 110
+    assert centered["y"] == 750
+    assert near_edge["x"] == 0
+    assert near_edge["y"] == 0
+
+
+def test_compute_refinement_crop_honors_min_and_max_side() -> None:
+    minimum = compute_refinement_crop(source_width=632, source_height=1368, center_x=300, center_y=600, crop_ratio=0.1)
+    maximum = compute_refinement_crop(source_width=2000, source_height=3000, center_x=1000, center_y=1500, crop_ratio=0.8)
+
+    assert minimum["width"] == 360
+    assert minimum["height"] == 360
+    assert maximum["width"] == 900
+    assert maximum["height"] == 900
+
+
+def test_prepare_refinement_crop_writes_crop_and_region(tmp_path: Path) -> None:
+    from PIL import Image
+
+    source = tmp_path / "source.png"
+    Image.new("RGB", (1125, 2436), color=(255, 255, 255)).save(source)
+
+    crop = prepare_refinement_crop(source, center={"x": 560, "y": 1200}, output_dir=tmp_path, crop_ratio=0.38)
+
+    assert crop["width"] == 900
+    assert png_size(Path(crop["path"])) == (900, 900)
+    assert Path(crop["regionPath"]).exists()
+
+
+def test_remap_crop_grounding_to_source_frame() -> None:
+    grounded = {
+        "status": "found",
+        "point": {"framePx": {"x": 100.0, "y": 200.0}, "normalized": {"x": 0.2, "y": 0.4}},
+        "frame": {"widthPx": 500, "heightPx": 500},
+    }
+    crop = {"x": 50, "y": 60, "width": 500, "height": 500, "sourceWidthPx": 1000, "sourceHeightPx": 1200}
+
+    result = remap_crop_grounding_to_source_frame(grounded, crop=crop)
+
+    assert result["point"]["cropFramePx"] == {"x": 100.0, "y": 200.0}
+    assert result["point"]["framePx"] == {"x": 150.0, "y": 260.0}
+    assert result["point"]["normalized"] == {"x": 0.15, "y": 260.0 / 1200}
+    assert result["frame"] == {"widthPx": 1000, "heightPx": 1200}
 
 
 def test_remap_grounding_to_source_frame_preserves_normalized_coordinates() -> None:
@@ -363,6 +547,24 @@ def test_coredevice_tunneld_error_is_detected_on_zero_exit() -> None:
     assert exc.value.code == "COREDEVICE_TUNNELD_UNAVAILABLE"
     assert exc.value.retryable is True
     assert exc.value.details["suggestedCommand"] == "sudo pymobiledevice3 remote tunneld --daemonize"
+
+
+def test_coredevice_failed_service_is_detected_on_zero_exit() -> None:
+    done = Completed(
+        argv=["pymobiledevice3", "developer", "core-device", "screen-capture", "screenshot", "--userspace"],
+        returncode=0,
+        stdout="",
+        stderr="ERROR Failed to start service. Possible reasons are: Make sure the DeveloperDiskImage is mounted",
+        duration_ms=10,
+    )
+
+    with pytest.raises(CoretapError) as exc:
+        _check_coredevice_result(done, code="COREDEVICE_SCREENSHOT_FAILED", stage="screenshot")
+
+    assert exc.value.code == "COREDEVICE_SCREENSHOT_FAILED"
+    assert exc.value.category == "environment"
+    assert exc.value.retryable is True
+    assert "mounter auto-mount --userspace" in exc.value.details["suggestedCommands"][0]
 
 
 def test_coredevice_default_tunnel_mode_uses_userspace() -> None:

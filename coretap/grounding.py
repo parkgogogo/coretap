@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import shutil
 from pathlib import Path
 from typing import Any
@@ -21,6 +22,9 @@ from coretap.runtime import CoretapError
 GROUNDING_PROFILES = public_profiles()
 ALL_GROUNDING_PROFILES = {**GROUNDING_PROFILES, **internal_profiles()}
 DEFAULT_GROUNDING_IMAGE_LONG_SIDE = 1368
+DEFAULT_REFINEMENT_CROP_RATIO = 0.38
+REFINEMENT_CROP_MIN_SIDE_PX = 360
+REFINEMENT_CROP_MAX_SIDE_PX = 900
 
 
 def prepare_image_long_side(
@@ -92,6 +96,132 @@ def prepare_grounding_image(
         max_long_side=max_long_side,
         stage="grounding-preprocess",
     )
+
+
+def compute_refinement_crop(
+    *,
+    source_width: int,
+    source_height: int,
+    center_x: float,
+    center_y: float,
+    crop_ratio: float = DEFAULT_REFINEMENT_CROP_RATIO,
+    min_side_px: int = REFINEMENT_CROP_MIN_SIDE_PX,
+    max_side_px: int = REFINEMENT_CROP_MAX_SIDE_PX,
+) -> dict[str, Any]:
+    if source_width <= 0 or source_height <= 0:
+        raise CoretapError("INVALID_IMAGE_SIZE", "source image dimensions must be positive", category="internal", stage="refine-crop")
+    if crop_ratio <= 0:
+        raise CoretapError("INVALID_ARGUMENT", "refine crop ratio must be > 0", category="usage", stage="refine-crop")
+    long_side = max(source_width, source_height)
+    side = round(long_side * crop_ratio)
+    side = max(min_side_px, min(max_side_px, side))
+    side = max(1, min(side, source_width, source_height))
+    clamped_center_x = max(0.0, min(float(source_width), float(center_x)))
+    clamped_center_y = max(0.0, min(float(source_height), float(center_y)))
+    left = round(clamped_center_x - side / 2)
+    top = round(clamped_center_y - side / 2)
+    left = max(0, min(left, source_width - side))
+    top = max(0, min(top, source_height - side))
+    return {
+        "x": left,
+        "y": top,
+        "width": side,
+        "height": side,
+        "sourceWidthPx": source_width,
+        "sourceHeightPx": source_height,
+        "center": {"x": clamped_center_x, "y": clamped_center_y},
+        "cropRatio": crop_ratio,
+        "minSidePx": min_side_px,
+        "maxSidePx": max_side_px,
+    }
+
+
+def prepare_refinement_crop(
+    image: Path,
+    *,
+    center: dict[str, Any],
+    output_dir: Path,
+    crop_ratio: float = DEFAULT_REFINEMENT_CROP_RATIO,
+    crop_name: str = "step-grounding-refine-crop.png",
+    region_name: str = "step-grounding-refine-region.png",
+) -> dict[str, Any]:
+    source_width, source_height = _image_size(image)
+    try:
+        center_x = float(center["x"])
+        center_y = float(center["y"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise CoretapError("INVALID_POINT", "refinement crop center must contain numeric x and y", category="internal", stage="refine-crop") from exc
+    crop = compute_refinement_crop(
+        source_width=source_width,
+        source_height=source_height,
+        center_x=center_x,
+        center_y=center_y,
+        crop_ratio=crop_ratio,
+    )
+    try:
+        from PIL import Image, ImageDraw
+    except ImportError as exc:
+        raise CoretapError(
+            "DEPENDENCY_MISSING",
+            "Pillow is required to crop refinement screenshots",
+            category="environment",
+            stage="refine-crop",
+            details={"package": "pillow"},
+        ) from exc
+    output_dir.mkdir(parents=True, exist_ok=True)
+    crop_path = output_dir / crop_name
+    region_path = output_dir / region_name
+    left = int(crop["x"])
+    top = int(crop["y"])
+    right = left + int(crop["width"])
+    bottom = top + int(crop["height"])
+    with Image.open(image) as source:
+        rgb = source.convert("RGB")
+        rgb.crop((left, top, right, bottom)).save(crop_path, compress_level=1)
+        region = rgb.copy()
+        draw = ImageDraw.Draw(region)
+        width = max(3, round(max(source_width, source_height) * 0.002))
+        draw.rectangle((left, top, right - 1, bottom - 1), outline=(255, 0, 0), width=width)
+        region.save(region_path, compress_level=1)
+    return {
+        **crop,
+        "path": str(crop_path),
+        "regionPath": str(region_path),
+    }
+
+
+def remap_crop_grounding_to_source_frame(grounded: dict[str, Any], *, crop: dict[str, Any]) -> dict[str, Any]:
+    result = copy.deepcopy(grounded)
+    point = result.get("point")
+    if not isinstance(point, dict):
+        return result
+    crop_width = int(crop["width"])
+    crop_height = int(crop["height"])
+    source_width = int(crop["sourceWidthPx"])
+    source_height = int(crop["sourceHeightPx"])
+    crop_frame_px = point.get("framePx")
+    normalized = point.get("normalized")
+    try:
+        if isinstance(crop_frame_px, dict):
+            crop_x = float(crop_frame_px["x"])
+            crop_y = float(crop_frame_px["y"])
+        elif isinstance(normalized, dict):
+            crop_x = float(normalized["x"]) * crop_width
+            crop_y = float(normalized["y"]) * crop_height
+            crop_frame_px = {"x": crop_x, "y": crop_y}
+        else:
+            return result
+    except (KeyError, TypeError, ValueError):
+        return result
+    source_x = float(crop["x"]) + crop_x
+    source_y = float(crop["y"]) + crop_y
+    if isinstance(normalized, dict):
+        point["cropNormalized"] = dict(normalized)
+    point["cropFramePx"] = {"x": crop_x, "y": crop_y}
+    point["framePx"] = {"x": source_x, "y": source_y}
+    point["normalized"] = {"x": source_x / source_width, "y": source_y / source_height}
+    result["frame"] = {"widthPx": source_width, "heightPx": source_height}
+    return result
 
 
 def remap_grounding_to_source_frame(grounded: dict[str, Any], *, source_width: int, source_height: int) -> dict[str, Any]:
