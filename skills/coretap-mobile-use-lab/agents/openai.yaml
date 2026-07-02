@@ -1,0 +1,4 @@
+interface:
+  display_name: "Coretap Mobile Use Lab"
+  short_description: "Scenario loop for Coretap mobile-use hardening"
+  default_prompt: "Use $coretap-mobile-use-lab to run scenario-driven Coretap mobile-use testing and harden failures."

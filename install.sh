@@ -8,7 +8,6 @@ IDB_COMPANION_VERSION="${IDB_COMPANION_VERSION:-1.1.8}"
 IDB_COMPANION_SHA256="${IDB_COMPANION_SHA256:-3b72cc6a9a5b1a22a188205a84090d3a294347a846180efd755cf1a3c848e3e7}"
 
 SKIP_MODEL=0
-SKIP_OCR=0
 SKIP_SIMULATOR=0
 SKIP_DEVICE=0
 SKIP_NODE_SMOKE=0
@@ -43,7 +42,6 @@ Usage:
 
 Options:
   --skip-model          Install the CLI but do not download/check/warm MAI-UI.
-  --skip-ocr            Do not install Tesseract OCR.
   --skip-simulator      Do not install/check Simulator tap support.
   --skip-device         Do not install/check pymobiledevice3.
   --skip-node-smoke     Do not run the Node test-kit smoke check from a checkout.
@@ -64,9 +62,6 @@ while [ "$#" -gt 0 ]; do
   case "$1" in
     --skip-model)
       SKIP_MODEL=1
-      ;;
-    --skip-ocr)
-      SKIP_OCR=1
       ;;
     --skip-simulator)
       SKIP_SIMULATOR=1
@@ -130,27 +125,6 @@ ensure_brew_package() {
   fi
   log "Installing $package with Homebrew"
   brew install "$package"
-}
-
-ensure_brew_formula() {
-  formula="$1"
-  if [ "$NO_BREW_INSTALL" -eq 1 ]; then
-    return 1
-  fi
-  if ! have brew; then
-    return 1
-  fi
-  if brew list --formula "$formula" >/dev/null 2>&1; then
-    return 0
-  fi
-  log "Installing $formula with Homebrew"
-  brew install "$formula"
-}
-
-tesseract_has_lang() {
-  lang="$1"
-  have tesseract || return 1
-  tesseract --list-langs 2>/dev/null | awk 'NR > 1 { print $0 }' | grep -qx "$lang"
 }
 
 ensure_uv() {
@@ -222,30 +196,12 @@ install_device_tools() {
   uv tool install --force "pymobiledevice3"
 }
 
-install_ocr_tools() {
-  if [ "$SKIP_OCR" -eq 1 ]; then
-    log "Skipping OCR install"
-    return 0
+check_vision_ocr_tools() {
+  if have xcrun; then
+    log "macOS Vision OCR available through xcrun/swiftc"
+  else
+    warn "xcrun was not found. Install Xcode Command Line Tools so Coretap can compile its macOS Vision OCR helper."
   fi
-
-  if have tesseract; then
-    log "Tesseract already installed"
-  elif ! ensure_brew_package tesseract tesseract; then
-    warn "Tesseract is not installed. Text assertions will fail until you install it, e.g. brew install tesseract tesseract-lang"
-    return 0
-  fi
-
-  if tesseract_has_lang eng && tesseract_has_lang chi_sim; then
-    log "Tesseract English and Simplified Chinese language data available"
-    return 0
-  fi
-
-  if ensure_brew_formula tesseract-lang && tesseract_has_lang eng && tesseract_has_lang chi_sim; then
-    log "Tesseract language data installed"
-    return 0
-  fi
-
-  warn "Tesseract default OCR language data is missing. Install it with: brew install tesseract-lang"
 }
 
 install_idb_companion() {
@@ -360,7 +316,7 @@ main() {
   coretap_bin="$(resolve_coretap_bin)"
   stop_existing_daemon "$coretap_bin"
   install_device_tools
-  install_ocr_tools
+  check_vision_ocr_tools
   install_idb_companion
   run_coretap_setup "$coretap_bin"
   run_node_smoke "$coretap_bin"

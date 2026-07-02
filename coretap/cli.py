@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager, suppress
 import json
 import os
+import re
 import shutil
 import sys
+import tempfile
 import time
 from pathlib import Path
 from typing import Any
@@ -15,9 +18,7 @@ from coretap.device_buttons import BUTTON_STATES, button_choices
 from coretap.grounding import (
     DEFAULT_GROUNDING_IMAGE_LONG_SIDE,
     GROUNDING_PROFILES,
-    assess_grounding_tap_safety,
     ground_target,
-    grounding_safety_diagnostics,
     model_check,
     model_install,
     model_status,
@@ -26,17 +27,22 @@ from coretap.grounding import (
     remap_grounding_to_source_frame,
     warm_model,
 )
-from coretap.model_pack import INTERNAL_FIXTURE_PROFILE, PUBLIC_MODEL_PROFILE
+from coretap.model_pack import (
+    INTERNAL_FIXTURE_PROFILE,
+    PUBLIC_MODEL_PROFILE,
+    PUBLIC_VISUAL_OBSERVE_PROMPT_VERSION,
+    run_visual_observe_model,
+)
 from coretap.ocr import (
+    DEFAULT_OCR_ENGINE,
     DEFAULT_OCR_LANG,
     OcrToken,
     find_exact_text_candidates,
     find_text,
     normalize_text,
     run_ocr,
-    run_tesseract,
-    run_vision_ocr,
-    tesseract_status,
+    vision_ocr_status,
+    token_match,
 )
 from coretap.runtime import (
     CoretapError,
@@ -70,14 +76,23 @@ EXIT_CODES = {
     "COREDEVICE_TAP_FAILED": 32,
     "COREDEVICE_TYPE_FAILED": 32,
     "COREDEVICE_KEY_FAILED": 32,
+    "COREDEVICE_LAUNCH_APP_FAILED": 32,
+    "COREDEVICE_UNINSTALL_APP_FAILED": 32,
+    "WEBINSPECTOR_OPEN_URL_FAILED": 32,
     "COREDEVICE_WORKER_FAILED": 32,
     "COREDEVICE_WORKER_TIMEOUT": 32,
+    "PASTEBOARD_SET_FAILED": 32,
+    "PASTE_MENU_NOT_FOUND": 32,
+    "TEXT_INPUT_VERIFICATION_FAILED": 30,
     "SIMULATOR_DRAG_UNSUPPORTED": 32,
     "SIMULATOR_PRESS_UNSUPPORTED": 32,
     "SIMULATOR_TAP_UNSUPPORTED": 32,
     "SIMULATOR_TYPE_UNSUPPORTED": 32,
     "SIMULATOR_KEY_UNSUPPORTED": 32,
     "SIMULATOR_TAP_FAILED": 32,
+    "SIMCTL_LAUNCH_APP_FAILED": 32,
+    "SIMCTL_UNINSTALL_APP_FAILED": 32,
+    "SIMCTL_OPEN_URL_FAILED": 32,
     "SIMULATOR_DESCRIBE_FAILED": 32,
     "OCR_UNAVAILABLE": 10,
     "OCR_PROCESS_FAILED": 40,
@@ -99,31 +114,954 @@ EXIT_CODES = {
     "GROUNDING_NOT_FOUND": 30,
     "GROUNDING_AMBIGUOUS": 30,
     "GROUNDING_SCHEMA_INVALID": 30,
-    "GROUNDING_UNSAFE_TO_TAP": 30,
     "ACTION_SCHEMA_INVALID": 2,
     "ACTION_UNSUPPORTED": 2,
-    "POSTCONDITION_FAILED": 30,
     "INVALID_POINT": 31,
     "FLOW_FAILED": 50,
     "DAEMON_UNAVAILABLE": 14,
     "DAEMON_START_FAILED": 14,
     "DAEMON_ALREADY_RUNNING": 14,
+    "DAEMON_STALE": 14,
     "DAEMON_REQUEST_FAILED": 14,
 }
 
-DEFAULT_STEP_MODEL_INPUT_LONG_SIDE = 512
-DEFAULT_TEXT_POST_TIMEOUT_MS = 3000
+DEFAULT_STEP_MODEL_INPUT_LONG_SIDE = DEFAULT_GROUNDING_IMAGE_LONG_SIDE
+DEFAULT_STEP_PAGE_WAIT_MS = 6000
+TEXT_ENTRY_ANCHOR_MAX_AGE_MS = 5 * 60 * 1000
+TRACE_SCHEMA = "coretap.trace.v1"
+TRACE_EVENT_SCHEMA = "coretap.trace.event.v1"
+TEXT_ENTRY_ANCHOR_CACHE_SCHEMA = "coretap.text-entry-anchor-cache.v1"
+TEXT_ENTRY_ANCHOR_SCHEMA = "coretap.text-entry-anchor.v1"
+TEXT_ENTRY_TARGET_MARKERS = (
+    "text field",
+    "textfield",
+    "search field",
+    "search text field",
+    "search bar",
+    "input field",
+    "input",
+    "field",
+    "搜索框",
+    "搜索栏",
+    "搜索输入",
+    "输入框",
+    "文本框",
+)
+TOP_TEXT_ENTRY_TARGET_MARKERS = (
+    "top",
+    "at the top",
+    "顶部",
+    "上方",
+    "顶端",
+)
+TEXT_ENTRY_PLACEHOLDER_MARKERS = (
+    "placeholder",
+    "search",
+    "搜索",
+    "输入",
+    "游戏",
+    "故事",
+    "app",
+    "应用",
+)
+NON_TEXT_ENTRY_CONTEXT_MARKERS = (
+    "row",
+    "result",
+    "suggestion",
+    "card",
+    "list item",
+    "结果",
+    "建议",
+    "行",
+    "卡片",
+)
+BUILTIN_APP_BUNDLE_IDS = {
+    "app store": "com.apple.AppStore",
+    "appstore": "com.apple.AppStore",
+    "apple store": "com.apple.AppStore",
+    "safari": "com.apple.mobilesafari",
+    "safari浏览器": "com.apple.mobilesafari",
+    "settings": "com.apple.Preferences",
+    "设置": "com.apple.Preferences",
+    "messages": "com.apple.MobileSMS",
+    "信息": "com.apple.MobileSMS",
+    "phone": "com.apple.mobilephone",
+    "电话": "com.apple.mobilephone",
+    "photos": "com.apple.mobileslideshow",
+    "照片": "com.apple.mobileslideshow",
+    "camera": "com.apple.camera",
+    "相机": "com.apple.camera",
+    "maps": "com.apple.Maps",
+    "地图": "com.apple.Maps",
+    "notes": "com.apple.mobilenotes",
+    "备忘录": "com.apple.mobilenotes",
+    "calendar": "com.apple.mobilecal",
+    "日历": "com.apple.mobilecal",
+    "clock": "com.apple.mobiletimer",
+    "时钟": "com.apple.mobiletimer",
+    "files": "com.apple.DocumentsApp",
+    "文件": "com.apple.DocumentsApp",
+    "rednote": "com.xingin.discover",
+    "xhs": "com.xingin.discover",
+    "xiaohongshu": "com.xingin.discover",
+    "小红书": "com.xingin.discover",
+    "小紅書": "com.xingin.discover",
+}
 
 
-def emit(data: dict[str, Any], fmt: str) -> None:
-    if fmt == "text":
-        if data.get("ok"):
-            print(json.dumps(data["result"], ensure_ascii=False, indent=2))
-        else:
-            err = data["error"]
-            print(f"{err['code']}: {err['message']}", file=sys.stderr)
+def emit(data: dict[str, Any]) -> None:
+    print(json.dumps(compact_response(data), ensure_ascii=False))
+
+
+def _utc_now_iso() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def _safe_trace_id(value: str) -> str:
+    cleaned = "".join(ch if ch.isalnum() or ch in "._-" else "-" for ch in value.strip())
+    cleaned = cleaned.strip(".-_")
+    if not cleaned:
+        raise CoretapError("INVALID_ARGUMENT", "trace id must contain at least one alphanumeric character", category="usage", stage="trace")
+    return cleaned[:120]
+
+
+def _truthy_env(name: str) -> bool:
+    value = os.environ.get(name)
+    return value is not None and value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _persistent_artifact_root(args: argparse.Namespace) -> Path | None:
+    if getattr(args, "no_artifacts", False):
+        return None
+    raw_root = getattr(args, "artifact_root", None)
+    if raw_root:
+        return Path(str(raw_root)).expanduser()
+    if getattr(args, "keep_artifacts", False) or getattr(args, "trace_id", None):
+        return ensure_state()["artifacts"]
+    return None
+
+
+def _trace_artifact_root(args: argparse.Namespace) -> Path:
+    raw_root = getattr(args, "artifact_root", None)
+    if raw_root:
+        return Path(str(raw_root)).expanduser()
+    return ensure_state()["artifacts"]
+
+
+def _artifacts_are_persistent(args: argparse.Namespace) -> bool:
+    return bool(getattr(args, "_artifacts_persistent", False))
+
+
+def _artifact_result(args: argparse.Namespace, run_dir: Path) -> dict[str, str]:
+    if not _artifacts_are_persistent(args):
+        return {}
+    return {"artifactDir": str(run_dir)}
+
+
+@contextmanager
+def _command_artifacts(args: argparse.Namespace):
+    existing = getattr(args, "_artifact_run_dir", None)
+    if existing:
+        yield Path(str(existing))
+        return
+
+    root = _persistent_artifact_root(args)
+    if root is not None:
+        run_dir = artifact_dir(root)
+        previous_dir = getattr(args, "_artifact_run_dir", None)
+        previous_persistent = getattr(args, "_artifacts_persistent", None)
+        args._artifact_run_dir = str(run_dir)
+        args._artifacts_persistent = True
+        try:
+            yield run_dir
+        finally:
+            if previous_dir is None:
+                with suppress(AttributeError):
+                    delattr(args, "_artifact_run_dir")
+            else:
+                args._artifact_run_dir = previous_dir
+            if previous_persistent is None:
+                with suppress(AttributeError):
+                    delattr(args, "_artifacts_persistent")
+            else:
+                args._artifacts_persistent = previous_persistent
+        return
+
+    previous_dir = getattr(args, "_artifact_run_dir", None)
+    previous_persistent = getattr(args, "_artifacts_persistent", None)
+    with tempfile.TemporaryDirectory(prefix="coretap-") as temp_root:
+        run_dir = artifact_dir(Path(temp_root))
+        args._artifact_run_dir = str(run_dir)
+        args._artifacts_persistent = False
+        try:
+            yield run_dir
+        finally:
+            if previous_dir is None:
+                with suppress(AttributeError):
+                    delattr(args, "_artifact_run_dir")
+            else:
+                args._artifact_run_dir = previous_dir
+            if previous_persistent is None:
+                with suppress(AttributeError):
+                    delattr(args, "_artifacts_persistent")
+            else:
+                args._artifacts_persistent = previous_persistent
+
+
+def _trace_root(args: argparse.Namespace) -> Path:
+    root = _trace_artifact_root(args)
+    return root / "traces"
+
+
+def _trace_paths(args: argparse.Namespace) -> dict[str, Path] | None:
+    trace_id = getattr(args, "trace_id", None) or os.environ.get("CORETAP_TRACE_ID")
+    if not trace_id:
+        return None
+    safe_id = _safe_trace_id(str(trace_id))
+    trace_dir = _trace_root(args) / safe_id
+    return {
+        "dir": trace_dir,
+        "trace": trace_dir / "trace.json",
+        "events": trace_dir / "events.jsonl",
+    }
+
+
+def _read_jsonl(path: Path) -> list[dict[str, Any]]:
+    if not path.exists():
+        return []
+    items: list[dict[str, Any]] = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        try:
+            parsed = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(parsed, dict):
+            items.append(parsed)
+    return items
+
+
+def _trace_title(args: argparse.Namespace) -> str | None:
+    title = getattr(args, "trace_title", None) or os.environ.get("CORETAP_TRACE_TITLE")
+    return str(title) if title else None
+
+
+def _action_trace_summary(action: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not isinstance(action, dict):
+        return None
+    summary = {"type": action.get("type")}
+    for key in ("target", "name", "text", "key", "button", "direction", "ms"):
+        if key in action:
+            summary[key] = action[key]
+    return summary
+
+
+def _observation_trace_summary(observation: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not isinstance(observation, dict):
+        return None
+    frame = observation.get("frame") if isinstance(observation.get("frame"), dict) else {}
+    source = observation.get("sourceFrame") if isinstance(observation.get("sourceFrame"), dict) else {}
+    ocr = observation.get("ocr") if isinstance(observation.get("ocr"), dict) else {}
+    return {
+        "frame": {
+            "path": frame.get("path"),
+            "widthPx": frame.get("widthPx"),
+            "heightPx": frame.get("heightPx"),
+            "sha256": frame.get("sha256"),
+        },
+        "sourceFrame": {
+            "path": source.get("path"),
+            "widthPx": source.get("widthPx"),
+            "heightPx": source.get("heightPx"),
+            "sha256": source.get("sha256"),
+        }
+        if source
+        else None,
+        "ocr": {
+            "enabled": bool(ocr.get("enabled")),
+            "selectedEngine": ocr.get("selectedEngine"),
+            "tokenCount": ocr.get("tokenCount"),
+        }
+        if ocr
+        else None,
+        "visual": {
+            "enabled": bool((observation.get("visual") or {}).get("enabled")),
+            "status": (observation.get("visual") or {}).get("status"),
+            "elementCount": len((observation.get("visual") or {}).get("elements") or []),
+        }
+        if isinstance(observation.get("visual"), dict)
+        else None,
+    }
+
+
+def _execution_trace_summary(execution: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not isinstance(execution, dict):
+        return None
+    summary: dict[str, Any] = {
+        "status": execution.get("status"),
+        "actionType": execution.get("actionType"),
+        "strategy": execution.get("strategy"),
+        "code": execution.get("code"),
+        "reason": execution.get("reason"),
+    }
+    if isinstance(execution.get("modelInput"), dict):
+        model_input = execution["modelInput"]
+        summary["modelInput"] = {
+            "path": model_input.get("path"),
+            "widthPx": model_input.get("widthPx"),
+            "heightPx": model_input.get("heightPx"),
+            "resized": model_input.get("resized"),
+            "maxLongSidePx": model_input.get("maxLongSidePx"),
+            "scale": model_input.get("scale"),
+        }
+    grounding = execution.get("grounding") if isinstance(execution.get("grounding"), dict) else None
+    if grounding:
+        point = grounding.get("point") if isinstance(grounding.get("point"), dict) else {}
+        summary["grounding"] = {
+            "status": grounding.get("status"),
+            "target": grounding.get("target"),
+            "point": {
+                "normalized": point.get("normalized"),
+                "framePx": point.get("framePx"),
+            },
+        }
+    if isinstance(execution.get("point"), dict):
+        point = execution["point"]
+        summary["point"] = {
+            "normalized": point.get("normalized"),
+            "screenshotPx": point.get("screenshotPx"),
+            "hidU16": point.get("hidU16"),
+        }
+    for result_key in ("tap", "typeResult", "pressResult", "keyResult", "clearResult", "scrollResult", "openUrlResult", "waitResult"):
+        value = execution.get(result_key)
+        if isinstance(value, dict):
+            summary[result_key] = {
+                key: value.get(key)
+                for key in ("attempted", "dryRun", "deliveryStatus", "completionStatus", "reason", "convertedText", "requestedButton", "button", "key", "direction", "url", "strategy", "waitedMs")
+                if key in value
+            }
+    substeps = execution.get("substeps")
+    if isinstance(substeps, list):
+        summary["substeps"] = [
+            {
+                "name": item.get("name"),
+                "status": item.get("status"),
+                "result": _execution_trace_summary(item.get("result")) if isinstance(item, dict) and isinstance(item.get("result"), dict) else None,
+            }
+            for item in substeps
+            if isinstance(item, dict)
+        ]
+    return {key: value for key, value in summary.items() if value is not None}
+
+
+def _trace_result_summary(data: dict[str, Any]) -> dict[str, Any]:
+    if not data.get("ok"):
+        error = data.get("error") if isinstance(data.get("error"), dict) else {}
+        return {
+            "status": "error",
+            "error": {
+                "code": error.get("code"),
+                "category": error.get("category"),
+                "stage": error.get("stage"),
+                "message": error.get("message"),
+                "retryable": error.get("retryable"),
+            },
+        }
+    result = data.get("result")
+    if not isinstance(result, dict):
+        return {"status": "ok", "resultType": type(result).__name__}
+    summary: dict[str, Any] = {
+        "status": result.get("status") or "ok",
+        "schema": result.get("schema"),
+        "artifactDir": result.get("artifactDir"),
+    }
+    if data.get("command") == "step":
+        summary.update(
+            {
+                "action": _action_trace_summary(result.get("action")),
+                "before": _observation_trace_summary(result.get("before")),
+                "execution": _execution_trace_summary(result.get("execution")),
+            }
+        )
+    elif data.get("command") == "observe":
+        summary["observation"] = _observation_trace_summary(result)
+    elif data.get("command") in {"assert", "wait"}:
+        summary["assertion"] = {
+            "text": result.get("text"),
+            "matched": result.get("matched"),
+            "attempts": result.get("attempts"),
+            "artifactDir": result.get("artifactDir"),
+        }
+    return {key: value for key, value in summary.items() if value is not None}
+
+
+def record_trace(args: argparse.Namespace, data: dict[str, Any], *, argv: list[str], cwd: str | None = None) -> dict[str, Any] | None:
+    paths = _trace_paths(args)
+    if paths is None:
+        return None
+    trace_dir = paths["dir"]
+    trace_dir.mkdir(parents=True, exist_ok=True)
+    events = _read_jsonl(paths["events"])
+    sequence = len(events) + 1
+    event_name = f"event-{sequence:06d}"
+    response_path = trace_dir / f"{event_name}.response.json"
+    trace_id = trace_dir.name
+    now = _utc_now_iso()
+
+    event = {
+        "schema": TRACE_EVENT_SCHEMA,
+        "traceId": trace_id,
+        "sequence": sequence,
+        "timestamp": now,
+        "cwd": cwd or str(Path.cwd()),
+        "argv": argv,
+        "command": data.get("command"),
+        "requestId": data.get("requestId"),
+        "ok": bool(data.get("ok")),
+        "durationMs": data.get("durationMs"),
+        "summary": _trace_result_summary(data),
+        "responsePath": str(response_path),
+    }
+    write_json(response_path, data)
+    with paths["events"].open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(event, ensure_ascii=False) + "\n")
+
+    existing = {}
+    if paths["trace"].exists():
+        try:
+            parsed = json.loads(paths["trace"].read_text(encoding="utf-8"))
+            if isinstance(parsed, dict):
+                existing = parsed
+        except json.JSONDecodeError:
+            existing = {}
+    trace = {
+        "schema": TRACE_SCHEMA,
+        "id": trace_id,
+        "title": _trace_title(args) or existing.get("title"),
+        "createdAt": existing.get("createdAt") or now,
+        "updatedAt": now,
+        "artifactRoot": str(_trace_artifact_root(args)),
+        "eventCount": sequence,
+        "eventsPath": str(paths["events"]),
+        "latestResponsePath": str(response_path),
+    }
+    write_json(paths["trace"], trace)
+    return {
+        "schema": "coretap.trace.ref.v1",
+        "id": trace_id,
+        "title": trace.get("title"),
+        "dir": str(trace_dir),
+        "tracePath": str(paths["trace"]),
+        "eventsPath": str(paths["events"]),
+        "eventSequence": sequence,
+        "responsePath": str(response_path),
+    }
+
+
+def attach_trace(args: argparse.Namespace, data: dict[str, Any], *, argv: list[str], cwd: str | None = None) -> dict[str, Any]:
+    try:
+        trace = record_trace(args, data, argv=argv, cwd=cwd)
+        if trace is not None:
+            data["trace"] = trace
+            write_json(Path(trace["responsePath"]), data)
+    except Exception as exc:  # Trace logging must not break the device action.
+        warnings = data.setdefault("warnings", [])
+        if isinstance(warnings, list):
+            warnings.append({"code": "TRACE_WRITE_FAILED", "message": str(exc), "stage": "trace"})
+        return data
+    return data
+
+
+def _compact_action(action: Any) -> dict[str, Any] | None:
+    if not isinstance(action, dict):
+        return None
+    compact = {key: value for key, value in action.items() if key != "schema" and value is not None}
+    return compact
+
+
+def _compact_frame(frame: Any) -> dict[str, Any] | None:
+    if not isinstance(frame, dict):
+        return None
+    keys = ("path", "widthPx", "heightPx", "resized", "maxLongSidePx", "sha256")
+    return {key: frame[key] for key in keys if key in frame}
+
+
+def _compact_execution(execution: Any) -> dict[str, Any] | None:
+    if not isinstance(execution, dict):
+        return None
+    compact: dict[str, Any] = {
+        "status": execution.get("status"),
+        "actionType": execution.get("actionType"),
+    }
+    if execution.get("strategy"):
+        compact["strategy"] = execution.get("strategy")
+    point = execution.get("point")
+    if isinstance(point, dict):
+        compact["point"] = {
+            key: point.get(key)
+            for key in ("normalized", "screenshotPx", "hidU16")
+            if key in point
+        }
+    grounding = execution.get("grounding")
+    if isinstance(grounding, dict):
+        gpoint = grounding.get("point") if isinstance(grounding.get("point"), dict) else {}
+        compact["grounding"] = {
+            "status": grounding.get("status"),
+            "point": {
+                key: gpoint.get(key)
+                for key in ("normalized", "framePx")
+                if key in gpoint
+            },
+        }
+    for result_key in ("tap", "scrollResult", "pressResult", "keyResult", "clearResult", "typeResult", "waitResult"):
+        value = execution.get(result_key)
+        if isinstance(value, dict):
+            compact[result_key] = _compact_nested_result(value)
+    return {key: value for key, value in compact.items() if value is not None}
+
+
+def _compact_nested_result(value: dict[str, Any]) -> dict[str, Any]:
+    allowed = {
+        "status",
+        "attempted",
+        "dryRun",
+        "dispatchStatus",
+        "deliveryStatus",
+        "confirmationStatus",
+        "direction",
+        "distance",
+        "button",
+        "key",
+        "count",
+        "waitedMs",
+        "typedCharacters",
+        "verified",
+    }
+    result = {key: value[key] for key in allowed if key in value}
+    if "from" in value and isinstance(value["from"], dict):
+        result["from"] = {"normalized": value["from"].get("normalized")}
+    if "to" in value and isinstance(value["to"], dict):
+        result["to"] = {"normalized": value["to"].get("normalized")}
+    if "anchor" in value:
+        result["anchor"] = value["anchor"]
+    return result
+
+
+def _debug_ref(data: dict[str, Any], result: Any) -> dict[str, Any] | None:
+    debug: dict[str, Any] = {}
+    if isinstance(result, dict):
+        artifact_dir = result.get("artifactDir")
+        if isinstance(artifact_dir, str):
+            debug["artifactDir"] = artifact_dir
+            if data.get("command") == "step":
+                debug["resultPath"] = str(Path(artifact_dir) / "step.result.json")
+            elif data.get("command") == "observe":
+                debug["resultPath"] = str(Path(artifact_dir) / "observe.result.json")
+            elif data.get("command") in {"assert", "wait"}:
+                debug["resultPath"] = str(Path(artifact_dir) / "assert-text.result.json")
+    trace = data.get("trace")
+    if isinstance(trace, dict):
+        debug["tracePath"] = trace.get("tracePath")
+        debug["responsePath"] = trace.get("responsePath")
+    return {key: value for key, value in debug.items() if value} or None
+
+
+def _compact_status(result_status: Any, *, ok: bool) -> str:
+    if not ok:
+        return "error"
+    if not isinstance(result_status, str):
+        return "success"
+    if result_status in (None, "ok", "executed", "satisfied"):
+        return "success"
+    return result_status
+
+
+def compact_response(data: dict[str, Any]) -> dict[str, Any]:
+    ok = bool(data.get("ok"))
+    result = data.get("result")
+    result_status = result.get("status") if isinstance(result, dict) else None
+    compact: dict[str, Any] = {
+        "ok": ok,
+        "command": data.get("command"),
+        "status": _compact_status(result_status, ok=ok),
+        "requestId": data.get("requestId"),
+        "durationMs": data.get("durationMs"),
+    }
+    if not ok:
+        error = data.get("error") if isinstance(data.get("error"), dict) else {}
+        compact["error"] = {
+            key: error.get(key)
+            for key in ("code", "category", "stage", "message", "retryable")
+            if key in error
+        }
+        debug = _debug_ref(data, error.get("details") if isinstance(error, dict) else None)
+        if debug:
+            compact["debug"] = debug
+        return {key: value for key, value in compact.items() if value is not None}
+
+    if data.get("command") == "step" and isinstance(result, dict):
+        compact.update(_compact_step_response(data, result))
+    elif data.get("command") == "observe" and isinstance(result, dict):
+        compact["observation"] = page_observation_summary(result)
+        compact["artifactDir"] = result.get("artifactDir")
+    elif data.get("command") in {"assert", "wait"} and isinstance(result, dict):
+        compact["matched"] = result.get("matched")
+        compact["expected"] = result.get("expected")
+        compact["attempts"] = result.get("attempts")
+        compact["match"] = {
+            key: result.get(key)
+            for key in ("matchedText", "matchedEngines", "matchedTokenMeanConfidence", "matchedBoxPx")
+            if key in result
+        }
+        compact["artifactDir"] = result.get("artifactDir")
     else:
-        print(json.dumps(data, ensure_ascii=False))
+        compact["result"] = result
+
+    debug = _debug_ref(data, result)
+    if debug:
+        compact["debug"] = debug
+    warnings = data.get("warnings")
+    if warnings:
+        compact["warnings"] = warnings
+    return {key: value for key, value in compact.items() if value is not None}
+
+
+def _compact_step_response(data: dict[str, Any], result: dict[str, Any]) -> dict[str, Any]:
+    compact: dict[str, Any] = {
+        "artifactDir": result.get("artifactDir"),
+        "action": _compact_action(result.get("action")),
+        "execution": _compact_execution(result.get("execution")),
+    }
+    observation = result.get("observation")
+    if isinstance(observation, dict):
+        compact["observation"] = observation
+    return compact
+
+
+def _element_bbox(element: dict[str, Any]) -> dict[str, float] | None:
+    bbox = element.get("bbox")
+    if not isinstance(bbox, dict):
+        return None
+    try:
+        x = float(bbox["x"])
+        y = float(bbox["y"])
+        width = float(bbox["width"])
+        height = float(bbox["height"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    return {"x": x, "y": y, "width": width, "height": height}
+
+
+def _union_bbox(items: list[dict[str, Any]]) -> dict[str, float] | None:
+    boxes = [box for box in (_element_bbox(item) for item in items) if box is not None]
+    if not boxes:
+        return None
+    left = min(box["x"] for box in boxes)
+    top = min(box["y"] for box in boxes)
+    right = max(box["x"] + box["width"] for box in boxes)
+    bottom = max(box["y"] + box["height"] for box in boxes)
+    return {"x": left, "y": top, "width": right - left, "height": bottom - top}
+
+
+def _bbox_center(bbox: dict[str, float] | None) -> dict[str, float] | None:
+    if not bbox:
+        return None
+    return {"x": bbox["x"] + bbox["width"] / 2, "y": bbox["y"] + bbox["height"] / 2}
+
+
+def _mean_confidence(items: list[dict[str, Any]]) -> float | None:
+    values: list[float] = []
+    for item in items:
+        try:
+            values.append(float(item["confidence"]))
+        except (KeyError, TypeError, ValueError):
+            pass
+    if not values:
+        return None
+    return round(sum(values) / len(values), 2)
+
+
+def _text_group(label: str, items: list[dict[str, Any]], *, group_type: str) -> dict[str, Any]:
+    bbox = _union_bbox(items)
+    result = {
+        "type": group_type,
+        "label": label,
+        "center": _bbox_center(bbox),
+        "bbox": bbox,
+        "tokenIndexes": [item.get("index") for item in items if item.get("index") is not None],
+        "confidence": _mean_confidence(items),
+    }
+    return {key: value for key, value in result.items() if value is not None}
+
+
+def _line_group_threshold(current: list[dict[str, Any]], candidate: dict[str, Any]) -> float:
+    heights = []
+    for item in [*current, candidate]:
+        box = _element_bbox(item)
+        if box:
+            heights.append(box["height"])
+    height = sorted(heights)[len(heights) // 2] if heights else 0.018
+    return max(0.018, height * 0.9)
+
+
+def _group_text_lines(elements: list[dict[str, Any]], *, max_lines: int = 60) -> list[dict[str, Any]]:
+    positioned = [item for item in elements if _element_bbox(item) is not None]
+    positioned.sort(key=lambda item: ((_element_bbox(item) or {}).get("y", 0), (_element_bbox(item) or {}).get("x", 0)))
+    raw_lines: list[list[dict[str, Any]]] = []
+    for item in positioned:
+        center = item.get("center") if isinstance(item.get("center"), dict) else None
+        try:
+            y = float(center["y"]) if center else (_element_bbox(item) or {})["y"]
+        except (KeyError, TypeError, ValueError):
+            continue
+        if not raw_lines:
+            raw_lines.append([item])
+            continue
+        last = raw_lines[-1]
+        last_centers = [float(member.get("center", {}).get("y")) for member in last if isinstance(member.get("center"), dict)]
+        last_y = sum(last_centers) / len(last_centers) if last_centers else y
+        if abs(y - last_y) <= _line_group_threshold(last, item):
+            last.append(item)
+        else:
+            raw_lines.append([item])
+
+    lines: list[dict[str, Any]] = []
+    for raw in raw_lines[:max_lines]:
+        raw.sort(key=lambda item: (_element_bbox(item) or {}).get("x", 0))
+        label = " ".join(str(item.get("label") or "").strip() for item in raw if str(item.get("label") or "").strip())
+        if label:
+            lines.append(_text_group(label, raw, group_type="textLine"))
+    return lines
+
+
+_BUTTON_TEXTS = {
+    "allow",
+    "cancel",
+    "close",
+    "continue",
+    "done",
+    "download",
+    "get",
+    "install",
+    "next",
+    "ok",
+    "open",
+    "paste",
+    "retry",
+    "save",
+    "search",
+    "update",
+    "允许",
+    "取消",
+    "关闭",
+    "继续",
+    "完成",
+    "下载",
+    "获取",
+    "安装",
+    "下一步",
+    "好",
+    "确定",
+    "打开",
+    "粘贴",
+    "重试",
+    "保存",
+    "搜索",
+    "更新",
+}
+
+
+def _label_suggests_button(label: str) -> bool:
+    normalized = normalize_text(label)
+    compact = re.sub(r"\s+", "", normalized)
+    return normalized in _BUTTON_TEXTS or compact in _BUTTON_TEXTS
+
+
+def _line_suggests_button(line: dict[str, Any]) -> bool:
+    label = str(line.get("label") or "").strip()
+    return _label_suggests_button(label)
+
+
+def _line_suggests_input(line: dict[str, Any]) -> bool:
+    label = str(line.get("label") or "").strip()
+    normalized = normalize_text(label)
+    compact = re.sub(r"\s+", "", normalized)
+    if re.match(r"^(q|◎|🔍|⌕)\s*", label.casefold()):
+        return True
+    if any(marker in compact for marker in ("search", "搜索", "输入", "查找")):
+        return True
+    return "游戏" in compact and ("app" in compact or "应用" in compact or "故事" in compact)
+
+
+def _line_vertical_gap(previous: dict[str, Any], current: dict[str, Any]) -> float | None:
+    prev_box = previous.get("bbox") if isinstance(previous.get("bbox"), dict) else None
+    cur_box = current.get("bbox") if isinstance(current.get("bbox"), dict) else None
+    if not prev_box or not cur_box:
+        return None
+    try:
+        return float(cur_box["y"]) - (float(prev_box["y"]) + float(prev_box["height"]))
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def _row_height(lines: list[dict[str, Any]]) -> float:
+    boxes = [line.get("bbox") for line in lines if isinstance(line.get("bbox"), dict)]
+    if not boxes:
+        return 0.0
+    top = min(float(box["y"]) for box in boxes)
+    bottom = max(float(box["y"]) + float(box["height"]) for box in boxes)
+    return bottom - top
+
+
+def _group_list_rows(lines: list[dict[str, Any]], *, max_rows: int = 40) -> list[dict[str, Any]]:
+    sorted_lines = [line for line in lines if isinstance(line.get("bbox"), dict)]
+    sorted_lines.sort(key=lambda line: (float(line["bbox"]["y"]), float(line["bbox"]["x"])))
+    rows: list[list[dict[str, Any]]] = []
+    for line in sorted_lines:
+        if not rows:
+            rows.append([line])
+            continue
+        current = rows[-1]
+        gap = _line_vertical_gap(current[-1], line)
+        tentative = [*current, line]
+        if gap is not None and gap <= 0.045 and _row_height(tentative) <= 0.14:
+            current.append(line)
+        else:
+            rows.append([line])
+
+    result: list[dict[str, Any]] = []
+    for row in rows[:max_rows]:
+        label = " / ".join(str(line.get("label") or "").strip() for line in row if str(line.get("label") or "").strip())
+        if not label:
+            continue
+        pseudo_items = [
+            {
+                "index": token_index,
+                "label": line.get("label"),
+                "confidence": line.get("confidence"),
+                "center": line.get("center"),
+                "bbox": line.get("bbox"),
+            }
+            for line in row
+            for token_index in (line.get("tokenIndexes") or [None])
+        ]
+        result.append(_text_group(label, pseudo_items, group_type="listRowCandidate"))
+    return result
+
+
+def _visual_group_items(elements: list[dict[str, Any]], roles: set[str], *, group_type: str, limit: int) -> list[dict[str, Any]]:
+    result: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+    for item in elements:
+        if item.get("source") != "vlm" or item.get("role") not in roles:
+            continue
+        center = item.get("center") if isinstance(item.get("center"), dict) else {}
+        key = (str(item.get("label") or ""), f"{center.get('x')}:{center.get('y')}")
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(dict(item, type=group_type))
+        if len(result) >= limit:
+            break
+    return result
+
+
+def _observation_groups(elements: list[dict[str, Any]]) -> dict[str, Any]:
+    text_elements = [item for item in elements if item.get("source") == "ocr" or item.get("type") == "text"]
+    visual_elements = [item for item in elements if item.get("source") == "vlm"]
+    lines = _group_text_lines(text_elements)
+    buttons = [dict(item, type="buttonCandidate") for item in text_elements if _label_suggests_button(str(item.get("label") or ""))]
+    buttons.extend(dict(line, type="buttonCandidate") for line in lines if _line_suggests_button(line))
+    inputs = [dict(line, type="inputCandidate") for line in lines if _line_suggests_input(line)]
+    rows = _group_list_rows(lines)
+    deduped_buttons: list[dict[str, Any]] = []
+    seen_buttons: set[tuple[str, str]] = set()
+    for button in buttons:
+        center = button.get("center") if isinstance(button.get("center"), dict) else {}
+        key = (str(button.get("label") or ""), f"{center.get('x')}:{center.get('y')}")
+        if key in seen_buttons:
+            continue
+        seen_buttons.add(key)
+        deduped_buttons.append(button)
+    return {
+        "textLines": lines,
+        "buttons": deduped_buttons[:30],
+        "inputs": inputs[:20],
+        "rows": rows[:40],
+        "visualButtons": _visual_group_items(visual_elements, {"button", "toggle", "navigation"}, group_type="visualButton", limit=40),
+        "appIcons": _visual_group_items(visual_elements, {"appIcon"}, group_type="appIcon", limit=40),
+        "tabs": _visual_group_items(visual_elements, {"tab"}, group_type="tab", limit=20),
+    }
+
+
+def page_observation_summary(observation: dict[str, Any], *, max_elements: int = 80) -> dict[str, Any]:
+    ocr = observation.get("ocr") if isinstance(observation, dict) else None
+    visual = observation.get("visual") if isinstance(observation, dict) else None
+    frame = observation.get("frame") if isinstance(observation, dict) else None
+    ocr_enabled = isinstance(ocr, dict) and bool(ocr.get("enabled"))
+    visual_enabled = isinstance(visual, dict) and bool(visual.get("enabled"))
+    summary: dict[str, Any] = {
+        "status": "ready" if ocr_enabled or visual_enabled else "no_observation",
+        "frame": _compact_frame(frame),
+    }
+    elements: list[dict[str, Any]] = []
+    visible_texts: list[str] = []
+    seen_texts: set[str] = set()
+    frame_width = float(frame.get("widthPx") or 0) if isinstance(frame, dict) else 0.0
+    frame_height = float(frame.get("heightPx") or 0) if isinstance(frame, dict) else 0.0
+    tokens = [item for item in ((ocr or {}).get("tokens") or []) if isinstance(item, dict)] if ocr_enabled else []
+    if ocr_enabled:
+        for fallback_index, token in enumerate(tokens[:max_elements]):
+            text = str(token.get("text") or "").strip()
+            if not text:
+                continue
+            normalized = token.get("normalized") if isinstance(token.get("normalized"), dict) else None
+            bbox = token.get("bboxNormalized") if isinstance(token.get("bboxNormalized"), dict) else None
+            if bbox is None and isinstance(token.get("bboxPx"), dict) and frame_width > 0 and frame_height > 0:
+                bbox_px = token["bboxPx"]
+                try:
+                    bbox = {
+                        "x": float(bbox_px["x"]) / frame_width,
+                        "y": float(bbox_px["y"]) / frame_height,
+                        "width": float(bbox_px["width"]) / frame_width,
+                        "height": float(bbox_px["height"]) / frame_height,
+                    }
+                except (KeyError, TypeError, ValueError):
+                    bbox = None
+            elements.append(
+                {
+                    "index": token.get("index", fallback_index),
+                    "type": "text",
+                    "source": "ocr",
+                    "label": text,
+                    "confidence": token.get("confidence"),
+                    "center": normalized,
+                    "bbox": bbox,
+                }
+            )
+            dedupe_key = normalize_text(text)
+            if dedupe_key and dedupe_key not in seen_texts:
+                seen_texts.add(dedupe_key)
+                visible_texts.append(text)
+    visual_elements = [item for item in ((visual or {}).get("elements") or []) if isinstance(item, dict)] if visual_enabled else []
+    elements.extend(visual_elements[:max_elements])
+    visual_summary = str((visual or {}).get("summary") or "").strip() if isinstance(visual, dict) else ""
+    text_summary = "可见文本：" + " / ".join(visible_texts[:24]) if visible_texts else "未识别到可见文本"
+    if visual_summary and visible_texts:
+        summary["summary"] = f"{visual_summary}；{text_summary}"
+    elif visual_summary:
+        summary["summary"] = visual_summary
+    else:
+        summary["summary"] = text_summary
+    summary["elements"] = elements
+    summary["groups"] = _observation_groups(elements)
+    summary["textCount"] = len(tokens)
+    summary["visualCount"] = len(visual_elements)
+    plain_text = (ocr or {}).get("plainText") if ocr_enabled else None
+    if isinstance(plain_text, str) and plain_text:
+        summary["plainText"] = plain_text
+    return {key: value for key, value in summary.items() if value is not None}
 
 
 def point_to_hid(x: float, y: float, *, width: int, height: int, space: str, frame_known: bool = True) -> dict[str, Any]:
@@ -168,7 +1106,7 @@ def command_setup(args: argparse.Namespace) -> dict[str, Any]:
             "version": 1,
             "capabilities": {
                 "grounding": {"profile": PUBLIC_MODEL_PROFILE},
-                "ocr": {"profile": "builtin:vision-tesseract-chi-sim-eng@1", "lang": DEFAULT_OCR_LANG},
+                "ocr": {"profile": "builtin:macos-vision-zh-hans-en-us@1", "lang": DEFAULT_OCR_LANG},
             },
             "storage": {name: str(path) for name, path in roots.items()},
         },
@@ -184,7 +1122,7 @@ def command_setup(args: argparse.Namespace) -> dict[str, Any]:
 
 def command_status(args: argparse.Namespace) -> dict[str, Any]:
     roots = ensure_state()
-    ocr = tesseract_status()
+    ocr = vision_ocr_status()
     model = model_status(args.profile)
     return {
         "version": __version__,
@@ -194,7 +1132,7 @@ def command_status(args: argparse.Namespace) -> dict[str, Any]:
         "ocr": ocr,
         "ready": {
             "grounding": bool(model.get("ready")),
-            "textAssertions": bool(ocr.get("ready") and ocr.get("defaultLangAvailable")),
+            "textAssertions": bool(ocr.get("ready")),
         },
     }
 
@@ -234,8 +1172,8 @@ def command_doctor(args: argparse.Namespace) -> dict[str, Any]:
     checks.append({"id": "state", "status": "pass", "details": command_setup(args)})
     model = model_status(args.profile)
     checks.append({"id": "grounding", "status": "pass" if model["ready"] else "fail", "details": model})
-    ocr = tesseract_status()
-    checks.append({"id": "ocr", "status": "pass" if ocr["ready"] and ocr["defaultLangAvailable"] else "warn", "details": ocr})
+    ocr = vision_ocr_status()
+    checks.append({"id": "ocr", "status": "pass" if ocr["ready"] else "warn", "details": ocr})
     try:
         devices = command_discover(args)["devices"]
         checks.append({"id": f"{args.backend}-discover", "status": "pass", "details": {"count": len(devices)}})
@@ -279,7 +1217,23 @@ def _capture_to(args: argparse.Namespace, *, label: str, run_dir: Path, out: Pat
 
 
 def capture(args: argparse.Namespace, *, label: str = "screenshot") -> tuple[Any, Path, Path]:
-    run_dir = artifact_dir(Path(args.artifact_root) if args.artifact_root else None)
+    existing = getattr(args, "_artifact_run_dir", None)
+    if existing:
+        run_dir = Path(str(existing))
+        out = Path(args.out) if getattr(args, "out", None) else run_dir / f"{label}.png"
+        frame = _capture_to(args, label=label, run_dir=run_dir, out=out)
+        return frame, run_dir, out
+    root = _persistent_artifact_root(args)
+    if root is None:
+        raise CoretapError(
+            "ARTIFACT_CONTEXT_REQUIRED",
+            "capture requires an active artifact context or persistent artifacts",
+            category="internal",
+            stage="artifact",
+        )
+    run_dir = artifact_dir(root)
+    args._artifact_run_dir = str(run_dir)
+    args._artifacts_persistent = True
     out = Path(args.out) if getattr(args, "out", None) else run_dir / f"{label}.png"
     frame = _capture_to(args, label=label, run_dir=run_dir, out=out)
     return frame, run_dir, out
@@ -300,13 +1254,169 @@ def _now_iso() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
 
+def _text_entry_anchor_cache_path() -> Path:
+    return ensure_state()["state"] / "text-entry-anchors.json"
+
+
+def _text_entry_anchor_key(args: argparse.Namespace) -> str:
+    backend = str(getattr(args, "backend", "") or "device")
+    device = str(getattr(args, "device", "") or "default")
+    return f"{backend}:{device}"
+
+
+def _load_text_entry_anchor_cache() -> dict[str, Any]:
+    path = _text_entry_anchor_cache_path()
+    if not path.exists():
+        return {"schema": TEXT_ENTRY_ANCHOR_CACHE_SCHEMA, "anchors": {}}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {"schema": TEXT_ENTRY_ANCHOR_CACHE_SCHEMA, "anchors": {}}
+    if not isinstance(data, dict):
+        return {"schema": TEXT_ENTRY_ANCHOR_CACHE_SCHEMA, "anchors": {}}
+    anchors = data.get("anchors")
+    if not isinstance(anchors, dict):
+        data["anchors"] = {}
+    data["schema"] = TEXT_ENTRY_ANCHOR_CACHE_SCHEMA
+    return data
+
+
+def _target_suggests_text_entry(target: str | None) -> bool:
+    if not target:
+        return False
+    raw = str(target)
+    haystack = f"{raw} {normalize_text(raw)}".casefold()
+    if any(marker in haystack for marker in NON_TEXT_ENTRY_CONTEXT_MARKERS):
+        return False
+    return any(marker in haystack for marker in TEXT_ENTRY_TARGET_MARKERS)
+
+
+def _target_suggests_top_text_entry(target: str | None, point: dict[str, Any] | None = None) -> bool:
+    if not _target_suggests_text_entry(target):
+        return False
+    raw = str(target or "")
+    haystack = f"{raw} {normalize_text(raw)}".casefold()
+    normalized = point.get("normalized") if isinstance(point, dict) else None
+    try:
+        point_y = float(normalized["y"]) if isinstance(normalized, dict) else None
+    except (KeyError, TypeError, ValueError):
+        point_y = None
+    if any(marker in haystack for marker in TOP_TEXT_ENTRY_TARGET_MARKERS):
+        return point_y is None or point_y < 0.35
+    if point_y is not None and point_y < 0.24 and any(marker in haystack for marker in ("search", "搜索")):
+        return True
+    return False
+
+
+def _target_suggests_relocated_search_entry(target: str | None, point: dict[str, Any] | None = None) -> bool:
+    if not _target_suggests_text_entry(target):
+        return False
+    raw = str(target or "")
+    haystack = f"{raw} {normalize_text(raw)}".casefold()
+    if not any(marker in haystack for marker in ("search", "搜索", "address", "地址")):
+        return False
+    normalized = point.get("normalized") if isinstance(point, dict) else None
+    try:
+        point_y = float(normalized["y"]) if isinstance(normalized, dict) else None
+    except (KeyError, TypeError, ValueError):
+        return False
+    return point_y >= 0.70
+
+
+def _remember_text_entry_anchor(
+    args: argparse.Namespace,
+    point: dict[str, Any],
+    *,
+    source: str,
+    action_type: str,
+    target: str | None = None,
+) -> dict[str, Any] | None:
+    if getattr(args, "dry_run", False):
+        return None
+    if action_type == "tap" and not _target_suggests_text_entry(target):
+        return None
+    normalized = point.get("normalized") if isinstance(point, dict) else None
+    if not isinstance(normalized, dict):
+        return None
+    try:
+        x = float(normalized["x"])
+        y = float(normalized["y"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    if not (0 <= x <= 1 and 0 <= y <= 1):
+        return None
+    anchor = {
+        "schema": TEXT_ENTRY_ANCHOR_SCHEMA,
+        "source": source,
+        "actionType": action_type,
+        "target": target,
+        "backend": str(getattr(args, "backend", "") or "device"),
+        "device": str(getattr(args, "device", "") or "default"),
+        "point": {"x": x, "y": y},
+        "updatedAt": _utc_now_iso(),
+        "updatedAtEpochMs": round(time.time() * 1000),
+    }
+    cache = _load_text_entry_anchor_cache()
+    anchors = cache.setdefault("anchors", {})
+    anchors[_text_entry_anchor_key(args)] = anchor
+    write_json(_text_entry_anchor_cache_path(), cache)
+    return anchor
+
+
+def _last_text_entry_anchor(args: argparse.Namespace) -> dict[str, Any] | None:
+    cache = _load_text_entry_anchor_cache()
+    anchors = cache.get("anchors")
+    if not isinstance(anchors, dict):
+        return None
+    anchor = anchors.get(_text_entry_anchor_key(args))
+    if not isinstance(anchor, dict):
+        return None
+    point = anchor.get("point")
+    if not isinstance(point, dict):
+        return None
+    try:
+        x = float(point["x"])
+        y = float(point["y"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    updated_at = anchor.get("updatedAtEpochMs")
+    try:
+        age_ms = round(time.time() * 1000) - int(updated_at)
+    except (TypeError, ValueError):
+        age_ms = TEXT_ENTRY_ANCHOR_MAX_AGE_MS + 1
+    if age_ms > TEXT_ENTRY_ANCHOR_MAX_AGE_MS:
+        return None
+    if not (0 <= x <= 1 and 0 <= y <= 1):
+        return None
+    return {**anchor, "point": {"x": x, "y": y}, "ageMs": age_ms}
+
+
+def _is_non_ascii_text(text: str) -> bool:
+    return any(ord(ch) > 127 for ch in text)
+
+
+def _is_unshifted_virtual_keyboard_text(text: str) -> bool:
+    if any(ch.isspace() for ch in text):
+        return False
+    from pymobiledevice3.remote.core_device.hid_service import ASCII_TO_HID
+
+    for ch in text:
+        mapping = ASCII_TO_HID.get(ch)
+        if mapping is None:
+            return False
+        _usage, needs_shift = mapping
+        if needs_shift and not ch.isalpha():
+            return False
+    return True
+
+
 def _screenshot_into(args: argparse.Namespace, *, run_dir: Path, label: str, out: Path | None = None) -> dict[str, Any]:
     captured_at = _now_iso()
     output_path = out or (Path(args.out) if getattr(args, "out", None) else run_dir / f"{label}.png")
     if getattr(args, "full_size", False):
         frame = _capture_to(args, label=label, run_dir=run_dir, out=output_path)
         result = {
-            "artifactDir": str(run_dir),
+            **_artifact_result(args, run_dir),
             "frame": {
                 "frameId": frame.frame_id,
                 "path": str(frame.path),
@@ -344,7 +1454,7 @@ def _screenshot_into(args: argparse.Namespace, *, run_dir: Path, label: str, out
     write_json(run_dir / f"{source_label}.frame.json", source_frame_json)
     preview = prepare_image_long_side(output_path, output_path=output_path, max_long_side=max_long_side)
     result = {
-        "artifactDir": str(run_dir),
+        **_artifact_result(args, run_dir),
         "frame": {
             "frameId": f"frame_{label}",
             "path": preview["path"],
@@ -417,31 +1527,40 @@ def _raise_ocr_unavailable(image: Path, raw: dict[str, Any]) -> None:
 
 
 def _run_observe_ocr(image: Path, args: argparse.Namespace) -> tuple[list[Any], dict[str, Any], str]:
-    if args.ocr_engine == "all":
-        tokens, raw = run_ocr(image, lang=args.lang, psm=args.psm)
-        return tokens, raw, "all"
-
-    raw: dict[str, Any] = {"engines": [], "errors": []}
-    if args.ocr_engine in ("auto", "vision"):
-        try:
-            tokens, vision_stdout = run_vision_ocr(image)
-            raw["engines"].append("vision")
-            raw["visionJson"] = vision_stdout
-            return tokens, raw, "vision"
-        except CoretapError as exc:
-            raw["errors"].append(_ocr_error_details(exc, engine="vision"))
-            if args.ocr_engine == "vision":
-                _raise_ocr_unavailable(image, raw)
-
     try:
-        tokens, tsv = run_tesseract(image, lang=args.lang, psm=args.psm)
-        raw["engines"].append("tesseract")
-        raw["tesseractTsv"] = tsv
-        return tokens, raw, "tesseract"
+        tokens, raw = run_ocr(image)
+        return tokens, raw, DEFAULT_OCR_ENGINE
     except CoretapError as exc:
-        raw["errors"].append(_ocr_error_details(exc, engine="tesseract"))
+        raw = {"engines": [], "errors": [_ocr_error_details(exc, engine=DEFAULT_OCR_ENGINE)]}
+        _raise_ocr_unavailable(image, raw)
 
-    _raise_ocr_unavailable(image, raw)
+
+def _run_observe_visual(image: Path, args: argparse.Namespace) -> dict[str, Any]:
+    profile = getattr(args, "profile", PUBLIC_MODEL_PROFILE)
+    if profile == INTERNAL_FIXTURE_PROFILE:
+        return {
+            "schema": "coretap.visual.observe.v1",
+            "enabled": False,
+            "status": "skipped",
+            "reason": "profile does not support VLM visual observe",
+            "profile": profile,
+            "promptVersion": PUBLIC_VISUAL_OBSERVE_PROMPT_VERSION,
+            "summary": "",
+            "elements": [],
+        }
+    try:
+        return run_visual_observe_model(image, profile=profile)
+    except CoretapError as exc:
+        if exc.code != "MODEL_WORKER_CRASHED" or not exc.retryable:
+            raise
+        warm_model(profile)
+        result = run_visual_observe_model(image, profile=profile)
+        result["modelRecovery"] = {
+            "schema": "coretap.model-recovery.v1",
+            "recoveredFrom": exc.code,
+            "attempts": 2,
+        }
+        return result
 
 
 def _observe_into(
@@ -450,6 +1569,7 @@ def _observe_into(
     run_dir: Path,
     label: str,
     no_ocr: bool | None = None,
+    no_vlm: bool | None = None,
     out: Path | None = None,
 ) -> dict[str, Any]:
     ns = argparse.Namespace(**vars(args))
@@ -459,47 +1579,53 @@ def _observe_into(
     frame = screenshot["frame"]
     result: dict[str, Any] = {
         "schema": "coretap.observe.result.v1",
-        "artifactDir": screenshot["artifactDir"],
         "frame": frame,
         "sourceFrame": screenshot.get("sourceFrame"),
+        **_artifact_result(args, run_dir),
     }
-    should_skip_ocr = bool(args.no_ocr if no_ocr is None else no_ocr)
+    should_skip_ocr = bool(getattr(args, "no_ocr", False) if no_ocr is None else no_ocr)
     if should_skip_ocr:
         result["ocr"] = {"enabled": False}
-        write_json(run_dir / f"{label}.observe.result.json", result)
-        return result
+    else:
+        image = Path(frame["path"])
+        tokens, raw, selected_engine = _run_observe_ocr(image, args)
+        filtered = [token for token in tokens if token.confidence >= args.min_confidence]
+        token_json = [
+            _ocr_token_json(token, index=index, frame_width=frame["widthPx"], frame_height=frame["heightPx"])
+            for index, token in enumerate(filtered)
+        ]
+        _write_ocr_artifacts(run_dir, label, raw)
+        result["ocr"] = {
+            "schema": "coretap.ocr.page.v1",
+            "enabled": True,
+            "lang": DEFAULT_OCR_LANG,
+            "engineMode": DEFAULT_OCR_ENGINE,
+            "selectedEngine": selected_engine,
+            "minConfidence": args.min_confidence,
+            "tokenCount": len(token_json),
+            "rawTokenCount": len(tokens),
+            "plainText": "\n".join(token["text"] for token in token_json),
+            **_ocr_summary(raw),
+            "tokens": token_json,
+        }
 
     image = Path(frame["path"])
-    tokens, raw, selected_engine = _run_observe_ocr(image, args)
-    filtered = [token for token in tokens if token.confidence >= args.min_confidence]
-    token_json = [
-        _ocr_token_json(token, index=index, frame_width=frame["widthPx"], frame_height=frame["heightPx"])
-        for index, token in enumerate(filtered)
-    ]
-    _write_ocr_artifacts(run_dir, label, raw)
-    result["ocr"] = {
-        "schema": "coretap.ocr.page.v1",
-        "enabled": True,
-        "lang": args.lang,
-        "psm": args.psm,
-        "engineMode": args.ocr_engine,
-        "selectedEngine": selected_engine,
-        "minConfidence": args.min_confidence,
-        "tokenCount": len(token_json),
-        "rawTokenCount": len(tokens),
-        "plainText": "\n".join(token["text"] for token in token_json),
-        **_ocr_summary(raw),
-        "tokens": token_json,
-    }
+    should_skip_vlm = bool(getattr(args, "no_vlm", False) if no_vlm is None else no_vlm)
+    if should_skip_vlm:
+        result["visual"] = {"enabled": False}
+    else:
+        visual = _run_observe_visual(image, args)
+        result["visual"] = visual
+        write_json(run_dir / f"{label}.visual.json", visual)
     write_json(run_dir / f"{label}.observe.result.json", result)
     return result
 
 
 def command_observe(args: argparse.Namespace) -> dict[str, Any]:
-    run_dir = artifact_dir(Path(args.artifact_root) if args.artifact_root else None)
-    result = _observe_into(args, run_dir=run_dir, label=args.label)
-    write_json(run_dir / "observe.result.json", result)
-    return result
+    with _command_artifacts(args) as run_dir:
+        result = _observe_into(args, run_dir=run_dir, label=args.label)
+        write_json(run_dir / "observe.result.json", result)
+        return result
 
 
 def _parse_xy_pair(raw: str, *, option: str) -> tuple[float, float]:
@@ -596,40 +1722,9 @@ def _grounding_error_code(status: str) -> str:
 def _run_ocr_progressive(
     image: Path,
     *,
-    lang: str,
-    psm: int,
     is_match: Any,
 ) -> tuple[list[Any], dict[str, Any]]:
-    tokens: list[Any] = []
-    raw: dict[str, Any] = {"engines": [], "errors": []}
-    try:
-        tesseract_tokens, tsv = run_tesseract(image, lang=lang, psm=psm)
-        tokens.extend(tesseract_tokens)
-        raw["engines"].append("tesseract")
-        raw["tesseractTsv"] = tsv
-        if is_match(tokens):
-            return tokens, raw
-    except CoretapError as exc:
-        raw["errors"].append({"engine": "tesseract", "code": exc.code, "message": str(exc), "details": exc.details})
-
-    try:
-        vision_tokens, vision_stdout = run_vision_ocr(image)
-        tokens.extend(vision_tokens)
-        raw["engines"].append("vision")
-        raw["visionJson"] = vision_stdout
-    except CoretapError as exc:
-        raw["errors"].append({"engine": "vision", "code": exc.code, "message": str(exc), "details": exc.details})
-
-    if not raw["engines"]:
-        errors = raw.get("errors") or []
-        first = errors[0] if errors else {}
-        raise CoretapError(
-            first.get("code") or "OCR_UNAVAILABLE",
-            first.get("message") or "No OCR engine is available",
-            stage="ocr",
-            category="environment",
-            details={"image": str(image), "errors": errors},
-        )
+    tokens, raw = run_ocr(image)
     return tokens, raw
 
 
@@ -653,27 +1748,28 @@ def _type_text_query(args: argparse.Namespace) -> str:
 
 
 def command_type(args: argparse.Namespace) -> dict[str, Any]:
-    backend = backend_for(args.backend, developer_dir=args.developer_dir, coredevice_tunnel_mode=args.coredevice_tunnel_mode)
-    text = _type_text_query(args)
-    if args.verify_timeout_ms < 0:
-        raise CoretapError("INVALID_ARGUMENT", "type --verify-timeout-ms must be >= 0", category="usage", stage="type")
-    if isinstance(args.paste_at, dict):
-        paste_at = args.paste_at
-    else:
-        paste_at = _parse_normalized_pair(args.paste_at, option="--paste-at", stage="type") if args.paste_at else None
-    result = backend.type_text(
-        args.device,
-        text,
-        char_delay_ms=args.char_delay_ms,
-        inter_delay_ms=args.inter_delay_ms,
-        paste_at=paste_at,
-        paste_hold_ms=args.paste_hold_ms,
-        clear_existing=args.replace,
-        dry_run=args.dry_run,
-    )
-    if args.dry_run or args.no_verify or not text:
-        return result
-    return _verify_type_result(args, text, result)
+    with _command_artifacts(args) as run_dir:
+        backend = backend_for(args.backend, developer_dir=args.developer_dir, coredevice_tunnel_mode=args.coredevice_tunnel_mode)
+        text = _type_text_query(args)
+        if args.verify_timeout_ms < 0:
+            raise CoretapError("INVALID_ARGUMENT", "type --verify-timeout-ms must be >= 0", category="usage", stage="type")
+        if isinstance(args.paste_at, dict):
+            paste_at = args.paste_at
+        else:
+            paste_at = _parse_normalized_pair(args.paste_at, option="--paste-at", stage="type") if args.paste_at else None
+        result = backend.type_text(
+            args.device,
+            text,
+            char_delay_ms=args.char_delay_ms,
+            inter_delay_ms=args.inter_delay_ms,
+            paste_at=paste_at,
+            paste_hold_ms=args.paste_hold_ms,
+            clear_existing=args.replace,
+            dry_run=args.dry_run,
+        )
+        if args.dry_run or args.no_verify or not text:
+            return result
+        return _verify_type_result(args, text, result, run_dir)
 
 
 def command_key(args: argparse.Namespace) -> dict[str, Any]:
@@ -697,7 +1793,7 @@ def command_clear(args: argparse.Namespace) -> dict[str, Any]:
     )
 
 
-def _verify_type_result(args: argparse.Namespace, text: str, result: dict[str, Any]) -> dict[str, Any]:
+def _verify_type_result(args: argparse.Namespace, text: str, result: dict[str, Any], run_dir: Path) -> dict[str, Any]:
     deadline = time.monotonic() + (args.verify_timeout_ms / 1000)
     attempts = 0
     last: dict[str, Any] | None = None
@@ -705,22 +1801,21 @@ def _verify_type_result(args: argparse.Namespace, text: str, result: dict[str, A
         attempts += 1
         capture_args = argparse.Namespace(**vars(args))
         capture_args.out = None
-        frame, run_dir, image = capture(capture_args, label="type-verify")
+        image = run_dir / "type-verify.png"
+        frame = _capture_to(capture_args, label="type-verify", run_dir=run_dir, out=image)
         tokens, raw = _run_ocr_progressive(
             image,
-            lang=DEFAULT_OCR_LANG,
-            psm=11,
             is_match=lambda current: bool(find_exact_text_candidates(current, text, min_confidence=25.0)),
         )
         _write_ocr_artifacts(run_dir, "type-verify", raw)
         candidates = find_exact_text_candidates(tokens, text, min_confidence=25.0)
         last = {
-            "artifactDir": str(run_dir),
             "frame": {"path": str(image), "widthPx": frame.width, "heightPx": frame.height},
             "attempts": attempts,
             "tokenCount": len(tokens),
             "candidateCount": len(candidates),
             "ocr": _ocr_summary(raw),
+            **_artifact_result(args, run_dir),
         }
         if candidates:
             verification = {**last, "match": candidates[0]}
@@ -742,7 +1837,11 @@ def _verify_type_result(args: argparse.Namespace, text: str, result: dict[str, A
 
 
 def command_assert_text(args: argparse.Namespace) -> dict[str, Any]:
-    run_dir = artifact_dir(Path(args.artifact_root) if args.artifact_root else None)
+    with _command_artifacts(args) as run_dir:
+        return _command_assert_text_into(args, run_dir)
+
+
+def _command_assert_text_into(args: argparse.Namespace, run_dir: Path) -> dict[str, Any]:
     if args.image:
         image = Path(args.image)
         frame_info: dict[str, Any] | None = None
@@ -767,14 +1866,13 @@ def command_assert_text(args: argparse.Namespace) -> dict[str, Any]:
                 "sha256": sha256_file(frame.path),
                 "capturedAt": _now_iso(),
             }
-        lang = getattr(args, "lang", DEFAULT_OCR_LANG)
-        psm = int(getattr(args, "psm", 11))
         tokens, raw = _run_ocr_progressive(
             image,
-            lang=lang,
-            psm=psm,
             is_match=lambda current: bool(find_text(current, args.text, case_sensitive=args.case_sensitive)),
         )
+        min_confidence = float(getattr(args, "min_confidence", 0.0) or 0.0)
+        if min_confidence > 0:
+            tokens = [token for token in tokens if token.confidence >= min_confidence]
         _write_ocr_artifacts(run_dir, f"assert-{attempts:03d}", raw)
         match = find_text(tokens, args.text, case_sensitive=args.case_sensitive)
         last = {
@@ -782,16 +1880,16 @@ def command_assert_text(args: argparse.Namespace) -> dict[str, Any]:
             "image": str(image),
             "frame": frame_info,
             "tokenCount": len(tokens),
-            "ocr": {"lang": lang, "psm": psm, **_ocr_summary(raw)},
+            "ocr": {"lang": DEFAULT_OCR_LANG, "selectedEngine": DEFAULT_OCR_ENGINE, **_ocr_summary(raw)},
             "match": match,
         }
         if match:
             result = {
-                "artifactDir": str(run_dir),
+                **_artifact_result(args, run_dir),
                 "expected": args.text,
                 "matched": True,
                 "frame": frame_info,
-                "ocr": {"lang": lang, "psm": psm, "tokenCount": len(tokens), **_ocr_summary(raw)},
+                "ocr": {"lang": DEFAULT_OCR_LANG, "selectedEngine": DEFAULT_OCR_ENGINE, "tokenCount": len(tokens), **_ocr_summary(raw)},
                 **match,
                 "attempts": attempts,
             }
@@ -811,12 +1909,18 @@ def command_assert_text(args: argparse.Namespace) -> dict[str, Any]:
 
 _STEP_ACTION_TYPES = {
     "tap",
+    "tapPoint",
+    "longPress",
     "openApp",
+    "openUrl",
     "typeText",
     "key",
     "clear",
     "press",
     "scroll",
+    "appSwitcher",
+    "terminateApp",
+    "uninstallApp",
     "wait",
 }
 
@@ -877,13 +1981,13 @@ def _load_step_action(args: argparse.Namespace) -> dict[str, Any]:
             details={"receivedType": type(action).__name__},
         )
     schema = action.get("schema")
-    if schema != "coretap.action.v2":
+    if schema not in (None, "", "coretap.action.v2"):
         raise CoretapError(
             "ACTION_SCHEMA_INVALID",
             f"Unsupported action schema: {schema}",
             category="usage",
             stage="step-action",
-            details={"schema": schema},
+            details={"schema": schema, "supported": ["coretap.action.v2"], "note": "schema is optional for step actions"},
         )
     return action
 
@@ -909,15 +2013,56 @@ def _integer(value: Any, *, key: str, stage: str) -> int:
         raise CoretapError("ACTION_SCHEMA_INVALID", f"action field {key} must be an integer", category="usage", stage=stage) from exc
 
 
-def _point_pair_from_action(value: Any, *, key: str, stage: str) -> str:
+def _point_pair_from_action(value: Any, *, key: str, stage: str) -> str | dict[str, Any]:
     if isinstance(value, str):
         _parse_xy_pair(value, option=key)
         return value
     if isinstance(value, dict):
         x = _number(value.get("x"), key=f"{key}.x", stage=stage)
         y = _number(value.get("y"), key=f"{key}.y", stage=stage)
-        return f"{x},{y}"
+        point: dict[str, Any] = {"x": x, "y": y}
+        source = str(value.get("source") or "").strip()
+        if source:
+            point["source"] = source
+        return point
     raise CoretapError("ACTION_SCHEMA_INVALID", f"action field {key} must be x,y or an object", category="usage", stage=stage)
+
+
+def _point_from_action(raw: dict[str, Any], *, stage: str, key: str = "point") -> dict[str, Any]:
+    payload = raw.get(key)
+    if payload is None and key == "point":
+        payload = raw
+    if isinstance(payload, str):
+        x, y = _parse_xy_pair(payload, option=key)
+        space = str(raw.get("space") or "normalized")
+        reference = str(raw.get("reference") or "source")
+    elif isinstance(payload, dict):
+        x = _number(payload.get("x"), key=f"{key}.x", stage=stage)
+        y = _number(payload.get("y"), key=f"{key}.y", stage=stage)
+        space = str(raw.get("space") or payload.get("space") or "normalized")
+        reference = str(raw.get("reference") or payload.get("reference") or "source")
+    else:
+        raise CoretapError("ACTION_SCHEMA_INVALID", f"action field {key} must be x,y or an object", category="usage", stage=stage)
+    if space not in {"normalized", "px", "hid"}:
+        raise CoretapError("ACTION_SCHEMA_INVALID", f"action field {key}.space must be normalized, px, or hid", category="usage", stage=stage)
+    if reference not in {"source", "preview"}:
+        raise CoretapError("ACTION_SCHEMA_INVALID", f"action field {key}.reference must be source or preview", category="usage", stage=stage)
+    return {"x": x, "y": y, "space": space, "reference": reference}
+
+
+def _string_list(value: Any, *, key: str, stage: str) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        items = [value]
+    elif isinstance(value, list):
+        items = value
+    else:
+        raise CoretapError("ACTION_SCHEMA_INVALID", f"action field {key} must be a string or array", category="usage", stage=stage)
+    result = [str(item).strip() for item in items if str(item).strip()]
+    if not result:
+        raise CoretapError("ACTION_SCHEMA_INVALID", f"action field {key} must not be empty", category="usage", stage=stage)
+    return result
 
 
 def _normalize_step_action(raw: dict[str, Any]) -> dict[str, Any]:
@@ -934,14 +2079,36 @@ def _normalize_step_action(raw: dict[str, Any]) -> dict[str, Any]:
 
     action: dict[str, Any] = {"schema": "coretap.action.v2", "type": action_type}
     if "postconditions" in raw:
-        action["postconditions"] = raw["postconditions"]
+        raise CoretapError("ACTION_SCHEMA_INVALID", "step action postconditions were removed", category="usage", stage=stage)
 
     if action_type == "tap":
         action["target"] = _require_str(raw, "target", stage=stage)
+        if "constraints" in raw:
+            raise CoretapError("ACTION_SCHEMA_INVALID", "tap constraints were removed; use VLM target text directly", category="usage", stage=stage)
+    elif action_type == "tapPoint":
+        action["point"] = _point_from_action(raw, stage=stage)
+    elif action_type == "longPress":
+        action["point"] = _point_from_action(raw, stage=stage)
+        action["durationMs"] = _integer(raw.get("durationMs", 1200), key="durationMs", stage=stage)
+        action["steps"] = _integer(raw.get("steps", 12), key="steps", stage=stage)
     elif action_type == "openApp":
         action["name"] = _require_str(raw, "name", stage=stage)
+        bundle_id = str(raw.get("bundleId") or "").strip()
+        builtin_bundle_id = BUILTIN_APP_BUNDLE_IDS.get(normalize_text(action["name"]))
+        if bundle_id or builtin_bundle_id:
+            action["bundleId"] = bundle_id or builtin_bundle_id
+        strategy = str(raw.get("strategy") or "auto").strip()
+        if strategy not in {"auto", "bundle", "spotlight"}:
+            raise CoretapError("ACTION_SCHEMA_INVALID", "openApp strategy must be auto, bundle, or spotlight", category="usage", stage=stage)
+        action["strategy"] = strategy
+        action["killExisting"] = bool(raw.get("killExisting", True))
         action["searchTarget"] = str(raw.get("searchTarget") or "the Search button at the bottom center of the iOS home screen")
-        action["resultTarget"] = str(raw.get("resultTarget") or f"the large {action['name']} app icon on the left side of the Best Search Result card in Spotlight search results")
+        action["resultTarget"] = str(raw.get("resultTarget") or f"the {action['name']} app icon in Spotlight search results")
+    elif action_type == "openUrl":
+        action["url"] = _require_str(raw, "url", stage=stage)
+        action["timeoutSec"] = _number(raw.get("timeoutSec", raw.get("timeout", 8.0)), key="timeoutSec", stage=stage)
+        if action["timeoutSec"] <= 0:
+            raise CoretapError("ACTION_SCHEMA_INVALID", "openUrl timeoutSec must be > 0", category="usage", stage=stage)
     elif action_type == "typeText":
         action["text"] = _require_str(raw, "text", stage=stage)
         action["charDelayMs"] = _integer(raw.get("charDelayMs", 40), key="charDelayMs", stage=stage)
@@ -974,62 +2141,40 @@ def _normalize_step_action(raw: dict[str, Any]) -> dict[str, Any]:
         action["anchorY"] = _number(raw.get("anchorY", anchor.get("y", 0.5)), key="anchorY", stage=stage)
         action["steps"] = _integer(raw.get("steps", 30), key="steps", stage=stage)
         action["durationMs"] = _integer(raw.get("durationMs", 600), key="durationMs", stage=stage)
+    elif action_type == "appSwitcher":
+        start = raw.get("start") if isinstance(raw.get("start"), dict) else {}
+        end = raw.get("end") if isinstance(raw.get("end"), dict) else {}
+        action["start"] = {
+            "x": _number(raw.get("startX", start.get("x", 0.5)), key="startX", stage=stage),
+            "y": _number(raw.get("startY", start.get("y", 0.98)), key="startY", stage=stage),
+            "space": "normalized",
+            "reference": "source",
+        }
+        action["end"] = {
+            "x": _number(raw.get("endX", end.get("x", 0.5)), key="endX", stage=stage),
+            "y": _number(raw.get("endY", end.get("y", 0.45)), key="endY", stage=stage),
+            "space": "normalized",
+            "reference": "source",
+        }
+        action["steps"] = _integer(raw.get("steps", 40), key="steps", stage=stage)
+        action["durationMs"] = _integer(raw.get("durationMs", 1200), key="durationMs", stage=stage)
+    elif action_type == "terminateApp":
+        action["bundleId"] = _require_str(raw, "bundleId", stage=stage)
+        action["signal"] = _integer(raw.get("signal", 9), key="signal", stage=stage)
+    elif action_type == "uninstallApp":
+        name = str(raw.get("name") or "").strip()
+        bundle_id = str(raw.get("bundleId") or "").strip()
+        builtin_bundle_id = BUILTIN_APP_BUNDLE_IDS.get(normalize_text(name)) if name else None
+        if not bundle_id and not builtin_bundle_id:
+            field = "bundleId or a known app name" if name else "bundleId"
+            raise CoretapError("ACTION_SCHEMA_INVALID", f"action is missing {field}", category="usage", stage=stage)
+        if name:
+            action["name"] = name
+        action["bundleId"] = bundle_id or builtin_bundle_id
+        action["ignoreMissing"] = bool(raw.get("ignoreMissing", True))
     elif action_type == "wait":
         action["ms"] = _integer(raw.get("ms", 700), key="ms", stage=stage)
     return action
-
-
-def _normalize_postcondition(raw: Any) -> dict[str, Any]:
-    if not isinstance(raw, dict):
-        raise CoretapError("ACTION_SCHEMA_INVALID", "postcondition must be a JSON object", category="usage", stage="step-postcondition")
-    kind = str(raw.get("type") or raw.get("kind") or "").strip()
-    if kind in {"expectText", "text"}:
-        kind = "textVisible"
-    elif kind in {"expectNoText", "noText"}:
-        kind = "textAbsent"
-    if kind not in {"textVisible", "textAbsent", "screenChanged"}:
-        raise CoretapError(
-            "ACTION_SCHEMA_INVALID",
-            f"Unsupported postcondition type: {kind or '<missing>'}",
-            category="usage",
-            stage="step-postcondition",
-        )
-    item = {"type": kind}
-    if kind in {"textVisible", "textAbsent"}:
-        item["text"] = _require_str(raw, "text", stage="step-postcondition")
-        item["caseSensitive"] = bool(raw.get("caseSensitive", False))
-        item["minConfidence"] = _number(raw.get("minConfidence", 0.0), key="minConfidence", stage="step-postcondition")
-        match_mode = str(raw.get("matchMode") or raw.get("mode") or "contains").strip()
-        if match_mode not in {"contains", "exact"}:
-            raise CoretapError(
-                "ACTION_SCHEMA_INVALID",
-                "text postcondition matchMode must be contains or exact",
-                category="usage",
-                stage="step-postcondition",
-            )
-        item["matchMode"] = match_mode
-    return item
-
-
-def _step_postconditions(args: argparse.Namespace, action: dict[str, Any]) -> list[dict[str, Any]]:
-    raw_items = action.get("postconditions") or []
-    if not isinstance(raw_items, list):
-        raise CoretapError("ACTION_SCHEMA_INVALID", "postconditions must be an array", category="usage", stage="step-postcondition")
-    items = [_normalize_postcondition(item) for item in raw_items]
-    for text in getattr(args, "expect_text", []) or []:
-        items.append({"type": "textVisible", "text": text, "caseSensitive": False, "minConfidence": 0.0, "matchMode": "exact"})
-    for text in getattr(args, "expect_no_text", []) or []:
-        items.append({"type": "textAbsent", "text": text, "caseSensitive": False, "minConfidence": 0.0, "matchMode": "exact"})
-    if getattr(args, "expect_change", False):
-        items.append({"type": "screenChanged"})
-    if getattr(args, "no_ocr", False) and any(item["type"] in {"textVisible", "textAbsent"} for item in items):
-        raise CoretapError(
-            "ACTION_SCHEMA_INVALID",
-            "text postconditions require OCR; remove --no-ocr",
-            category="usage",
-            stage="step-postcondition",
-        )
-    return items
 
 
 def _observation_tokens(observation: dict[str, Any]) -> list[OcrToken]:
@@ -1058,392 +2203,384 @@ def _observation_tokens(observation: dict[str, Any]) -> list[OcrToken]:
     return tokens
 
 
-def _find_observation_text(
-    observation: dict[str, Any],
-    text: str,
-    *,
-    case_sensitive: bool,
-    min_confidence: float,
-    match_mode: str = "contains",
-) -> dict[str, Any] | None:
-    tokens = [token for token in _observation_tokens(observation) if token.confidence >= min_confidence]
-    if match_mode == "exact":
-        for candidate in find_exact_text_candidates(tokens, text, case_sensitive=case_sensitive, min_confidence=min_confidence):
-            if candidate.get("matchedKind") == "exact":
-                return candidate
-        return None
-    return find_text(tokens, text, case_sensitive=case_sensitive)
-
-
-def _token_center_normalized(token: dict[str, Any]) -> dict[str, float] | None:
-    center = token.get("normalized") if isinstance(token, dict) else None
-    if not isinstance(center, dict):
-        return None
-    try:
-        x = float(center["x"])
-        y = float(center["y"])
-    except (KeyError, TypeError, ValueError):
-        return None
-    if not (0 <= x <= 1 and 0 <= y <= 1):
-        return None
-    return {"x": x, "y": y}
-
-
-def _token_bbox_normalized(token: dict[str, Any], observation: dict[str, Any]) -> dict[str, float] | None:
-    bbox = token.get("bboxPx") if isinstance(token, dict) else None
-    frame = observation.get("frame") if isinstance(observation, dict) else None
-    if not isinstance(bbox, dict) or not isinstance(frame, dict):
-        return None
-    try:
-        frame_width = float(frame["widthPx"])
-        frame_height = float(frame["heightPx"])
-        left = float(bbox["x"])
-        top = float(bbox["y"])
-        width = float(bbox["width"])
-        height = float(bbox["height"])
-    except (KeyError, TypeError, ValueError):
-        return None
-    if frame_width <= 0 or frame_height <= 0 or width <= 0 or height <= 0:
-        return None
-    return {
-        "x": min(1.0, max(0.0, left / frame_width)),
-        "y": min(1.0, max(0.0, top / frame_height)),
-        "width": min(1.0, max(0.0, width / frame_width)),
-        "height": min(1.0, max(0.0, height / frame_height)),
-    }
-
-
-def _visible_paste_menu_point(token: dict[str, Any], observation: dict[str, Any]) -> dict[str, float] | None:
-    center = _token_center_normalized(token)
-    if center is None:
-        return None
-    text = str(token.get("text") or "")
-    normalized = normalize_text(text)
-    bbox = _token_bbox_normalized(token, observation)
-    if bbox is None:
-        return center
-
-    compact = "".join(ch for ch in text if not ch.isspace())
-    compact_casefold = compact.casefold()
-    paste_index = compact.find("粘贴")
-    paste_width = 2
-    if paste_index < 0:
-        paste_index = compact.find("粘貼")
-    if paste_index < 0:
-        paste_index = compact_casefold.find("paste")
-        paste_width = 5
-    if paste_index < 0 and "填充" in compact:
-        x = bbox["x"] + bbox["width"] * 0.22
-        return {"x": min(0.98, max(0.02, x)), "y": center["y"]}
-    if paste_index < 0:
-        return center
-
-    has_neighbor = (
-        "自动填充" in compact
-        or "autofill" in normalized
-        or len(compact) > paste_width + 1
-    )
-    if not has_neighbor:
-        return center
-
-    glyph_count = max(len(compact), paste_width)
-    ratio = (paste_index + (paste_width / 2)) / glyph_count
-    x = bbox["x"] + bbox["width"] * min(0.92, max(0.08, ratio))
-    return {"x": min(0.98, max(0.02, x)), "y": center["y"]}
-
-
-def _observation_ocr_tokens_json(observation: dict[str, Any]) -> list[dict[str, Any]]:
-    ocr = observation.get("ocr") if isinstance(observation, dict) else None
-    if not isinstance(ocr, dict) or not ocr.get("enabled"):
-        return []
-    return [item for item in ocr.get("tokens") or [] if isinstance(item, dict)]
-
-
-def _text_entry_context(observation: dict[str, Any]) -> dict[str, Any]:
-    tokens = _observation_ocr_tokens_json(observation)
-    anchor_candidates: list[dict[str, Any]] = []
-    keyboard_marker_count = 0
-    has_edit_menu = False
-    edit_menu_anchor: dict[str, Any] | None = None
-    app_store_search_context = _looks_like_app_store_search_tokens(tokens)
-
+def _text_near_anchor(observation: dict[str, Any], anchor: dict[str, float]) -> list[OcrToken]:
+    tokens = _observation_tokens(observation)
+    near: list[OcrToken] = []
+    y_tolerance = 0.09 if anchor["y"] < 0.22 else 0.055
     for token in tokens:
-        text = str(token.get("text") or "")
-        normalized = normalize_text(text)
-        center = _token_center_normalized(token)
-        if center is None:
+        center_x = token.left + token.width / 2
+        center_y = token.top + token.height / 2
+        frame = observation.get("frame") if isinstance(observation, dict) else {}
+        try:
+            normalized_x = center_x / float(frame["widthPx"])
+            normalized_y = center_y / float(frame["heightPx"])
+        except (KeyError, TypeError, ValueError, ZeroDivisionError):
             continue
-        if "粘贴" in text or "粘貼" in text or "填充" in text or "paste" in normalized or "autofill" in normalized:
-            has_edit_menu = True
-            if edit_menu_anchor is None:
-                menu_point = _visible_paste_menu_point(token, observation) or center
-                edit_menu_anchor = {
-                    "source": "edit-menu",
-                    "point": menu_point,
-                    "pointKind": "visible-paste-menu",
-                    "token": token,
-                }
-        if _looks_like_top_search_content_token(token, observation, normalized) and (
-            _looks_like_search_query_prefix(normalized) or app_store_search_context
-        ):
-            anchor_candidates.append(
-                {
-                    "priority": 0,
-                    "source": "active-search-field",
-                    "point": _search_field_anchor_point(token, observation) or center,
-                    "pointKind": "inferred-active-search-field",
-                    "token": token,
-                }
-            )
-        elif ("游戏" in text and "故事" in text) or ("game" in normalized and "app" in normalized):
-            anchor_candidates.append({"priority": 0, "source": "search-placeholder", "point": center, "token": token})
-        elif _looks_like_search_field_token(text, normalized) and _search_field_token_y_is_plausible(token, normalized):
-            anchor_candidates.append(
-                {
-                    "priority": 1,
-                    "source": "search-field",
-                    "point": _search_field_anchor_point(token, observation) or center,
-                    "pointKind": "inferred-search-field-center",
-                    "token": token,
-                }
-            )
-        elif (normalized in {"空格", "space", "123", "换行", "return"} or (len(normalized) == 1 and normalized.isascii() and normalized.isalnum())) and center["y"] >= 0.6:
-            keyboard_marker_count += 1
-
-    anchor = None
-    if edit_menu_anchor is not None:
-        anchor = edit_menu_anchor
-    elif anchor_candidates:
-        anchor = sorted(anchor_candidates, key=lambda item: (item["priority"], item["point"]["y"]))[0]
-    elif _looks_like_spotlight_suggestions(tokens):
-        anchor = {
-            "priority": 2,
-            "source": "spotlight-bottom-search",
-            "point": {"x": 0.5, "y": 0.925},
-            "pointKind": "inferred-spotlight-bottom-search",
-        }
-
-    ready = bool(anchor or has_edit_menu or keyboard_marker_count >= 3)
-    return {
-        "schema": "coretap.text-entry-context.v1",
-        "ready": ready,
-        "reason": "text input context is visible" if ready else "no focused text input context was visible before typing",
-        "anchor": anchor,
-        "hasEditMenu": has_edit_menu,
-        "keyboardMarkerCount": keyboard_marker_count,
-        "tokenCount": len(tokens),
-    }
+        if abs(normalized_y - anchor["y"]) <= y_tolerance and abs(normalized_x - anchor["x"]) <= 0.42:
+            near.append(token)
+    return near
 
 
-def _source_ocr_text_entry_context(args: argparse.Namespace, before: dict[str, Any], run_dir: Path) -> dict[str, Any] | None:
-    source_frame = before.get("sourceFrame") if isinstance(before, dict) else None
-    preview_frame = before.get("frame") if isinstance(before, dict) else None
-    if not isinstance(source_frame, dict) or not source_frame.get("path"):
-        return None
-    if isinstance(preview_frame, dict) and source_frame.get("path") == preview_frame.get("path"):
-        return None
-
-    image = Path(str(source_frame["path"]))
-    tokens, raw, selected_engine = _run_observe_ocr(image, args)
-    filtered = [token for token in tokens if token.confidence >= args.min_confidence]
-    token_json = [
-        _ocr_token_json(token, index=index, frame_width=source_frame["widthPx"], frame_height=source_frame["heightPx"])
-        for index, token in enumerate(filtered)
-    ]
-    label = "step-before-source-ocr"
-    _write_ocr_artifacts(run_dir, label, raw)
-    observation = {
-        "schema": "coretap.observe.result.v1",
-        "artifactDir": before.get("artifactDir"),
-        "frame": source_frame,
-        "sourceFrame": source_frame,
-        "ocr": {
-            "schema": "coretap.ocr.page.v1",
-            "enabled": True,
-            "lang": args.lang,
-            "psm": args.psm,
-            "engineMode": args.ocr_engine,
-            "selectedEngine": selected_engine,
-            "minConfidence": args.min_confidence,
-            "tokenCount": len(token_json),
-            "rawTokenCount": len(tokens),
-            "plainText": "\n".join(token["text"] for token in token_json),
-            **_ocr_summary(raw),
-            "tokens": token_json,
-        },
-    }
-    write_json(run_dir / f"{label}.observe.result.json", observation)
-    context = _text_entry_context(observation)
-    context["source"] = "source-ocr"
-    return context
-
-
-def _looks_like_spotlight_suggestions(tokens: list[dict[str, Any]]) -> bool:
-    normalized_items = [normalize_text(str(token.get("text") or "")).replace(" ", "") for token in tokens]
-    joined = " ".join(normalized_items)
-    has_siri_suggestions = any("siri建议" in item or ("siri" in item and "建议" in item) for item in normalized_items)
-    has_less_content = any("更少内容" in item for item in normalized_items)
-    if has_siri_suggestions and has_less_content:
-        return True
-
-    suggestion_markers = 0
-    for marker in ("appstore", "safari", "相机", "健康", "天气", "扫一扫", "邮件"):
-        if marker in joined:
-            suggestion_markers += 1
-    return has_siri_suggestions and suggestion_markers >= 2
-
-
-def _looks_like_app_store_search_tokens(tokens: list[dict[str, Any]]) -> bool:
-    normalized_items = [normalize_text(str(token.get("text") or "")).replace(" ", "") for token in tokens]
-    joined = " ".join(normalized_items)
-    has_search_tab = "搜索" in joined or "search" in joined
-    has_app_store_tabs = ("today" in joined or "游戏" in joined) and ("app" in joined or "arcade" in joined)
-    return has_search_tab and has_app_store_tabs
-
-
-def _looks_like_top_search_content_token(token: dict[str, Any], observation: dict[str, Any], normalized: str) -> bool:
-    if not normalized or normalized.replace(":", "").isdigit():
-        return False
-    bbox = _token_bbox_normalized(token, observation)
-    if bbox is None:
-        return False
-    top = bbox["y"]
-    if not (0.055 <= top <= 0.14):
-        return False
-    compact = normalized.replace(" ", "")
-    if compact in {"100", "wifi", "lte", "5g"}:
-        return False
-    return True
-
-
-def _looks_like_search_query_prefix(normalized: str) -> bool:
-    compact = normalized.replace(" ", "").replace(".", "")
-    return compact == "q" or (compact.startswith("q") and len(compact) > 1)
-
-
-def _looks_like_spotlight_results(observation: dict[str, Any]) -> bool:
+def _replace_decision_from_before_observation(observation: dict[str, Any], anchor: dict[str, float]) -> dict[str, Any]:
     ocr = observation.get("ocr") if isinstance(observation, dict) else None
     if not isinstance(ocr, dict) or not ocr.get("enabled"):
-        return False
-    plain_text = str(ocr.get("plainText") or "")
-    if not plain_text:
-        plain_text = " ".join(str(token.get("text") or "") for token in ocr.get("tokens") or [] if isinstance(token, dict))
-    plain = normalize_text(plain_text)
-    compact = plain.replace(" ", "")
-    return "最佳搜索结果" in compact or "在app中搜索" in compact
-
-
-def _looks_like_spotlight_overlay(observation: dict[str, Any]) -> bool:
-    return _looks_like_spotlight_results(observation) or _looks_like_spotlight_suggestions(_observation_ocr_tokens_json(observation))
-
-
-def _visible_app_label_anchor(observation: dict[str, Any], app_name: str) -> dict[str, Any] | None:
-    target = normalize_text(app_name).replace(" ", "")
-    if not target:
-        return None
-    for token in _observation_ocr_tokens_json(observation):
-        text = str(token.get("text") or "")
-        normalized = normalize_text(text)
-        if normalized.replace(" ", "") != target:
-            continue
-        center = _token_center_normalized(token)
-        if center is None or center["y"] > 0.62:
-            continue
-        point = {"x": center["x"], "y": max(0.06, center["y"] - 0.07)}
         return {
-            "schema": "coretap.visible-app-label-anchor.v1",
-            "app": app_name,
-            "source": "ocr-label",
-            "label": token,
-            "point": point,
+            "schema": "coretap.typeText.replace-decision.v1",
+            "status": "unknown",
+            "shouldClear": True,
+            "reason": "before observation has no OCR",
         }
+    near_tokens = [token for token in _text_near_anchor(observation, anchor) if token.text.strip()]
+    texts = [token.text.strip() for token in near_tokens]
+    if not texts:
+        return {
+            "schema": "coretap.typeText.replace-decision.v1",
+            "status": "empty",
+            "shouldClear": False,
+            "reason": "no OCR text near text-entry anchor",
+            "nearText": [],
+        }
+    joined = " ".join(texts)
+    normalized = normalize_text(joined).casefold()
+    placeholder_like = any(marker in normalized for marker in TEXT_ENTRY_PLACEHOLDER_MARKERS)
+    return {
+        "schema": "coretap.typeText.replace-decision.v1",
+        "status": "placeholder" if placeholder_like else "text",
+        "shouldClear": not placeholder_like,
+        "reason": "placeholder text should not be cleared with keyboard shortcuts" if placeholder_like else "existing text is visible near text-entry anchor",
+        "nearText": texts[:8],
+    }
+
+
+def _resolve_type_text_paste_at(
+    args: argparse.Namespace,
+    action: dict[str, Any],
+    context: dict[str, Any],
+) -> str | dict[str, Any] | None:
+    explicit = action.get("pasteAt")
+    if explicit is not None:
+        context["anchor"] = {"source": "explicit", "point": explicit}
+        return explicit
+    text = str(action.get("text") or "")
+    if _is_unshifted_virtual_keyboard_text(text):
+        return None
+    anchor = _last_text_entry_anchor(args)
+    if anchor is None:
+        context["ready"] = False
+        context["reason"] = "paste-backed typeText requires a recent tap focus anchor or explicit pasteAt"
+        raise CoretapError(
+            "TEXT_INPUT_TARGET_UNKNOWN",
+            "typeText requires a recent tap focus anchor for this text; tap the text field first or pass pasteAt",
+            category="usage",
+            stage="type",
+            details={
+                "textLength": len(text),
+                "backend": getattr(args, "backend", None),
+                "device": getattr(args, "device", None),
+                "anchorMaxAgeMs": TEXT_ENTRY_ANCHOR_MAX_AGE_MS,
+            },
+        )
+    point = anchor["point"]
+    resolved = {"x": point["x"], "y": point["y"], "source": "last-tap"}
+    context["anchor"] = {
+        "source": "last-tap",
+        "point": {"x": point["x"], "y": point["y"]},
+        "ageMs": anchor.get("ageMs"),
+        "target": anchor.get("target"),
+        "actionType": anchor.get("actionType"),
+    }
+    return resolved
+
+
+def _anchor_point_from_value(value: str | dict[str, Any], *, source: str) -> dict[str, Any]:
+    if isinstance(value, str):
+        x, y = _parse_xy_pair(value, option="pasteAt")
+        return {"x": x, "y": y, "source": source}
+    try:
+        x = float(value["x"])
+        y = float(value["y"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise CoretapError(
+            "ACTION_SCHEMA_INVALID",
+            "typeText pasteAt must contain normalized x and y",
+            category="usage",
+            stage="type",
+            details={"pasteAt": value},
+        ) from exc
+    if not (0 <= x <= 1 and 0 <= y <= 1):
+        raise CoretapError(
+            "INVALID_POINT",
+            "typeText pasteAt must be normalized coordinates between 0 and 1",
+            category="usage",
+            stage="type",
+            details={"pasteAt": value},
+        )
+    return {"x": x, "y": y, "source": str(value.get("source") or source)}
+
+
+def _resolve_keyboard_text_focus_anchor(
+    args: argparse.Namespace,
+    paste_at: str | dict[str, Any] | None,
+    context: dict[str, Any],
+) -> dict[str, Any] | None:
+    if paste_at is not None:
+        resolved = _anchor_point_from_value(paste_at, source="explicit")
+        context["anchor"] = {"source": resolved["source"], "point": {"x": resolved["x"], "y": resolved["y"]}}
+        return resolved
+    anchor = _last_text_entry_anchor(args)
+    if anchor is None:
+        context["reason"] = "no recent text-entry anchor; keyboard input will rely on the currently focused field"
+        return None
+    point = anchor["point"]
+    context["anchor"] = {
+        "source": "last-tap",
+        "point": {"x": point["x"], "y": point["y"]},
+        "ageMs": anchor.get("ageMs"),
+        "target": anchor.get("target"),
+        "actionType": anchor.get("actionType"),
+    }
+    return {"x": point["x"], "y": point["y"], "source": "last-tap"}
+
+
+_PASTE_MENU_LABELS = ("粘贴", "粘貼", "Paste")
+_PASTE_MENU_FUZZY_MARKERS = ("粘", "贴", "貼")
+_PASTE_MENU_REJECT_MARKERS = ("自动填充", "自動填充", "autofill")
+_TEXT_INPUT_VISUAL_ATTEMPTS = 2
+
+
+def _set_device_pasteboard_text(args: argparse.Namespace, text: str, *, verify: bool = True) -> dict[str, Any]:
+    backend = backend_for(
+        args.backend,
+        developer_dir=getattr(args, "developer_dir", None),
+        coredevice_tunnel_mode=getattr(args, "coredevice_tunnel_mode", None),
+    )
+    return backend.set_pasteboard_text(args.device, text, verify=verify, dry_run=getattr(args, "dry_run", False))
+
+
+def _match_center_normalized(match: dict[str, Any], frame: dict[str, Any]) -> dict[str, float]:
+    box = match["matchedBoxPx"]
+    width = float(frame["widthPx"])
+    height = float(frame["heightPx"])
+    return {
+        "x": (float(box["x"]) + float(box["width"]) / 2) / width,
+        "y": (float(box["y"]) + float(box["height"]) / 2) / height,
+    }
+
+
+def _match_label_center_normalized(match: dict[str, Any], label: str, frame: dict[str, Any]) -> dict[str, float]:
+    box = match["matchedBoxPx"]
+    box_x = float(box["x"])
+    box_y = float(box["y"])
+    box_width = float(box["width"])
+    box_height = float(box["height"])
+    center_x = box_x + box_width / 2
+    if match.get("matchedKind") == "token_contains":
+        text = str(match.get("matchedText") or "")
+        folded_text = text.casefold()
+        folded_label = label.casefold()
+        start = folded_text.find(folded_label)
+        if start >= 0 and text:
+            center_index = start + len(label) / 2
+            center_x = box_x + box_width * (center_index / max(len(text), 1))
+    width = float(frame["widthPx"])
+    height = float(frame["heightPx"])
+    return {
+        "x": center_x / width,
+        "y": (box_y + box_height / 2) / height,
+    }
+
+
+def _distance_from_anchor(point: dict[str, float], anchor: dict[str, float]) -> float:
+    return ((point["x"] - anchor["x"]) ** 2 + (point["y"] - anchor["y"]) ** 2) ** 0.5
+
+
+def _paste_menu_ocr_candidates(observation: dict[str, Any], anchor: dict[str, float]) -> list[dict[str, Any]]:
+    tokens = _observation_tokens(observation)
+    frame = observation["frame"]
+    candidates: list[dict[str, Any]] = []
+    seen: set[tuple[int, int, str]] = set()
+    for label in _PASTE_MENU_LABELS:
+        for match in find_exact_text_candidates(tokens, label, case_sensitive=False, min_confidence=0.0):
+            center = _match_label_center_normalized(match, label, frame)
+            distance = _distance_from_anchor(center, anchor)
+            if distance > 0.55:
+                continue
+            token_range = match.get("matchedTokenRange") or {}
+            key = (int(token_range.get("start", -1)), int(token_range.get("endExclusive", -1)), label)
+            if key in seen:
+                continue
+            seen.add(key)
+            candidates.append(
+                {
+                    "schema": "coretap.paste-menu.candidate.v1",
+                    "source": "ocr",
+                    "label": label,
+                    "point": center,
+                    "distanceFromAnchor": distance,
+                    "match": match,
+                }
+            )
+    if candidates:
+        return sorted(candidates, key=lambda item: (item["distanceFromAnchor"], -float(item["match"].get("matchedTokenMeanConfidence", 0.0))))
+
+    frame_width = float(frame["widthPx"])
+    frame_height = float(frame["heightPx"])
+    for index, token in enumerate(tokens):
+        text = token.text.strip()
+        folded = text.casefold()
+        if not text or not any(marker in folded for marker in _PASTE_MENU_FUZZY_MARKERS):
+            continue
+        box = {"x": token.left, "y": token.top, "width": token.width, "height": token.height}
+        center_y = (float(token.top) + float(token.height) / 2) / frame_height
+        token_center_x = (float(token.left) + float(token.width) / 2) / frame_width
+        if anchor["y"] < 0.2:
+            if not (anchor["y"] + 0.025 <= center_y <= anchor["y"] + 0.12):
+                continue
+        elif abs(center_y - anchor["y"]) > 0.13:
+            continue
+        if abs(token_center_x - anchor["x"]) > 0.28:
+            continue
+        point = {
+            "x": (float(token.left) + float(token.width) * 0.18) / frame_width,
+            "y": center_y,
+        }
+        distance = _distance_from_anchor(point, anchor)
+        candidates.append(
+            {
+                "schema": "coretap.paste-menu.candidate.v1",
+                "source": "ocr_fuzzy",
+                "label": "粘贴",
+                "point": point,
+                "distanceFromAnchor": distance,
+                "match": {
+                    "matchedText": text,
+                    "matchedEngines": [token.engine],
+                    "matchedTokenRange": {"start": index, "endExclusive": index + 1},
+                    "matchedTokenMeanConfidence": token.confidence,
+                    "matchedTokenMinimumConfidence": token.confidence,
+                    "matchedBoxPx": box,
+                    "matchedKind": "fuzzy_menu_token",
+                },
+            }
+        )
+    return sorted(candidates, key=lambda item: (item["distanceFromAnchor"], -float(item["match"].get("matchedTokenMeanConfidence", 0.0))))
+
+
+def _locate_paste_menu_with_vlm(
+    args: argparse.Namespace,
+    observation: dict[str, Any],
+    *,
+    run_dir: Path,
+    label: str,
+) -> dict[str, Any] | None:
+    if args.profile == INTERNAL_FIXTURE_PROFILE:
+        return None
+    frame = observation["frame"]
+    image = Path(frame["path"])
+    model_input = prepare_grounding_image(image, output_dir=run_dir, max_long_side=args.max_long_side)
+    target = "the visible Paste or 粘贴 item in the iOS edit menu"
+    grounded = _ground_target_with_recovery(Path(model_input["path"]), target, profile=args.profile)
+    grounded["modelInput"] = {
+        "path": model_input["path"],
+        "widthPx": model_input["widthPx"],
+        "heightPx": model_input["heightPx"],
+        "resized": model_input["resized"],
+        "maxLongSidePx": model_input["maxLongSidePx"],
+        "scale": model_input["scale"],
+    }
+    grounded = remap_grounding_to_source_frame(grounded, source_width=int(frame["widthPx"]), source_height=int(frame["heightPx"]))
+    _write_grounding_artifacts(run_dir, grounded, stem=f"{label}-vlm")
+    if grounded.get("status") != "found":
+        return None
+    normalized = dict(grounded["point"]["normalized"])
+    return {
+        "schema": "coretap.paste-menu.candidate.v1",
+        "source": "vlm",
+        "label": "Paste/粘贴",
+        "point": {"x": float(normalized["x"]), "y": float(normalized["y"])},
+        "grounding": grounded,
+    }
+
+
+def _locate_paste_menu(
+    args: argparse.Namespace,
+    observation: dict[str, Any],
+    *,
+    anchor: dict[str, float],
+    run_dir: Path,
+    label: str,
+    allow_vlm: bool = False,
+) -> dict[str, Any] | None:
+    candidates = _paste_menu_ocr_candidates(observation, anchor)
+    if candidates:
+        return {**candidates[0], "candidates": candidates}
+    if not allow_vlm:
+        return None
+    vlm_candidate = _locate_paste_menu_with_vlm(args, observation, run_dir=run_dir, label=label)
+    if vlm_candidate is not None:
+        return {**vlm_candidate, "candidates": candidates}
     return None
 
 
-def _looks_like_search_field_token(text: str, normalized: str) -> bool:
-    compact = normalized.replace(" ", "").replace(".", "")
-    if normalized == "search" or compact in {"搜索", "q搜索", "、搜索"}:
+def _text_match_is_near_anchor(match: dict[str, Any], frame: dict[str, Any], anchor: dict[str, float]) -> bool:
+    center = _match_center_normalized(match, frame)
+    if anchor["y"] < 0.2:
+        return 0.015 <= center["y"] <= min(0.24, anchor["y"] + 0.13)
+    if anchor["y"] > 0.82 and 0.04 <= center["y"] <= 0.28:
         return True
-    if compact.startswith("q") and 2 <= len(compact) <= 5:
-        tail = compact[1:]
-        if tail in {"搜素", "搜紫", "搜萦", "製索", "櫻索", "接索", "超索", "提察", "提索", "學索", "学索", "優索"}:
-            return True
-        if tail.endswith("索") and any(ch in tail for ch in "搜製櫻接超提學学優"):
-            return True
-    return False
+    return abs(center["x"] - anchor["x"]) <= 0.48 and abs(center["y"] - anchor["y"]) <= 0.1
 
 
-def _search_field_token_y_is_plausible(token: dict[str, Any], normalized: str) -> bool:
-    center = _token_center_normalized(token)
-    if center is None:
-        return False
-    if 0.06 <= center["y"] <= 0.7:
-        return True
-    compact = normalized.replace(" ", "").replace(".", "")
-    return compact.startswith("q") and 0.72 <= center["y"] <= 0.97
+def _compact_input_verification_text(text: str) -> str:
+    return re.sub(r"\s+", "", normalize_text(text))
 
 
-def _search_field_anchor_point(token: dict[str, Any], observation: dict[str, Any]) -> dict[str, float] | None:
-    center = _token_center_normalized(token)
-    if center is None:
-        return None
-    bbox = _token_bbox_normalized(token, observation)
-    if bbox is None:
-        return {"x": 0.5, "y": center["y"]}
-    text_right = bbox["x"] + bbox["width"]
-    x = max(0.35, min(0.62, text_right + 0.24))
-    return {"x": x, "y": center["y"]}
+def _find_compact_text_input_candidates(tokens: list[OcrToken], expected: str) -> list[dict[str, Any]]:
+    needle = _compact_input_verification_text(expected)
+    if len(needle) < 8:
+        return []
+    normalized = [_compact_input_verification_text(token.text) for token in tokens]
+    candidates: list[dict[str, Any]] = []
+    seen: set[tuple[int, int]] = set()
+    for start in range(len(tokens)):
+        acc = ""
+        for end in range(start, len(tokens)):
+            acc += normalized[end]
+            if acc == needle:
+                match = token_match(tokens[start : end + 1], start, end + 1)
+                match["matchedKind"] = "compact"
+                key = (match["matchedTokenRange"]["start"], match["matchedTokenRange"]["endExclusive"])
+                if key not in seen:
+                    candidates.append(match)
+                    seen.add(key)
+                break
+            if len(acc) > len(needle) + 30:
+                break
+    return candidates
 
 
-def _is_ascii_text(text: str) -> bool:
-    return all(ord(ch) < 128 for ch in text)
-
-
-def _contains_cjk(text: str) -> bool:
-    return any("\u4e00" <= ch <= "\u9fff" for ch in text)
-
-
-def _resolve_type_text_paste_at(action: dict[str, Any], context: dict[str, Any]) -> str | dict[str, Any] | None:
-    explicit = action.get("pasteAt")
-    anchor = context.get("anchor") if isinstance(context, dict) else None
-    point = anchor.get("point") if isinstance(anchor, dict) else None
-    if not _is_ascii_text(action["text"]):
-        if explicit is not None:
-            return explicit
-        if isinstance(anchor, dict) and isinstance(point, dict) and anchor.get("source") == "edit-menu":
-            return {"x": float(point["x"]), "y": float(point["y"]), "mode": "menu"}
-        return None
-    return explicit
-
-
-def _type_text_focus_anchor(action: dict[str, Any], context: dict[str, Any]) -> dict[str, Any] | None:
-    if _is_ascii_text(action["text"]) or action.get("pasteAt") is not None:
-        return None
-    anchor = context.get("anchor") if isinstance(context, dict) else None
-    point = anchor.get("point") if isinstance(anchor, dict) else None
-    if not isinstance(point, dict):
-        return None
-    if anchor.get("source") not in {"search-field", "search-placeholder", "active-search-field", "spotlight-bottom-search"}:
-        return None
-    return anchor
-
-
-def _is_search_field_target(target: str) -> bool:
-    normalized = normalize_text(target)
-    return "search" in normalized and ("field" in normalized or "bar" in normalized)
-
-
-def _search_field_tap_anchor(target: str, observation: dict[str, Any]) -> dict[str, Any] | None:
-    if not _is_search_field_target(target):
-        return None
-    context = _text_entry_context(observation)
-    anchor = context.get("anchor") if isinstance(context, dict) else None
-    if not isinstance(anchor, dict) or anchor.get("source") not in {"search-field", "search-placeholder", "active-search-field"}:
-        return None
-    point = anchor.get("point")
-    if not isinstance(point, dict):
-        return None
-    return anchor
+def _verify_text_input_near_anchor(observation: dict[str, Any], text: str, anchor: dict[str, float]) -> dict[str, Any]:
+    tokens = _observation_tokens(observation)
+    frame = observation["frame"]
+    candidates = find_exact_text_candidates(tokens, text, case_sensitive=False, min_confidence=0.0)
+    candidates.extend(_find_compact_text_input_candidates(tokens, text))
+    near = [match for match in candidates if _text_match_is_near_anchor(match, frame, anchor)]
+    if near:
+        return {
+            "schema": "coretap.text-input.verification.v1",
+            "status": "verified",
+            "expectedText": text,
+            "match": near[0],
+            "candidateCount": len(candidates),
+        }
+    return {
+        "schema": "coretap.text-input.verification.v1",
+        "status": "failed",
+        "expectedText": text,
+        "candidateCount": len(candidates),
+        "offTargetMatches": candidates[:5],
+        "reason": "expected text was not visible near the text entry anchor",
+    }
 
 
 def _tap_normalized_for_step(args: argparse.Namespace, point: dict[str, float], *, reason: str) -> dict[str, Any]:
@@ -1466,89 +2603,6 @@ def _tap_normalized_for_step(args: argparse.Namespace, point: dict[str, float], 
     }
 
 
-def _frame_digest(observation: dict[str, Any]) -> str | None:
-    frame = observation.get("frame") if isinstance(observation, dict) else None
-    return frame.get("sha256") if isinstance(frame, dict) else None
-
-
-def _evaluate_postconditions(
-    before: dict[str, Any],
-    after: dict[str, Any] | None,
-    postconditions: list[dict[str, Any]],
-) -> dict[str, Any]:
-    if not postconditions:
-        return {"schema": "coretap.step.postconditions.v1", "status": "unchecked", "checks": []}
-    checks: list[dict[str, Any]] = []
-    target_observation = after or before
-    for item in postconditions:
-        kind = item["type"]
-        if kind == "textVisible":
-            match = _find_observation_text(
-                target_observation,
-                item["text"],
-                case_sensitive=bool(item.get("caseSensitive", False)),
-                min_confidence=float(item.get("minConfidence", 0.0)),
-                match_mode=str(item.get("matchMode") or "contains"),
-            )
-            checks.append({"type": kind, "text": item["text"], "passed": bool(match), "match": match, "matchMode": item.get("matchMode") or "contains"})
-        elif kind == "textAbsent":
-            match = _find_observation_text(
-                target_observation,
-                item["text"],
-                case_sensitive=bool(item.get("caseSensitive", False)),
-                min_confidence=float(item.get("minConfidence", 0.0)),
-                match_mode=str(item.get("matchMode") or "contains"),
-            )
-            checks.append({"type": kind, "text": item["text"], "passed": match is None, "match": match, "matchMode": item.get("matchMode") or "contains"})
-        elif kind == "screenChanged":
-            before_sha = _frame_digest(before)
-            after_sha = _frame_digest(after or {})
-            checks.append({"type": kind, "passed": bool(before_sha and after_sha and before_sha != after_sha), "beforeSha256": before_sha, "afterSha256": after_sha})
-    status = "satisfied" if all(check["passed"] for check in checks) else "failed"
-    return {"schema": "coretap.step.postconditions.v1", "status": status, "checks": checks}
-
-
-def _effective_step_post_timeout_ms(args: argparse.Namespace, postconditions: list[dict[str, Any]]) -> int:
-    configured = int(getattr(args, "post_timeout_ms", 0) or 0)
-    if configured > 0:
-        return configured
-    if any(item["type"] in {"textVisible", "textAbsent"} for item in postconditions):
-        return DEFAULT_TEXT_POST_TIMEOUT_MS
-    return 0
-
-
-_PASTE_PERMISSION_ALLOW_TEXTS = ("允许粘贴", "Allow Paste")
-
-
-def _dismiss_paste_permission_prompt(args: argparse.Namespace, observation: dict[str, Any]) -> dict[str, Any] | None:
-    for text in _PASTE_PERMISSION_ALLOW_TEXTS:
-        match = _find_observation_text(observation, text, case_sensitive=False, min_confidence=0.0)
-        if not match:
-            continue
-        frame = observation.get("frame") if isinstance(observation, dict) else None
-        if not isinstance(frame, dict):
-            return None
-        try:
-            width = float(frame["widthPx"])
-            height = float(frame["heightPx"])
-            box = match["matchedBoxPx"]
-            x = (float(box["x"]) + float(box["width"]) / 2) / width
-            y = (float(box["y"]) + float(box["height"]) / 2) / height
-        except (KeyError, TypeError, ValueError, ZeroDivisionError):
-            return None
-        backend = backend_for(args.backend, developer_dir=args.developer_dir, coredevice_tunnel_mode=args.coredevice_tunnel_mode)
-        tap = backend.tap_normalized(args.device, x, y, dry_run=False)
-        return {
-            "schema": "coretap.step.recovery.v1",
-            "type": "pastePermissionPrompt",
-            "matchedText": text,
-            "match": match,
-            "point": {"normalized": {"x": x, "y": y}},
-            "tap": tap,
-        }
-    return None
-
-
 def _step_blocked(action: dict[str, Any], code: str, message: str, *, details: dict[str, Any] | None = None) -> dict[str, Any]:
     return {
         "schema": "coretap.step.execution.v1",
@@ -1560,10 +2614,35 @@ def _step_blocked(action: dict[str, Any], code: str, message: str, *, details: d
     }
 
 
+def _bundle_launch_confirmed(launch: dict[str, Any]) -> bool:
+    if launch.get("dryRun"):
+        return True
+    strategy = str(launch.get("strategy") or "")
+    backend = str(launch.get("backend") or "")
+    if strategy != "coredevice-dvt-launch" and backend != "device":
+        return True
+    try:
+        return int(launch.get("pid") or 0) > 0
+    except (TypeError, ValueError):
+        return False
+
+
 def _observation_frame(observation: dict[str, Any], *, reference: str = "source") -> dict[str, Any]:
     if reference == "preview":
         return observation["frame"]
     return observation.get("sourceFrame") or observation["frame"]
+
+
+def _step_point_to_hid(action_point: dict[str, Any], before: dict[str, Any]) -> dict[str, Any]:
+    reference = str(action_point.get("reference") or "source")
+    frame = _observation_frame(before, reference=reference)
+    return point_to_hid(
+        float(action_point["x"]),
+        float(action_point["y"]),
+        width=int(frame["widthPx"]),
+        height=int(frame["heightPx"]),
+        space=str(action_point.get("space") or "normalized"),
+    )
 
 
 def _write_grounding_artifacts(run_dir: Path, grounded: dict[str, Any], *, stem: str) -> None:
@@ -1576,21 +2655,189 @@ def _write_grounding_artifacts(run_dir: Path, grounded: dict[str, Any], *, stem:
     write_json(run_dir / f"{stem}.json", grounded)
 
 
+def _step_before_observation_needs_ocr(action: dict[str, Any]) -> bool:
+    if action.get("type") == "typeText" and _is_non_ascii_text(str(action.get("text") or "")):
+        return True
+    if action.get("type") == "typeText" and bool(action.get("replace")):
+        return True
+    return False
+
+
+def _step_action_requires_before_observation(action: dict[str, Any]) -> bool:
+    return action.get("type") not in {"terminateApp", "uninstallApp", "openUrl", "wait"}
+
+
+def _text_entry_anchor_point_for_tap(action: dict[str, Any], point: dict[str, Any], source_frame: dict[str, Any]) -> dict[str, Any]:
+    target = str(action.get("target") or "")
+    if _target_suggests_relocated_search_entry(target, point):
+        return point_to_hid(
+            0.5,
+            0.54,
+            width=int(source_frame["widthPx"]),
+            height=int(source_frame["heightPx"]),
+            space="normalized",
+        )
+    if _target_suggests_top_text_entry(target, point):
+        return point_to_hid(
+            0.5,
+            0.09,
+            width=int(source_frame["widthPx"]),
+            height=int(source_frame["heightPx"]),
+            space="normalized",
+        )
+    return point
+
+
+def _execute_step_tap_point(args: argparse.Namespace, action: dict[str, Any], before: dict[str, Any]) -> dict[str, Any]:
+    point = _step_point_to_hid(action["point"], before)
+    backend = backend_for(args.backend, developer_dir=args.developer_dir, coredevice_tunnel_mode=args.coredevice_tunnel_mode)
+    tap = backend.tap_normalized(
+        args.device,
+        point["normalized"]["x"],
+        point["normalized"]["y"],
+        dry_run=args.dry_run,
+        hid_u16=point["hidU16"],
+    )
+    anchor = _remember_text_entry_anchor(args, point, source="last-tap", action_type="tapPoint")
+    return {
+        "schema": "coretap.step.execution.v1",
+        "status": "executed",
+        "actionType": "tapPoint",
+        "strategy": "explicit_point",
+        "point": point,
+        "textEntryAnchor": anchor,
+        "tap": tap,
+    }
+
+
+def _execute_step_long_press(args: argparse.Namespace, action: dict[str, Any], before: dict[str, Any]) -> dict[str, Any]:
+    point = _step_point_to_hid(action["point"], before)
+    backend = backend_for(args.backend, developer_dir=args.developer_dir, coredevice_tunnel_mode=args.coredevice_tunnel_mode)
+    hold = backend.drag_normalized(
+        args.device,
+        point["normalized"]["x"],
+        point["normalized"]["y"],
+        point["normalized"]["x"],
+        point["normalized"]["y"],
+        dry_run=args.dry_run,
+        start_hid_u16=point["hidU16"],
+        end_hid_u16=point["hidU16"],
+        steps=action["steps"],
+        duration_ms=action["durationMs"],
+    )
+    return {
+        "schema": "coretap.step.execution.v1",
+        "status": "executed",
+        "actionType": "longPress",
+        "strategy": "explicit_point_hold",
+        "durationMs": action["durationMs"],
+        "steps": action["steps"],
+        "point": point,
+        "hold": hold,
+    }
+
+
+def _execute_step_app_switcher(args: argparse.Namespace, action: dict[str, Any], before: dict[str, Any]) -> dict[str, Any]:
+    start = _step_point_to_hid(action["start"], before)
+    end = _step_point_to_hid(action["end"], before)
+    backend = backend_for(args.backend, developer_dir=args.developer_dir, coredevice_tunnel_mode=args.coredevice_tunnel_mode)
+    gesture = backend.drag_normalized(
+        args.device,
+        start["normalized"]["x"],
+        start["normalized"]["y"],
+        end["normalized"]["x"],
+        end["normalized"]["y"],
+        dry_run=args.dry_run,
+        start_hid_u16=start["hidU16"],
+        end_hid_u16=end["hidU16"],
+        steps=action["steps"],
+        duration_ms=action["durationMs"],
+    )
+    return {
+        "schema": "coretap.step.execution.v1",
+        "status": "executed",
+        "actionType": "appSwitcher",
+        "strategy": "home_indicator_up_and_hold",
+        "start": start,
+        "end": end,
+        "steps": action["steps"],
+        "durationMs": action["durationMs"],
+        "gesture": gesture,
+    }
+
+
+def _execute_step_terminate_app(args: argparse.Namespace, action: dict[str, Any]) -> dict[str, Any]:
+    backend = backend_for(args.backend, developer_dir=args.developer_dir, coredevice_tunnel_mode=args.coredevice_tunnel_mode)
+    result = backend.terminate_app(
+        args.device,
+        action["bundleId"],
+        signal=action["signal"],
+        dry_run=args.dry_run,
+    )
+    return {
+        "schema": "coretap.step.execution.v1",
+        "status": "executed",
+        "actionType": "terminateApp",
+        "strategy": "bundle_process_signal",
+        "terminateResult": result,
+    }
+
+
+def _execute_step_uninstall_app(args: argparse.Namespace, action: dict[str, Any]) -> dict[str, Any]:
+    backend = backend_for(args.backend, developer_dir=args.developer_dir, coredevice_tunnel_mode=args.coredevice_tunnel_mode)
+    result = backend.uninstall_app(
+        args.device,
+        action["bundleId"],
+        ignore_missing=action["ignoreMissing"],
+        dry_run=args.dry_run,
+    )
+    return {
+        "schema": "coretap.step.execution.v1",
+        "status": "executed",
+        "actionType": "uninstallApp",
+        "strategy": "bundle_uninstall",
+        **({"name": action["name"]} if "name" in action else {}),
+        "bundleId": action["bundleId"],
+        "uninstallResult": result,
+    }
+
+
+def _execute_step_open_url(args: argparse.Namespace, action: dict[str, Any]) -> dict[str, Any]:
+    backend = backend_for(args.backend, developer_dir=args.developer_dir, coredevice_tunnel_mode=args.coredevice_tunnel_mode)
+    result = backend.open_url(
+        args.device,
+        action["url"],
+        timeout_sec=action["timeoutSec"],
+        dry_run=args.dry_run,
+    )
+    return {
+        "schema": "coretap.step.execution.v1",
+        "status": "executed",
+        "actionType": "openUrl",
+        "strategy": result.get("strategy") or "open-url",
+        "url": action["url"],
+        "openUrlResult": result,
+    }
+
+
+def _ground_target_with_recovery(image: Path, target: str, *, profile: str) -> dict[str, Any]:
+    try:
+        return ground_target(image, target, profile=profile)
+    except CoretapError as exc:
+        if exc.code != "MODEL_WORKER_CRASHED" or not exc.retryable:
+            raise
+        warm_model(profile)
+        result = ground_target(image, target, profile=profile)
+        result["modelRecovery"] = {
+            "schema": "coretap.model-recovery.v1",
+            "recoveredFrom": exc.code,
+            "attempts": 2,
+        }
+        return result
+
+
 def _execute_step_tap(args: argparse.Namespace, action: dict[str, Any], before: dict[str, Any], run_dir: Path) -> dict[str, Any]:
     target = action["target"]
-    search_anchor = _search_field_tap_anchor(target, before)
-    if search_anchor is not None:
-        focus = _tap_normalized_for_step(args, search_anchor["point"], reason=f"tap-{search_anchor['source']}")
-        return {
-            "schema": "coretap.step.execution.v1",
-            "status": "executed",
-            "actionType": "tap",
-            "strategy": "ocr_search_field",
-            "target": target,
-            "anchor": search_anchor,
-            "point": focus["point"],
-            "tap": focus["tap"],
-        }
     warm_model(args.profile)
     source_frame = _observation_frame(before, reference="source")
     source_image = Path(source_frame["path"])
@@ -1605,7 +2852,7 @@ def _execute_step_tap(args: argparse.Namespace, action: dict[str, Any], before: 
         }
     else:
         model_input = prepare_grounding_image(source_image, output_dir=run_dir, max_long_side=args.max_long_side)
-    grounded = ground_target(Path(model_input["path"]), target, profile=args.profile)
+    grounded = _ground_target_with_recovery(Path(model_input["path"]), target, profile=args.profile)
     grounded["modelInput"] = {
         "path": model_input["path"],
         "widthPx": model_input["widthPx"],
@@ -1620,7 +2867,6 @@ def _execute_step_tap(args: argparse.Namespace, action: dict[str, Any], before: 
         source_height=int(source_frame["heightPx"]),
     )
     if grounded.get("status") != "found":
-        grounded["safety"] = grounding_safety_diagnostics(target, grounded)
         _write_grounding_artifacts(run_dir, grounded, stem="step-grounding")
         return _step_blocked(
             action,
@@ -1628,16 +2874,7 @@ def _execute_step_tap(args: argparse.Namespace, action: dict[str, Any], before: 
             f"Target was not found: {target}",
             details={"grounding": grounded, "modelInput": model_input},
         )
-    grounded["safety"] = grounding_safety_diagnostics(target, grounded) if args.dry_run else assess_grounding_tap_safety(source_image, target, grounded)
     _write_grounding_artifacts(run_dir, grounded, stem="step-grounding")
-    safety = grounded.get("safety")
-    if not args.dry_run and isinstance(safety, dict) and not safety.get("safeToTap", False):
-        return _step_blocked(
-            action,
-            "GROUNDING_UNSAFE_TO_TAP",
-            f"Grounding was not trusted enough for a real tap: {target}",
-            details={"grounding": grounded, "safety": safety},
-        )
     point_px = grounded["point"]["framePx"]
     point = point_to_hid(
         point_px["x"],
@@ -1654,6 +2891,8 @@ def _execute_step_tap(args: argparse.Namespace, action: dict[str, Any], before: 
         dry_run=args.dry_run,
         hid_u16=point["hidU16"],
     )
+    anchor_point = _text_entry_anchor_point_for_tap(action, point, source_frame)
+    anchor = _remember_text_entry_anchor(args, anchor_point, source="last-tap", action_type="tap", target=target)
     return {
         "schema": "coretap.step.execution.v1",
         "status": "executed",
@@ -1664,26 +2903,90 @@ def _execute_step_tap(args: argparse.Namespace, action: dict[str, Any], before: 
         "modelInput": grounded.get("modelInput"),
         "grounding": grounded,
         "point": point,
+        "textEntryAnchor": anchor,
         "tap": tap,
     }
 
 
 def _execute_step_open_app(args: argparse.Namespace, action: dict[str, Any], before: dict[str, Any], run_dir: Path) -> dict[str, Any]:
     app_name = action["name"]
+    bundle_id = action.get("bundleId")
+    strategy = str(action.get("strategy") or "auto")
     search_target = str(action.get("searchTarget") or "the Search button at the bottom center of the iOS home screen")
-    result_target = str(action.get("resultTarget") or f"the large {app_name} app icon on the left side of the Best Search Result card in Spotlight search results")
+    result_target = str(action.get("resultTarget") or f"the {app_name} app icon in Spotlight search results")
+    substeps: list[dict[str, Any]] = []
     if args.dry_run:
+        resolved_strategy = "bundle-launch" if bundle_id and strategy != "spotlight" else "spotlight-search"
         return {
             "schema": "coretap.step.execution.v1",
             "status": "executed",
             "actionType": "openApp",
-            "strategy": "spotlight-search",
+            "strategy": resolved_strategy,
             "app": app_name,
+            "bundleId": bundle_id,
             "attempted": False,
             "dryRun": True,
         }
 
-    substeps: list[dict[str, Any]] = []
+    if bundle_id and strategy in {"auto", "bundle"}:
+        backend = backend_for(args.backend, developer_dir=args.developer_dir, coredevice_tunnel_mode=args.coredevice_tunnel_mode)
+        try:
+            launch = backend.launch_app(
+                args.device,
+                str(bundle_id),
+                kill_existing=bool(action.get("killExisting", True)),
+                dry_run=args.dry_run,
+            )
+            substeps.append({"name": "launch-bundle", "status": "executed", "result": launch})
+            if not _bundle_launch_confirmed(launch):
+                substeps.append(
+                    {
+                        "name": "confirm-bundle-launch",
+                        "status": "blocked",
+                        "reason": "bundle launch did not return a running process id",
+                    }
+                )
+                if strategy == "bundle":
+                    return _step_blocked(
+                        action,
+                        "APP_LAUNCH_NOT_CONFIRMED",
+                        f"Could not confirm app launch by bundle id: {app_name}",
+                        details={"bundleId": bundle_id, "launch": launch, "substeps": substeps},
+                    )
+            else:
+                command_wait(argparse.Namespace(ms=800, wait_command=None))
+                launched = _observe_into(args, run_dir=run_dir, label="open-app-after-launch", no_ocr=True)
+                substeps.append({"name": "observe-after-launch", "status": "observed", "result": launched})
+                return {
+                    "schema": "coretap.step.execution.v1",
+                    "status": "executed",
+                    "actionType": "openApp",
+                    "strategy": "bundle-launch",
+                    "app": app_name,
+                    "bundleId": bundle_id,
+                    "substeps": substeps,
+                }
+        except CoretapError as exc:
+            substeps.append(
+                {
+                    "name": "launch-bundle",
+                    "status": "blocked",
+                    "error": {
+                        "code": exc.code,
+                        "message": str(exc),
+                        "category": exc.category,
+                        "stage": exc.stage,
+                        "details": exc.details,
+                    },
+                }
+            )
+            if strategy == "bundle":
+                return _step_blocked(
+                    action,
+                    exc.code,
+                    f"Could not launch app by bundle id: {app_name}",
+                    details={"bundleId": bundle_id, "substeps": substeps},
+                )
 
     press_args = argparse.Namespace(**vars(args))
     press_args.button = "home"
@@ -1693,7 +2996,7 @@ def _execute_step_open_app(args: argparse.Namespace, action: dict[str, Any], bef
     substeps.append({"name": "press-home", "status": "executed", "result": press_result})
     command_wait(argparse.Namespace(ms=700, wait_command=None))
 
-    home = _observe_into(args, run_dir=run_dir, label="open-app-home")
+    home = _observe_into(args, run_dir=run_dir, label="open-app-home", no_ocr=True)
     search_tap = _execute_step_tap(args, {"schema": "coretap.action.v2", "type": "tap", "target": search_target}, home, run_dir)
     substeps.append({"name": "tap-spotlight-search", "status": search_tap.get("status"), "result": search_tap})
     if search_tap.get("status") == "blocked":
@@ -1705,24 +3008,7 @@ def _execute_step_open_app(args: argparse.Namespace, action: dict[str, Any], bef
         )
     command_wait(argparse.Namespace(ms=800, wait_command=None))
 
-    search = _observe_into(args, run_dir=run_dir, label="open-app-search")
-    visible_anchor = _visible_app_label_anchor(search, app_name)
-    if visible_anchor is not None:
-        visible_tap = _tap_normalized_for_step(args, visible_anchor["point"], reason="open-visible-app-label")
-        substeps.append({"name": "tap-visible-app-label", "status": "executed", "result": {"anchor": visible_anchor, "tap": visible_tap}})
-        command_wait(argparse.Namespace(ms=1500, wait_command=None))
-        visible_launch = _observe_into(args, run_dir=run_dir, label="open-app-visible-after-launch")
-        substeps.append({"name": "observe-visible-after-launch", "status": "observed", "result": visible_launch})
-        if not _looks_like_spotlight_overlay(visible_launch):
-            return {
-                "schema": "coretap.step.execution.v1",
-                "status": "executed",
-                "actionType": "openApp",
-                "strategy": "spotlight-visible-label",
-                "app": app_name,
-                "substeps": substeps,
-            }
-
+    search = _observe_into(args, run_dir=run_dir, label="open-app-search", no_ocr=True)
     type_action = {
         "schema": "coretap.action.v2",
         "type": "typeText",
@@ -1746,7 +3032,7 @@ def _execute_step_open_app(args: argparse.Namespace, action: dict[str, Any], bef
         )
     command_wait(argparse.Namespace(ms=900, wait_command=None))
 
-    results = _observe_into(args, run_dir=run_dir, label="open-app-results")
+    results = _observe_into(args, run_dir=run_dir, label="open-app-results", no_ocr=True)
     result_tap = _execute_step_tap(args, {"schema": "coretap.action.v2", "type": "tap", "target": result_target}, results, run_dir)
     substeps.append({"name": "tap-app-result", "status": result_tap.get("status"), "result": result_tap})
     if result_tap.get("status") == "blocked":
@@ -1758,15 +3044,8 @@ def _execute_step_open_app(args: argparse.Namespace, action: dict[str, Any], bef
         )
     command_wait(argparse.Namespace(ms=1500, wait_command=None))
 
-    launched = _observe_into(args, run_dir=run_dir, label="open-app-after-launch")
+    launched = _observe_into(args, run_dir=run_dir, label="open-app-after-launch", no_ocr=True)
     substeps.append({"name": "observe-after-launch", "status": "observed", "result": launched})
-    if _looks_like_spotlight_overlay(launched):
-        return _step_blocked(
-            action,
-            "FLOW_FAILED",
-            f"Spotlight result tap did not open app: {app_name}",
-            details={"substeps": substeps},
-        )
 
     return {
         "schema": "coretap.step.execution.v1",
@@ -1778,50 +3057,322 @@ def _execute_step_open_app(args: argparse.Namespace, action: dict[str, Any], bef
     }
 
 
+def _type_text_step_strategy(type_result: dict[str, Any]) -> str:
+    input_method = str(type_result.get("inputMethod") or "").strip()
+    if input_method == "coredevice-pinyin-keyboard":
+        return "coredevice_pinyin_keyboard"
+    if input_method == "coredevice-pasteboard-keyboard-shortcut":
+        return "pasteboard_keyboard_shortcut"
+    if input_method == "coredevice-pasteboard-visual-menu":
+        return "visual_paste_verified"
+    if input_method in {"coredevice-hid-keyboard", "coredevice-virtual-keyboard"}:
+        return "coredevice_hid_keyboard"
+    if input_method == "coredevice-pasteboard-edit-menu":
+        return "pasteboard_edit_menu"
+    if input_method:
+        return input_method.replace("-", "_")
+    return "coredevice_text_input"
+
+
+def _execute_step_type_text(args: argparse.Namespace, action: dict[str, Any], before: dict[str, Any], run_dir: Path) -> dict[str, Any]:
+    context = {
+        "schema": "coretap.text-entry-context.v1",
+        "ready": True,
+        "source": "vlm-first",
+        "reason": "typeText no longer uses OCR to infer focus; focus text fields with an explicit VLM tap step before typing",
+        "anchor": None,
+    }
+    ns = argparse.Namespace(**vars(args))
+    ns.text = action["text"]
+    ns.text_query = None
+    ns.char_delay_ms = action["charDelayMs"]
+    ns.inter_delay_ms = action["interDelayMs"]
+    ns.paste_at = _resolve_type_text_paste_at(args, action, context)
+    ns.paste_hold_ms = action["pasteHoldMs"]
+    ns.verify_timeout_ms = action["verifyTimeoutMs"]
+    ns.no_verify = action["noVerify"]
+    ns.replace = action["replace"]
+    if _is_unshifted_virtual_keyboard_text(action["text"]):
+        focus_anchor = _resolve_keyboard_text_focus_anchor(args, ns.paste_at, context)
+        focus_result = None
+        if focus_anchor is not None:
+            if ns.replace:
+                replace_decision = _replace_decision_from_before_observation(
+                    before,
+                    {"x": float(focus_anchor["x"]), "y": float(focus_anchor["y"])},
+                )
+                context["replaceDecision"] = replace_decision
+                if not replace_decision.get("shouldClear", True):
+                    ns.replace = False
+            focus_result = _tap_normalized_for_step(
+                args,
+                {"x": float(focus_anchor["x"]), "y": float(focus_anchor["y"])},
+                reason="focus-text-field-before-keyboard-input",
+            )
+            command_wait(argparse.Namespace(ms=150, wait_command=None))
+        type_result = command_type(ns)
+        return {
+            "schema": "coretap.step.execution.v1",
+            "status": "executed",
+            "actionType": "typeText",
+            "strategy": _type_text_step_strategy(type_result),
+            "textEntryContext": context,
+            "focusResult": focus_result,
+            "resolvedPasteAt": ns.paste_at,
+            "typeResult": type_result,
+        }
+    focus_anchor = _anchor_point_from_value(ns.paste_at, source="last-tap")
+    if ns.replace:
+        replace_decision = _replace_decision_from_before_observation(
+            before,
+            {"x": float(focus_anchor["x"]), "y": float(focus_anchor["y"])},
+        )
+        context["replaceDecision"] = replace_decision
+        if not replace_decision.get("shouldClear", True):
+            ns.replace = False
+    visual_action = {**action, "replace": bool(ns.replace)}
+    return _execute_step_type_text_visual(
+        args,
+        visual_action,
+        before,
+        run_dir,
+        context=context,
+        paste_at={
+            "x": float(focus_anchor["x"]),
+            "y": float(focus_anchor["y"]),
+            "source": str(focus_anchor.get("source") or "last-tap"),
+        },
+    )
+
+
+def _execute_step_type_text_visual(
+    args: argparse.Namespace,
+    action: dict[str, Any],
+    before: dict[str, Any],
+    run_dir: Path,
+    *,
+    context: dict[str, Any],
+    paste_at: str | dict[str, Any] | None,
+) -> dict[str, Any]:
+    if getattr(args, "no_ocr", False):
+        raise CoretapError(
+            "ACTION_SCHEMA_INVALID",
+            "paste-backed typeText requires OCR/VLM verification; remove --no-ocr",
+            category="usage",
+            stage="type",
+        )
+    if isinstance(paste_at, str):
+        x, y = _parse_xy_pair(paste_at, option="pasteAt")
+        paste_at = {"x": x, "y": y, "source": "explicit"}
+    if not isinstance(paste_at, dict):
+        raise CoretapError(
+            "TEXT_INPUT_TARGET_UNKNOWN",
+            "Paste-backed typeText requires a normalized paste anchor",
+            category="usage",
+            stage="type",
+            details={"pasteAt": paste_at},
+        )
+    anchor = {"x": float(paste_at["x"]), "y": float(paste_at["y"])}
+    attempts: list[dict[str, Any]] = []
+    if getattr(args, "dry_run", False):
+        return {
+            "schema": "coretap.step.execution.v1",
+            "status": "executed",
+            "actionType": "typeText",
+            "strategy": "visual_paste_verified",
+            "textEntryContext": context,
+            "resolvedPasteAt": paste_at,
+            "attempts": [],
+            "typeResult": {
+                "attempted": False,
+                "dryRun": True,
+                "inputMethod": "coredevice-pasteboard-visual-menu",
+                "confirmationStatus": "not_requested",
+                "reason": "dry-run requested",
+            },
+        }
+
+    for attempt_index in range(1, _TEXT_INPUT_VISUAL_ATTEMPTS + 1):
+        attempt: dict[str, Any] = {"index": attempt_index, "anchor": anchor}
+        attempts.append(attempt)
+        pasteboard = _set_device_pasteboard_text(args, action["text"], verify=True)
+        attempt["pasteboard"] = pasteboard
+
+        before_ocr = before.get("ocr") if isinstance(before, dict) else None
+        visible_observation = (
+            before
+            if attempt_index == 1 and isinstance(before_ocr, dict) and before_ocr.get("enabled")
+            else _observe_into(args, run_dir=run_dir, label=f"type-visible-menu-{attempt_index:03d}", no_ocr=False)
+        )
+        attempt["visibleMenuObservation"] = {
+            "frame": visible_observation.get("frame"),
+            "ocr": _ocr_summary_for_observation(visible_observation),
+        }
+        visible_paste_candidate = _locate_paste_menu(
+            args,
+            visible_observation,
+            anchor=anchor,
+            run_dir=run_dir,
+            label=f"type-visible-menu-{attempt_index:03d}",
+        )
+        if visible_paste_candidate is not None:
+            attempt["pasteCandidate"] = {**visible_paste_candidate, "stage": "already-visible"}
+            attempt["pasteTap"] = _tap_normalized_for_step(args, visible_paste_candidate["point"], reason="tap-visible-paste-menu")
+            command_wait(argparse.Namespace(ms=700, wait_command=None))
+
+            verify_observation = _observe_into(args, run_dir=run_dir, label=f"type-verify-{attempt_index:03d}", no_ocr=False)
+            verification = _verify_text_input_near_anchor(verify_observation, action["text"], anchor)
+            attempt["verification"] = verification
+            attempt["verifyObservation"] = {
+                "frame": verify_observation.get("frame"),
+                "ocr": _ocr_summary_for_observation(verify_observation),
+            }
+            if verification["status"] == "verified":
+                return {
+                    "schema": "coretap.step.execution.v1",
+                    "status": "executed",
+                    "actionType": "typeText",
+                    "strategy": "visual_paste_verified",
+                    "textEntryContext": context,
+                    "focusResult": None,
+                    "resolvedPasteAt": paste_at,
+                    "attempts": attempts,
+                    "typeResult": {
+                        "attempted": True,
+                        "dryRun": False,
+                        "inputMethod": "coredevice-pasteboard-visible-menu",
+                        "confirmationStatus": "verified_text",
+                        "pasteboardSet": True,
+                        "pasteboardVerified": bool(pasteboard.get("pasteboardVerified")),
+                        "pasteAnchor": {"source": paste_at.get("source", "explicit"), **anchor},
+                        "pasteMenuTap": attempt["pasteTap"],
+                        "verification": verification,
+                        "attemptCount": attempt_index,
+                        "clearExisting": action["replace"],
+                        "typedCharacters": len(action["text"]),
+                    },
+                }
+            attempt["status"] = "visible-menu-verification-failed"
+
+        focus = _tap_normalized_for_step(args, anchor, reason="focus-text-field-before-visual-paste")
+        attempt["focus"] = focus
+        command_wait(argparse.Namespace(ms=150, wait_command=None))
+
+        if action["replace"]:
+            clear_args = argparse.Namespace(**vars(args))
+            clear_args.count = 80
+            clear_args.inter_delay_ms = 1
+            attempt["clear"] = command_clear(clear_args)
+            command_wait(argparse.Namespace(ms=120, wait_command=None))
+
+        long_press_action = {
+            "schema": "coretap.action.v2",
+            "type": "longPress",
+            "point": {"x": anchor["x"], "y": anchor["y"], "space": "normalized", "reference": "source"},
+            "durationMs": action["pasteHoldMs"],
+            "steps": 12,
+        }
+        attempt["openMenu"] = _execute_step_long_press(args, long_press_action, before)
+        command_wait(argparse.Namespace(ms=250, wait_command=None))
+
+        menu_observation = _observe_into(args, run_dir=run_dir, label=f"type-paste-menu-{attempt_index:03d}", no_ocr=False)
+        attempt["menuObservation"] = {
+            "frame": menu_observation.get("frame"),
+            "ocr": _ocr_summary_for_observation(menu_observation),
+        }
+        paste_candidate = _locate_paste_menu(
+            args,
+            menu_observation,
+            anchor=anchor,
+            run_dir=run_dir,
+            label=f"type-paste-menu-{attempt_index:03d}",
+            allow_vlm=True,
+        )
+        attempt["pasteCandidate"] = paste_candidate
+        if paste_candidate is None:
+            attempt["status"] = "paste-menu-not-found"
+            _tap_normalized_for_step(args, anchor, reason="dismiss-missing-paste-menu")
+            command_wait(argparse.Namespace(ms=250, wait_command=None))
+            continue
+
+        attempt["pasteTap"] = _tap_normalized_for_step(args, paste_candidate["point"], reason="tap-visual-paste-menu")
+        command_wait(argparse.Namespace(ms=700, wait_command=None))
+
+        verify_observation = _observe_into(args, run_dir=run_dir, label=f"type-verify-{attempt_index:03d}", no_ocr=False)
+        verification = _verify_text_input_near_anchor(verify_observation, action["text"], anchor)
+        attempt["verification"] = verification
+        attempt["verifyObservation"] = {
+            "frame": verify_observation.get("frame"),
+            "ocr": _ocr_summary_for_observation(verify_observation),
+        }
+        if verification["status"] == "verified":
+            return {
+                "schema": "coretap.step.execution.v1",
+                "status": "executed",
+                "actionType": "typeText",
+                "strategy": "visual_paste_verified",
+                "textEntryContext": context,
+                "focusResult": focus,
+                "resolvedPasteAt": paste_at,
+                "attempts": attempts,
+                "typeResult": {
+                    "attempted": True,
+                    "dryRun": False,
+                    "inputMethod": "coredevice-pasteboard-visual-menu",
+                    "confirmationStatus": "verified_text",
+                    "pasteboardSet": True,
+                    "pasteboardVerified": bool(pasteboard.get("pasteboardVerified")),
+                    "pasteAnchor": {"source": paste_at.get("source", "last-tap"), **anchor},
+                    "pasteMenuTap": attempt["pasteTap"],
+                    "verification": verification,
+                    "attemptCount": attempt_index,
+                    "clearExisting": action["replace"],
+                    "typedCharacters": len(action["text"]),
+                },
+            }
+        attempt["status"] = "verification-failed"
+
+    failure_code = "PASTE_MENU_NOT_FOUND" if all(item.get("pasteCandidate") is None for item in attempts) else "TEXT_INPUT_VERIFICATION_FAILED"
+    raise CoretapError(
+        failure_code,
+        "Paste-backed text input could not be verified",
+        category="assertion",
+        stage="type",
+        details={
+            "text": action["text"],
+            "anchor": anchor,
+            "attempts": attempts,
+            "textEntryContext": context,
+        },
+    )
+
+
+def _ocr_summary_for_observation(observation: dict[str, Any]) -> dict[str, Any]:
+    ocr = observation.get("ocr") if isinstance(observation, dict) else None
+    if not isinstance(ocr, dict):
+        return {"enabled": False}
+    return {
+        "enabled": bool(ocr.get("enabled")),
+        "selectedEngine": ocr.get("selectedEngine"),
+        "tokenCount": ocr.get("tokenCount"),
+        "plainText": ocr.get("plainText"),
+    }
+
+
 def _execute_step_action(args: argparse.Namespace, action: dict[str, Any], before: dict[str, Any], run_dir: Path) -> dict[str, Any]:
     action_type = action["type"]
     if action_type == "tap":
         return _execute_step_tap(args, action, before, run_dir)
+    if action_type == "tapPoint":
+        return _execute_step_tap_point(args, action, before)
+    if action_type == "longPress":
+        return _execute_step_long_press(args, action, before)
     if action_type == "openApp":
         return _execute_step_open_app(args, action, before, run_dir)
+    if action_type == "openUrl":
+        return _execute_step_open_url(args, action)
     if action_type == "typeText":
-        context = _text_entry_context(before)
-        has_explicit_paste_at = action.get("pasteAt") is not None
-        if not args.dry_run and not context["ready"] and not has_explicit_paste_at:
-            source_context = _source_ocr_text_entry_context(args, before, run_dir)
-            if source_context is not None and source_context["ready"]:
-                context = source_context
-        if not args.dry_run and not context["ready"] and not has_explicit_paste_at:
-            return _step_blocked(
-                action,
-                "TEXT_INPUT_TARGET_UNKNOWN",
-                "No focused text input context was visible before typing",
-                details={"textEntryContext": context},
-            )
-        ns = argparse.Namespace(**vars(args))
-        ns.text = action["text"]
-        ns.text_query = None
-        ns.char_delay_ms = action["charDelayMs"]
-        ns.inter_delay_ms = action["interDelayMs"]
-        ns.paste_at = _resolve_type_text_paste_at(action, context)
-        ns.paste_hold_ms = action["pasteHoldMs"]
-        ns.verify_timeout_ms = action["verifyTimeoutMs"]
-        ns.no_verify = action["noVerify"]
-        ns.replace = action["replace"]
-        focus_anchor = _type_text_focus_anchor(action, context)
-        focus_result = None
-        if focus_anchor is not None and not args.dry_run:
-            focus_result = _tap_normalized_for_step(args, focus_anchor["point"], reason=f"focus-{focus_anchor['source']}")
-            command_wait(argparse.Namespace(ms=650, wait_command=None))
-        return {
-            "schema": "coretap.step.execution.v1",
-            "status": "executed",
-            "actionType": action_type,
-            "textEntryContext": context,
-            "focusResult": focus_result,
-            "resolvedPasteAt": ns.paste_at,
-            "typeResult": command_type(ns),
-        }
+        return _execute_step_type_text(args, action, before, run_dir)
     if action_type == "key":
         ns = argparse.Namespace(**vars(args))
         ns.key = action["key"]
@@ -1848,6 +3399,12 @@ def _execute_step_action(args: argparse.Namespace, action: dict[str, Any], befor
         ns.steps = action["steps"]
         ns.duration_ms = action["durationMs"]
         return {"schema": "coretap.step.execution.v1", "status": "executed", "actionType": action_type, "scrollResult": command_scroll(ns)}
+    if action_type == "appSwitcher":
+        return _execute_step_app_switcher(args, action, before)
+    if action_type == "terminateApp":
+        return _execute_step_terminate_app(args, action)
+    if action_type == "uninstallApp":
+        return _execute_step_uninstall_app(args, action)
     if action_type == "wait":
         return {
             "schema": "coretap.step.execution.v1",
@@ -1858,26 +3415,70 @@ def _execute_step_action(args: argparse.Namespace, action: dict[str, Any], befor
     raise CoretapError("ACTION_UNSUPPORTED", f"Unsupported step action type: {action_type}", category="usage", stage="step-action")
 
 
+def _step_action_should_observe_page(action: dict[str, Any]) -> bool:
+    return action.get("type") in {
+        "tap",
+        "tapPoint",
+        "longPress",
+        "openApp",
+        "openUrl",
+        "typeText",
+        "key",
+        "clear",
+        "press",
+        "scroll",
+        "appSwitcher",
+    }
+
+
+def _attach_step_page_observation(args: argparse.Namespace, result: dict[str, Any], run_dir: Path) -> None:
+    action = result.get("action")
+    if not isinstance(action, dict) or not _step_action_should_observe_page(action):
+        return
+    if getattr(args, "dry_run", False) or getattr(args, "no_page", False):
+        result["observation"] = {"status": "skipped", "reason": "disabled"}
+        return
+    page_wait_ms = max(0, int(getattr(args, "page_wait_ms", DEFAULT_STEP_PAGE_WAIT_MS) or 0))
+    if page_wait_ms:
+        command_wait(argparse.Namespace(ms=page_wait_ms, wait_command=None))
+    page = _observe_into(
+        args,
+        run_dir=run_dir,
+        label="step-page",
+        no_ocr=bool(getattr(args, "no_ocr", False)),
+        no_vlm=bool(getattr(args, "no_vlm", False)),
+    )
+    result["observation"] = page_observation_summary(page)
+
+
 def command_step(args: argparse.Namespace) -> dict[str, Any]:
-    run_dir = artifact_dir(Path(args.artifact_root) if args.artifact_root else None)
+    with _command_artifacts(args) as run_dir:
+        return _command_step_into(args, run_dir)
+
+
+def _command_step_into(args: argparse.Namespace, run_dir: Path) -> dict[str, Any]:
     raw_action = _load_step_action(args)
     action = _normalize_step_action(raw_action)
-    postconditions = _step_postconditions(args, action)
-    needs_ocr = any(item["type"] in {"textVisible", "textAbsent"} for item in postconditions)
-    before = _observe_into(args, run_dir=run_dir, label="step-before", no_ocr=(args.no_ocr and not needs_ocr))
+    before_needs_ocr = _step_before_observation_needs_ocr(action)
+    if _step_action_requires_before_observation(action):
+        before = _observe_into(args, run_dir=run_dir, label="step-before", no_ocr=not before_needs_ocr, no_vlm=True)
+    else:
+        before = {
+            "schema": "coretap.observe.result.v1",
+            "skipped": True,
+            "reason": "action does not require screen observation",
+        }
     result: dict[str, Any] = {
         "schema": "coretap.step.result.v1",
-        "artifactDir": str(run_dir),
         "action": action,
         "before": before,
-        "postconditions": {"schema": "coretap.step.postconditions.v1", "status": "not_evaluated", "checks": []},
+        **_artifact_result(args, run_dir),
     }
     execution = _execute_step_action(args, action, before, run_dir)
     result["execution"] = execution
 
     if execution.get("status") == "blocked":
         result["status"] = "blocked"
-        result["postconditions"] = {"schema": "coretap.step.postconditions.v1", "status": "skipped", "reason": "action blocked", "checks": []}
         write_json(run_dir / "step.result.json", result)
         raise CoretapError(
             str(execution.get("code") or "FLOW_FAILED"),
@@ -1889,52 +3490,11 @@ def command_step(args: argparse.Namespace) -> dict[str, Any]:
 
     if args.dry_run:
         result["status"] = "dry_run"
-        result["postconditions"] = {"schema": "coretap.step.postconditions.v1", "status": "skipped", "reason": "dry run", "checks": []}
         write_json(run_dir / "step.result.json", result)
         return result
 
-    if action["type"] != "wait" and args.post_wait_ms > 0:
-        command_wait(argparse.Namespace(ms=args.post_wait_ms, wait_command=None))
-
-    after_attempts: list[dict[str, Any]] = []
-    recoveries: list[dict[str, Any]] = []
-    poll_index = 0
-    post_timeout_ms = _effective_step_post_timeout_ms(args, postconditions)
-    deadline = time.monotonic() + (post_timeout_ms / 1000)
-    while True:
-        label = "step-after" if poll_index == 0 else f"step-after-retry-{poll_index:03d}"
-        after_needs_ocr = any(item["type"] in {"textVisible", "textAbsent"} for item in postconditions)
-        after = _observe_into(args, run_dir=run_dir, label=label, no_ocr=(args.no_ocr and not after_needs_ocr))
-        after_attempts.append(after)
-        postcondition_result = _evaluate_postconditions(before, after, postconditions)
-        if postcondition_result["status"] == "failed" and action["type"] == "typeText" and not recoveries:
-            recovery = _dismiss_paste_permission_prompt(args, after)
-            if recovery is not None:
-                recoveries.append(recovery)
-                result["recoveries"] = recoveries
-                command_wait(argparse.Namespace(ms=600, wait_command=None))
-                poll_index += 1
-                continue
-        if postcondition_result["status"] != "failed" or post_timeout_ms <= 0 or time.monotonic() >= deadline:
-            result["after"] = after
-            result["afterAttempts"] = len(after_attempts)
-            result["postTimeoutMs"] = post_timeout_ms
-            result["postconditions"] = postcondition_result
-            break
-        poll_index += 1
-        time.sleep(args.poll_interval_ms / 1000)
-
-    if result["postconditions"]["status"] == "failed":
-        result["status"] = "postcondition_failed"
-        write_json(run_dir / "step.result.json", result)
-        raise CoretapError(
-            "POSTCONDITION_FAILED",
-            "step action executed but postconditions were not satisfied",
-            category="test",
-            stage="step-postcondition",
-            details=result,
-        )
     result["status"] = "executed"
+    _attach_step_page_observation(args, result, run_dir)
     write_json(run_dir / "step.result.json", result)
     return result
 
@@ -1951,8 +3511,6 @@ def command_wait(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def _write_ocr_artifacts(run_dir: Path, stem: str, raw: dict[str, Any]) -> None:
-    if "tesseractTsv" in raw:
-        (run_dir / f"{stem}.tsv").write_text(raw["tesseractTsv"], encoding="utf-8")
     if "visionJson" in raw:
         (run_dir / f"{stem}.vision.json").write_text(raw["visionJson"], encoding="utf-8")
     write_json(run_dir / f"{stem}.ocr.json", _ocr_summary(raw))
@@ -1993,14 +3551,17 @@ def command_daemon(args: argparse.Namespace) -> dict[str, Any]:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="coretap")
-    parser.add_argument("--format", choices=["text", "json", "ndjson"], default="json")
     parser.add_argument("--backend", choices=["simulator", "device"], default="simulator")
     parser.add_argument("--device", default="booted")
     parser.add_argument("--developer-dir", default=None)
     parser.add_argument("--coredevice-tunnel-mode", choices=["userspace", "tunneld"], default=None)
-    parser.add_argument("--artifact-root", default=None)
+    parser.add_argument("--artifact-root", default=os.environ.get("CORETAP_ARTIFACT_ROOT"))
+    parser.add_argument("--keep-artifacts", action="store_true", default=_truthy_env("CORETAP_KEEP_ARTIFACTS"))
+    parser.add_argument("--no-artifacts", action="store_true", default=_truthy_env("CORETAP_NO_ARTIFACTS"))
     parser.add_argument("--profile", default=PUBLIC_MODEL_PROFILE)
     parser.add_argument("--daemon", choices=["off", "auto", "on"], default="auto")
+    parser.add_argument("--trace-id", default=os.environ.get("CORETAP_TRACE_ID"))
+    parser.add_argument("--trace-title", default=os.environ.get("CORETAP_TRACE_TITLE"))
 
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("setup")
@@ -2026,30 +3587,21 @@ def build_parser() -> argparse.ArgumentParser:
     observe.add_argument("--out", default=None)
     observe.add_argument("--max-long-side", type=int, default=DEFAULT_GROUNDING_IMAGE_LONG_SIDE)
     observe.add_argument("--full-size", action="store_true")
-    observe.add_argument("--lang", default=DEFAULT_OCR_LANG)
-    observe.add_argument("--psm", type=int, default=11)
-    observe.add_argument("--ocr-engine", choices=["auto", "vision", "tesseract", "all"], default="auto")
     observe.add_argument("--min-confidence", type=float, default=0.0)
     observe.add_argument("--no-ocr", action="store_true")
+    observe.add_argument("--no-vlm", action="store_true")
 
     step = sub.add_parser("step")
-    step.add_argument("--action", default=None, help="Single coretap.action.v2 JSON object")
-    step.add_argument("--action-file", default=None, help="Path to a single coretap.action.v2 JSON object")
-    step.add_argument("--post-wait-ms", type=int, default=700)
-    step.add_argument("--post-timeout-ms", type=int, default=0)
-    step.add_argument("--poll-interval-ms", type=int, default=300)
-    step.add_argument("--expect-text", action="append", default=[])
-    step.add_argument("--expect-no-text", action="append", default=[])
-    step.add_argument("--expect-change", action="store_true")
-    step.add_argument("--fail-on-postcondition", action="store_true")
+    step.add_argument("--action", default=None, help="Single Coretap step action JSON object")
+    step.add_argument("--action-file", default=None, help="Path to a single Coretap step action JSON object")
     step.add_argument("--dry-run", action="store_true")
-    step.add_argument("--lang", default=DEFAULT_OCR_LANG)
-    step.add_argument("--psm", type=int, default=11)
-    step.add_argument("--ocr-engine", choices=["auto", "vision", "tesseract", "all"], default="auto")
+    step.add_argument("--page-wait-ms", type=int, default=DEFAULT_STEP_PAGE_WAIT_MS)
+    step.add_argument("--no-page", action="store_true")
     step.add_argument("--min-confidence", type=float, default=0.0)
     step.add_argument("--max-long-side", type=int, default=DEFAULT_STEP_MODEL_INPUT_LONG_SIDE)
     step.add_argument("--full-size", action="store_true")
     step.add_argument("--no-ocr", action="store_true")
+    step.add_argument("--no-vlm", action="store_true")
 
     assert_text = sub.add_parser("assert")
     assert_sub = assert_text.add_subparsers(dest="assert_command", required=True)
@@ -2058,8 +3610,7 @@ def build_parser() -> argparse.ArgumentParser:
     text.add_argument("--image", default=None)
     text.add_argument("--timeout-ms", type=int, default=3000)
     text.add_argument("--poll-interval-ms", type=int, default=300)
-    text.add_argument("--lang", default=DEFAULT_OCR_LANG)
-    text.add_argument("--psm", type=int, default=11)
+    text.add_argument("--min-confidence", type=float, default=0.0)
     text.add_argument("--case-sensitive", action="store_true")
 
     wait = sub.add_parser("wait")
@@ -2068,14 +3619,12 @@ def build_parser() -> argparse.ArgumentParser:
     wait.add_argument("--image", default=None)
     wait.add_argument("--timeout-ms", type=int, default=3000)
     wait.add_argument("--poll-interval-ms", type=int, default=300)
-    wait.add_argument("--lang", default=DEFAULT_OCR_LANG)
-    wait.add_argument("--psm", type=int, default=11)
+    wait.add_argument("--min-confidence", type=float, default=0.0)
     wait.add_argument("--case-sensitive", action="store_true")
     return parser
 
 
 COMMON_OPTIONS_WITH_VALUES = {
-    "--format",
     "--backend",
     "--device",
     "--developer-dir",
@@ -2083,6 +3632,14 @@ COMMON_OPTIONS_WITH_VALUES = {
     "--artifact-root",
     "--profile",
     "--daemon",
+    "--trace-id",
+    "--trace-title",
+}
+
+
+COMMON_FLAG_OPTIONS = {
+    "--keep-artifacts",
+    "--no-artifacts",
 }
 
 
@@ -2100,6 +3657,9 @@ def normalize_global_args(argv: list[str]) -> list[str]:
         if token in COMMON_OPTIONS_WITH_VALUES and i + 1 < len(head):
             moved.extend([token, head[i + 1]])
             i += 2
+        elif token in COMMON_FLAG_OPTIONS:
+            moved.append(token)
+            i += 1
         else:
             rest.append(token)
             i += 1
@@ -2132,6 +3692,55 @@ def dispatch(args: argparse.Namespace) -> dict[str, Any]:
     raise CoretapError("UNKNOWN_COMMAND", args.command, category="usage", stage="cli")
 
 
+def _daemon_status_is_stale(status: dict[str, Any] | None, client_code: dict[str, Any]) -> bool:
+    if not isinstance(status, dict):
+        return True
+    daemon_code = status.get("code")
+    if not isinstance(daemon_code, dict):
+        return True
+    return daemon_code.get("fingerprint") != client_code.get("fingerprint")
+
+
+def _ensure_current_daemon(daemon_mode: str) -> None:
+    from coretap.daemon import ping_daemon, source_fingerprint, start_daemon, stop_daemon
+
+    client_code = source_fingerprint()
+    try:
+        ping = ping_daemon(timeout=0.5)
+    except CoretapError as exc:
+        if daemon_mode == "auto" and exc.code == "DAEMON_UNAVAILABLE":
+            start_daemon()
+            return
+        raise
+
+    status = ping.get("result") if isinstance(ping, dict) else None
+    if not _daemon_status_is_stale(status, client_code):
+        return
+
+    details = {
+        "daemon": {
+            "pid": status.get("pid") if isinstance(status, dict) else None,
+            "code": status.get("code") if isinstance(status, dict) else None,
+        },
+        "client": {"code": client_code},
+    }
+    if daemon_mode != "auto":
+        raise CoretapError(
+            "DAEMON_STALE",
+            "Coretap daemon is running older code. Restart it with `coretap daemon stop && coretap daemon start`.",
+            category="infrastructure",
+            stage="daemon",
+            details=details,
+        )
+
+    try:
+        stop_daemon(timeout=2.0)
+    except CoretapError as exc:
+        if exc.code != "DAEMON_UNAVAILABLE":
+            raise
+    start_daemon()
+
+
 def main(argv: list[str] | None = None) -> None:
     parser = build_parser()
     normalized = normalize_global_args(list(argv if argv is not None else sys.argv[1:]))
@@ -2140,33 +3749,36 @@ def main(argv: list[str] | None = None) -> None:
         from coretap.daemon import request_daemon, start_daemon
 
         try:
+            _ensure_current_daemon(args.daemon)
             data = request_daemon(normalized, cwd=str(Path.cwd()))
-            emit(data, args.format)
+            emit(data)
             raise SystemExit(int(data.get("exitCode", 0 if data.get("ok") else 70)))
         except CoretapError as exc:
             if args.daemon == "auto" and exc.code == "DAEMON_UNAVAILABLE":
                 start_daemon()
                 data = request_daemon(normalized, cwd=str(Path.cwd()))
-                emit(data, args.format)
+                emit(data)
                 raise SystemExit(int(data.get("exitCode", 0 if data.get("ok") else 70)))
             if args.daemon == "on":
                 data = response_error(args.command, exc)
-                emit(data, args.format)
+                emit(data)
                 raise SystemExit(EXIT_CODES.get(exc.code, 70))
             data = response_error(args.command, exc)
-            emit(data, args.format)
+            emit(data)
             raise SystemExit(EXIT_CODES.get(exc.code, 70))
     started = time.monotonic()
     try:
         result = dispatch(args)
         data = response_ok(args.command, result)
         data["durationMs"] = round((time.monotonic() - started) * 1000)
-        emit(data, args.format)
+        attach_trace(args, data, argv=normalized, cwd=str(Path.cwd()))
+        emit(data)
         raise SystemExit(0)
     except CoretapError as exc:
         data = response_error(args.command, exc)
         data["durationMs"] = round((time.monotonic() - started) * 1000)
-        emit(data, args.format)
+        attach_trace(args, data, argv=normalized, cwd=str(Path.cwd()))
+        emit(data)
         raise SystemExit(EXIT_CODES.get(exc.code, 70))
 
 

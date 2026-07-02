@@ -81,20 +81,58 @@ async function main() {
     profile: "builtin:mai-ui-2b-mlx-6bit@1",
     daemon: "off",
   });
+  const artifactFake = await Coretap.connect({
+    command: fakeCoretapCommand(),
+    backend: "device",
+    device: "device-udid",
+    daemon: "off",
+    keepArtifacts: true,
+  });
+  const artifactObserve = await artifactFake.observe({ noVlm: true, noArtifacts: true });
+  assert(
+    argvIncludesInOrder(artifactObserve.argv, ["--keep-artifacts", "--no-artifacts", "observe", "--no-vlm"]),
+    `artifact argv was not built as expected: ${artifactObserve.argv.join(" ")}`,
+  );
+
   const fakeRun = await fake.openRun({ name: "node-argv" });
   await fakeRun.test("mobile-use helpers route through step", async (ui) => {
-    const tap = await ui.tap("the App Store search field", { dryRun: true, expectChange: true });
+    const tap = await ui.tap("the App Store search field", { dryRun: true });
+    const traceIndex = tap.argv.indexOf("--trace-id");
+    assert(traceIndex >= 0, `tap argv should include trace id: ${tap.argv.join(" ")}`);
+    assert(/^node-argv-/.test(tap.argv[traceIndex + 1]), `trace id should be based on run name: ${tap.argv.join(" ")}`);
+    assert(argvIncludesInOrder(tap.argv, ["--trace-title", "node-argv"]), `tap argv should include trace title: ${tap.argv.join(" ")}`);
     assert(
       argvIncludesInOrder(tap.argv, [
         "--coredevice-tunnel-mode",
         "userspace",
         "step",
         "--action",
-        '{"schema":"coretap.action.v2","type":"tap","target":"the App Store search field"}',
-        "--expect-change",
+        '{"type":"tap","target":"the App Store search field"}',
         "--dry-run",
       ]),
       `tap argv was not built as expected: ${tap.argv.join(" ")}`,
+    );
+
+    const pointTap = await ui.tapPoint({ x: 0.25, y: 0.5 }, { dryRun: true });
+    assert(
+      argvIncludesInOrder(pointTap.argv, [
+        "step",
+        "--action",
+        '{"type":"tapPoint","point":{"x":0.25,"y":0.5}}',
+        "--dry-run",
+      ]),
+      `tapPoint argv was not built as expected: ${pointTap.argv.join(" ")}`,
+    );
+
+    const held = await ui.longPress({ x: 0.4, y: 0.6 }, { dryRun: true, durationMs: 1500, steps: 16 });
+    assert(
+      argvIncludesInOrder(held.argv, [
+        "step",
+        "--action",
+        '{"type":"longPress","point":{"x":0.4,"y":0.6},"durationMs":1500,"steps":16}',
+        "--dry-run",
+      ]),
+      `longPress argv was not built as expected: ${held.argv.join(" ")}`,
     );
 
     const typed = await ui.typeText("hello@example.com", { dryRun: true, charDelayMs: 0, interDelayMs: 0, pasteAt: { x: 0.2, y: 0.54 } });
@@ -102,7 +140,7 @@ async function main() {
       argvIncludesInOrder(typed.argv, [
         "step",
         "--action",
-        '{"schema":"coretap.action.v2","type":"typeText","text":"hello@example.com","charDelayMs":0,"interDelayMs":0,"pasteAt":{"x":0.2,"y":0.54}}',
+        '{"type":"typeText","text":"hello@example.com","charDelayMs":0,"interDelayMs":0,"pasteAt":{"x":0.2,"y":0.54}}',
         "--dry-run",
       ]),
       `typeText argv was not built as expected: ${typed.argv.join(" ")}`,
@@ -113,22 +151,53 @@ async function main() {
       argvIncludesInOrder(opened.argv, [
         "step",
         "--action",
-        '{"schema":"coretap.action.v2","type":"openApp","name":"App Store"}',
+        '{"type":"openApp","name":"App Store"}',
         "--dry-run",
       ]),
       `openApp argv was not built as expected: ${opened.argv.join(" ")}`,
+    );
+
+    const switcher = await ui.appSwitcher({ dryRun: true });
+    assert(
+      argvIncludesInOrder(switcher.argv, [
+        "step",
+        "--action",
+        '{"type":"appSwitcher"}',
+        "--dry-run",
+      ]),
+      `appSwitcher argv was not built as expected: ${switcher.argv.join(" ")}`,
+    );
+
+    const terminated = await ui.terminateApp("com.apple.AppStore", { dryRun: true });
+    assert(
+      argvIncludesInOrder(terminated.argv, [
+        "step",
+        "--action",
+        '{"type":"terminateApp","bundleId":"com.apple.AppStore"}',
+        "--dry-run",
+      ]),
+      `terminateApp argv was not built as expected: ${terminated.argv.join(" ")}`,
+    );
+
+    const uninstalled = await ui.uninstallApp("小红书", { dryRun: true });
+    assert(
+      argvIncludesInOrder(uninstalled.argv, [
+        "step",
+        "--action",
+        '{"type":"uninstallApp","name":"小红书"}',
+        "--dry-run",
+      ]),
+      `uninstallApp argv was not built as expected: ${uninstalled.argv.join(" ")}`,
     );
   });
   await fakeRun.test("observe args use default JSON output", async (ui) => {
     const result = await ui.observe({
       label: "agent-eyes",
       maxLongSide: 1368,
-      lang: "chi_sim+eng",
-      psm: 11,
-      ocrEngine: "vision",
       minConfidence: 10,
+      noVlm: true,
     });
-    assert(!result.argv.includes("--format"), `observe argv should not include --format: ${result.argv.join(" ")}`);
+    assert(!result.argv.includes("--format"), `observe argv should use the single JSON stdout form: ${result.argv.join(" ")}`);
     assert(
       argvIncludesInOrder(result.argv, [
         "--backend",
@@ -140,49 +209,32 @@ async function main() {
         "agent-eyes",
         "--max-long-side",
         "1368",
-        "--lang",
-        "chi_sim+eng",
-        "--psm",
-        "11",
-        "--ocr-engine",
-        "vision",
         "--min-confidence",
         "10",
+        "--no-vlm",
       ]),
       `observe argv was not built as expected: ${result.argv.join(" ")}`,
     );
   });
   await fakeRun.test("step args expose single-action mobile-use runtime", async (ui) => {
     const result = await ui.step(
-      { schema: "coretap.action.v2", type: "tap", target: "the App Store search field" },
+      { type: "tap", target: "the App Store search field" },
       {
-        postWaitMs: 500,
-        postTimeoutMs: 1500,
-        pollIntervalMs: 250,
-        expectChange: true,
-        expectText: "搜索",
-        ocrEngine: "vision",
+        pageWaitMs: 2000,
         maxLongSide: 1368,
+        noVlm: true,
       },
     );
     assert(
       argvIncludesInOrder(result.argv, [
         "step",
         "--action",
-        '{"schema":"coretap.action.v2","type":"tap","target":"the App Store search field"}',
-        "--post-wait-ms",
-        "500",
-        "--post-timeout-ms",
-        "1500",
-        "--poll-interval-ms",
-        "250",
-        "--expect-text",
-        "搜索",
-        "--expect-change",
-        "--ocr-engine",
-        "vision",
+        '{"type":"tap","target":"the App Store search field"}',
+        "--page-wait-ms",
+        "2000",
         "--max-long-side",
         "1368",
+        "--no-vlm",
       ]),
       `step argv was not built as expected: ${result.argv.join(" ")}`,
     );

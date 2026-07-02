@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import signal
@@ -32,6 +33,27 @@ def default_pid_path() -> Path:
 
 def default_log_path() -> Path:
     return ensure_state()["state"] / "coretapd.log"
+
+
+def source_fingerprint() -> dict[str, Any]:
+    package_root = Path(__file__).resolve().parent
+    digest = hashlib.sha256()
+    file_count = 0
+    for path in sorted(package_root.rglob("*.py")):
+        if "__pycache__" in path.parts:
+            continue
+        rel = path.relative_to(package_root).as_posix()
+        digest.update(rel.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(path.read_bytes())
+        digest.update(b"\0")
+        file_count += 1
+    return {
+        "schema": "coretap.source-fingerprint.v1",
+        "packageRoot": str(package_root),
+        "fingerprint": f"sha256:{digest.hexdigest()}",
+        "fileCount": file_count,
+    }
 
 
 def request_daemon(
@@ -196,28 +218,32 @@ def start_daemon(*, socket_path: str | Path | None = None, timeout: float = 5.0)
 
 
 def handle_argv(argv: list[str], *, cwd: str | None = None) -> dict[str, Any]:
-    from coretap.cli import EXIT_CODES, build_parser, dispatch, normalize_global_args
+    from coretap.cli import EXIT_CODES, attach_trace, build_parser, dispatch, normalize_global_args
 
     started = time.monotonic()
     command = "unknown"
     old_cwd = os.getcwd()
+    normalized = normalize_global_args(argv)
     try:
         if cwd:
             os.chdir(cwd)
         parser = build_parser()
-        args = parser.parse_args(normalize_global_args(argv))
+        args = parser.parse_args(normalized)
         command = args.command
         result = dispatch(args)
         data = response_ok(command, result)
         data["durationMs"] = round((time.monotonic() - started) * 1000)
         data["daemon"] = daemon_status()
         data["exitCode"] = 0
+        attach_trace(args, data, argv=normalized, cwd=str(Path.cwd()))
         return data
     except CoretapError as exc:
         data = response_error(command, exc)
         data["durationMs"] = round((time.monotonic() - started) * 1000)
         data["daemon"] = daemon_status()
         data["exitCode"] = EXIT_CODES.get(exc.code, 70)
+        if "args" in locals():
+            attach_trace(args, data, argv=normalized, cwd=str(Path.cwd()))
         return data
     except SystemExit as exc:
         error = CoretapError(
@@ -308,6 +334,7 @@ def daemon_status() -> dict[str, Any]:
     return {
         "pid": os.getpid(),
         "socket": str(default_socket_path()),
+        "code": source_fingerprint(),
         "workers": {
             "model": model_worker_status(),
             "coredevice": DEVICE_WORKER_POOL.stats(),

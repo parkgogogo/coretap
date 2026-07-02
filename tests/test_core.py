@@ -19,27 +19,23 @@ from coretap.cli import point_to_hid
 from coretap.device_buttons import resolve_button
 from coretap.device_worker import (
     CoreDeviceWorkerPool,
+    _supports_unshifted_virtual_keyboard_text,
     is_recoverable_coredevice_display_error,
     is_recoverable_userspace_tunnel_error,
     recover_coredevice_display_service,
     set_default_device_worker_pool,
 )
 from coretap.grounding import (
-    assess_grounding_tap_safety,
     prepare_grounding_image,
     prepare_image_long_side,
     remap_grounding_to_source_frame,
-    target_text_terms,
 )
-from coretap.model_pack import parse_grounding_output
+from coretap.model_pack import parse_grounding_output, parse_visual_observe_output
 from coretap.ocr import (
     DEFAULT_OCR_LANG,
     OcrToken,
     find_exact_text_candidates,
     find_text,
-    missing_tesseract_languages,
-    parse_tesseract_languages,
-    parse_tsv,
     parse_vision_json,
 )
 from coretap.runtime import Completed, CoretapError, png_size
@@ -70,6 +66,68 @@ def test_point_to_hid_omits_screenshot_pixels_when_frame_unknown() -> None:
     assert point["hidU16"] == {"x": 32768, "y": 16384}
     assert point["screenshotPx"] is None
     assert point["frame"] == {"known": False, "widthPx": None, "heightPx": None}
+
+
+def test_parse_visual_observe_output_accepts_center_and_bbox() -> None:
+    raw = json.dumps(
+        {
+            "summary": "Home screen with app icons",
+            "elements": [
+                {
+                    "label": "ChatGPT app icon",
+                    "role": "appIcon",
+                    "center": [820, 530],
+                    "bbox": [740, 470, 900, 610],
+                    "confidence": 0.84,
+                },
+                {
+                    "label": "Search icon button",
+                    "role": "button",
+                    "bbox": [440, 880, 560, 940],
+                    "confidence": 1.2,
+                },
+            ],
+        }
+    )
+
+    result = parse_visual_observe_output(raw, width=1000, height=2000)
+
+    assert result["status"] == "ready"
+    assert result["promptVersion"] == "visual-observe-v1"
+    assert result["summary"] == "Home screen with app icons"
+    assert result["elements"][0]["source"] == "vlm"
+    assert result["elements"][0]["role"] == "appIcon"
+    assert result["elements"][0]["center"] == {"x": 0.82, "y": 0.53}
+    assert result["elements"][0]["bbox"] == {"x": 0.74, "y": 0.47, "width": 0.16, "height": 0.14}
+    assert result["elements"][1]["center"] == {"x": 0.5, "y": 0.91}
+    assert result["elements"][1]["confidence"] == 1.0
+
+
+def test_parse_visual_observe_output_drops_invalid_and_duplicate_elements() -> None:
+    raw = json.dumps(
+        {
+            "summary": "Toolbar",
+            "elements": [
+                {"label": "Close button", "role": "button", "center": [100, 100], "confidence": 0.7},
+                {"label": "Close button", "role": "button", "center": [100, 100], "confidence": 0.7},
+                {"label": "Offscreen", "role": "button", "center": [1200, 100], "confidence": 0.7},
+                {"label": "Missing coordinate", "role": "button", "confidence": 0.7},
+                {"label": "Odd role", "role": "fancy", "center": {"x": 500, "y": 500}},
+            ],
+        }
+    )
+
+    result = parse_visual_observe_output(raw, width=1000, height=2000)
+
+    assert [item["label"] for item in result["elements"]] == ["Close button", "Odd role"]
+    assert result["elements"][1]["role"] == "unknown"
+
+
+def test_parse_visual_observe_output_handles_invalid_json() -> None:
+    result = parse_visual_observe_output("not json", width=1000, height=2000)
+
+    assert result["status"] == "invalid"
+    assert result["elements"] == []
 
 
 def test_point_to_hid_from_pixels() -> None:
@@ -171,19 +229,17 @@ def test_remap_grounding_to_source_frame_preserves_normalized_coordinates() -> N
     assert result["frame"] == {"widthPx": 1260, "heightPx": 2736}
 
 
-def test_parse_tsv_and_find_text() -> None:
-    tsv = """level\tpage_num\tblock_num\tpar_num\tline_num\tword_num\tleft\ttop\twidth\theight\tconf\ttext
-5\t1\t1\t1\t1\t1\t10\t20\t30\t12\t95\tGeneral
-5\t1\t1\t1\t1\t2\t50\t20\t40\t12\t90\tAbout
-"""
-
-    tokens = parse_tsv(tsv)
+def test_find_text_uses_structured_ocr_tokens() -> None:
+    tokens = [
+        OcrToken("General", 95, 10, 20, 30, 12),
+        OcrToken("About", 90, 50, 20, 40, 12),
+    ]
     match = find_text(tokens, "general")
 
     assert len(tokens) == 2
     assert match is not None
     assert match["matchedText"] == "General"
-    assert match["matchedEngines"] == ["tesseract"]
+    assert match["matchedEngines"] == ["vision"]
     assert match["matchedBoxPx"] == {"x": 10, "y": 20, "width": 30, "height": 12}
 
 
@@ -198,28 +254,16 @@ def test_parse_vision_json_and_find_text() -> None:
     assert match["matchedEngines"] == ["vision"]
 
 
-def test_default_ocr_language_requires_chinese_and_english() -> None:
-    languages = parse_tesseract_languages(
-        """List of available languages in "/opt/homebrew/share/tessdata/" (3):
-eng
-chi_sim
-osd
-"""
-    )
-
-    assert DEFAULT_OCR_LANG == "chi_sim+eng"
-    assert missing_tesseract_languages(languages) == []
-    assert missing_tesseract_languages(["eng"]) == ["chi_sim"]
+def test_default_ocr_language_is_macos_vision_chinese_and_english() -> None:
+    assert DEFAULT_OCR_LANG == "zh-Hans+en-US"
 
 
 def test_find_exact_text_candidates_requires_exact_normalized_match() -> None:
-    tsv = """level\tpage_num\tblock_num\tpar_num\tline_num\tword_num\tleft\ttop\twidth\theight\tconf\ttext
-5\t1\t1\t1\t1\t1\t10\t20\t30\t12\t95\tChatGPT
-5\t1\t1\t1\t1\t2\t50\t20\t40\t12\t95\tChatGPTX
-5\t1\t1\t1\t1\t3\t100\t20\t30\t12\t40\tChatGPT
-"""
-
-    tokens = parse_tsv(tsv)
+    tokens = [
+        OcrToken("ChatGPT", 95, 10, 20, 30, 12),
+        OcrToken("ChatGPTX", 95, 50, 20, 40, 12),
+        OcrToken("ChatGPT", 20, 100, 20, 30, 12),
+    ]
     matches = find_exact_text_candidates(tokens, "chatgpt", min_confidence=50)
 
     assert len(matches) == 1
@@ -228,12 +272,10 @@ def test_find_exact_text_candidates_requires_exact_normalized_match() -> None:
 
 
 def test_find_exact_text_candidates_can_match_phrase() -> None:
-    tsv = """level\tpage_num\tblock_num\tpar_num\tline_num\tword_num\tleft\ttop\twidth\theight\tconf\ttext
-5\t1\t1\t1\t1\t1\t10\t20\t30\t12\t95\tApp
-5\t1\t1\t1\t1\t2\t50\t20\t40\t12\t90\tStore
-"""
-
-    tokens = parse_tsv(tsv)
+    tokens = [
+        OcrToken("App", 95, 10, 20, 30, 12),
+        OcrToken("Store", 90, 50, 20, 40, 12),
+    ]
     matches = find_exact_text_candidates(tokens, "App Store")
 
     assert len(matches) == 1
@@ -252,21 +294,31 @@ def test_find_exact_text_candidates_accepts_vision_token_contains() -> None:
 
 
 def test_find_exact_text_candidates_accepts_search_ui_prefix() -> None:
-    tokens = parse_vision_json('[{"text":"Q 小红书","confidence":30,"left":10,"top":20,"width":100,"height":30}]')
-    matches = find_exact_text_candidates(tokens, "小红书", min_confidence=50)
+    tokens = parse_vision_json('[{"text":"Q 示例应用","confidence":30,"left":10,"top":20,"width":100,"height":30}]')
+    matches = find_exact_text_candidates(tokens, "示例应用", min_confidence=50)
 
     assert len(matches) == 1
-    assert matches[0]["matchedText"] == "Q 小红书"
+    assert matches[0]["matchedText"] == "Q 示例应用"
+    assert matches[0]["matchedKind"] == "exact"
+    assert matches[0]["exactMatchStrategy"] == "ui-prefix-stripped"
+
+
+def test_find_exact_text_candidates_accepts_vision_single_letter_ui_prefix() -> None:
+    tokens = parse_vision_json('[{"text":"g Xingin","confidence":30,"left":222,"top":978,"width":89,"height":21}]')
+    matches = find_exact_text_candidates(tokens, "Xingin", min_confidence=50)
+
+    assert len(matches) == 1
+    assert matches[0]["matchedText"] == "g Xingin"
     assert matches[0]["matchedKind"] == "exact"
     assert matches[0]["exactMatchStrategy"] == "ui-prefix-stripped"
 
 
 def test_find_exact_text_candidates_accepts_badge_ui_prefix() -> None:
-    tokens = parse_vision_json('[{"text":"⑧ 小红书","confidence":30,"left":10,"top":20,"width":100,"height":30}]')
-    matches = find_exact_text_candidates(tokens, "小红书", min_confidence=50)
+    tokens = parse_vision_json('[{"text":"⑧ 示例应用","confidence":30,"left":10,"top":20,"width":100,"height":30}]')
+    matches = find_exact_text_candidates(tokens, "示例应用", min_confidence=50)
 
     assert len(matches) == 1
-    assert matches[0]["matchedText"] == "⑧ 小红书"
+    assert matches[0]["matchedText"] == "⑧ 示例应用"
     assert matches[0]["matchedKind"] == "exact"
 
 
@@ -564,115 +616,6 @@ def test_device_backend_display_info_falls_back_after_worker_tunnel_error(monkey
     ]
 
 
-def test_target_text_terms_extracts_specific_app_name() -> None:
-    assert target_text_terms("the ChatGPT app icon") == ["chatgpt"]
-    assert target_text_terms("点击 搜索") == ["搜索"]
-    assert target_text_terms("the App Store search tab") == ["store", "search", "搜索"]
-    assert target_text_terms("the App Store search field") == ["store", "search", "搜索", "游戏"]
-    assert target_text_terms("the center of the bottom iOS home screen search field") == ["search", "搜索", "游戏", "故事等"]
-    assert target_text_terms("the retry button") == ["retry", "重试"]
-    assert target_text_terms("the search field labeled 游戏、App、故事等 at the top") == ["search", "搜索", "游戏", "故事等"]
-
-
-def test_grounding_tap_safety_rejects_missing_target_text(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    image = tmp_path / "screen.png"
-    image.write_bytes(TINY_PNG)
-    grounded = {
-        "status": "found",
-        "point": {"framePx": {"x": 120, "y": 160}, "normalized": {"x": 0.5, "y": 0.5}},
-        "frame": {"widthPx": 240, "heightPx": 320},
-    }
-    monkeypatch.setattr("coretap.grounding.run_tesseract", lambda *_args, **_kwargs: ([], ""))
-    monkeypatch.setattr("coretap.grounding.run_vision_ocr", lambda *_args, **_kwargs: ([], "[]"))
-
-    safety = assess_grounding_tap_safety(image, "the ChatGPT app icon", grounded)
-
-    assert safety["status"] == "unsafe"
-    assert safety["safeToTap"] is False
-    assert safety["checks"][1]["reason"] == "target text was not visible in the current screenshot"
-
-
-def test_grounding_tap_safety_accepts_visible_nearby_target_text(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    image = tmp_path / "screen.png"
-    image.write_bytes(TINY_PNG)
-    grounded = {
-        "status": "found",
-        "point": {"framePx": {"x": 120, "y": 150}, "normalized": {"x": 0.5, "y": 0.5}},
-        "frame": {"widthPx": 240, "heightPx": 320},
-    }
-    tokens = [OcrToken("ChatGPT", 95.0, 92, 178, 80, 20)]
-    monkeypatch.setattr("coretap.grounding.run_tesseract", lambda *_args, **_kwargs: (tokens, ""))
-
-    safety = assess_grounding_tap_safety(image, "the ChatGPT app icon", grounded)
-
-    assert safety["status"] == "safe"
-    assert safety["safeToTap"] is True
-
-
-def test_grounding_tap_safety_uses_nearby_vision_match_when_tesseract_match_is_far(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    image = tmp_path / "screen.png"
-    image.write_bytes(TINY_PNG)
-    grounded = {
-        "status": "found",
-        "point": {"framePx": {"x": 120, "y": 150}, "normalized": {"x": 0.5, "y": 0.5}},
-        "frame": {"widthPx": 240, "heightPx": 320},
-    }
-    tesseract_tokens = [OcrToken("搜索", 95.0, 4, 4, 40, 20)]
-    vision_tokens = [OcrToken("搜索", 95.0, 100, 140, 48, 24, engine="vision")]
-    monkeypatch.setattr("coretap.grounding.run_tesseract", lambda *_args, **_kwargs: (tesseract_tokens, ""))
-    monkeypatch.setattr("coretap.grounding.run_vision_ocr", lambda *_args, **_kwargs: (vision_tokens, "[]"))
-
-    safety = assess_grounding_tap_safety(image, "the App Store search tab", grounded)
-
-    assert safety["status"] == "safe"
-    assert safety["safeToTap"] is True
-    evidence = safety["checks"][1]
-    assert evidence["engines"] == ["tesseract", "vision"]
-    assert evidence["nearestMatch"]["matchedEngines"] == ["vision"]
-
-
-def test_grounding_tap_safety_accepts_app_store_search_placeholder(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    image = tmp_path / "screen.png"
-    image.write_bytes(TINY_PNG)
-    grounded = {
-        "status": "found",
-        "point": {"framePx": {"x": 130, "y": 30}, "normalized": {"x": 0.54, "y": 0.09}},
-        "frame": {"widthPx": 240, "heightPx": 320},
-    }
-    tokens = [OcrToken("游戏、App、故事等", 95.0, 40, 20, 130, 18, engine="vision")]
-    monkeypatch.setattr("coretap.grounding.run_tesseract", lambda *_args, **_kwargs: ([], ""))
-    monkeypatch.setattr("coretap.grounding.run_vision_ocr", lambda *_args, **_kwargs: (tokens, "[]"))
-
-    safety = assess_grounding_tap_safety(image, "the App Store search field", grounded)
-
-    assert safety["status"] == "safe"
-    assert safety["safeToTap"] is True
-    assert safety["checks"][1]["nearestMatch"]["matchedText"] == "游戏、App、故事等"
-
-
-def test_grounding_tap_safety_accepts_search_field_with_existing_query(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    image = tmp_path / "screen.png"
-    image.write_bytes(TINY_PNG)
-    grounded = {
-        "status": "found",
-        "point": {"framePx": {"x": 110, "y": 44}, "normalized": {"x": 0.46, "y": 0.14}},
-        "frame": {"widthPx": 240, "heightPx": 320},
-    }
-    tokens = [OcrToken("xiaohongshu小红书", 95.0, 40, 36, 130, 18, engine="vision")]
-    monkeypatch.setattr("coretap.grounding.run_tesseract", lambda *_args, **_kwargs: ([], ""))
-    monkeypatch.setattr("coretap.grounding.run_vision_ocr", lambda *_args, **_kwargs: (tokens, "[]"))
-
-    safety = assess_grounding_tap_safety(image, "the App Store search field", grounded)
-
-    assert safety["status"] == "safe"
-    assert safety["safeToTap"] is True
-    assert safety["checks"][1]["semanticEvidence"] == "search-field-content"
-    assert safety["checks"][1]["nearestMatch"]["matchedText"] == "xiaohongshu小红书"
-
-
 def test_paste_menu_point_uses_below_anchor_for_top_text_fields() -> None:
     from coretap.device_worker import _paste_menu_point_for_anchor
 
@@ -722,6 +665,224 @@ def test_device_backend_type_text_dry_run_supports_unicode() -> None:
     assert result["text"]["length"] == 2
     assert result["text"]["asciiOnly"] is False
     assert result["inputMethod"] == "coredevice-pasteboard-edit-menu"
+
+
+def test_device_backend_type_text_dry_run_reports_shortcut_paste_mode() -> None:
+    result = DeviceBackend().type_text(
+        "device-udid",
+        "搜索",
+        paste_at={"x": 0.25, "y": 0.15, "mode": "shortcut"},
+        dry_run=True,
+    )
+
+    assert result["attempted"] is False
+    assert result["inputMethod"] == "coredevice-pasteboard-keyboard-shortcut"
+
+
+def test_device_backend_set_pasteboard_text_cli_fallback_verifies_readback(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[list[str]] = []
+
+    def fake_run_command(argv: list[str], **_kwargs: object) -> Completed:
+        calls.append(argv)
+        if "paste" in argv:
+            return Completed(argv=argv, returncode=0, stdout="小红书", stderr="", duration_ms=2)
+        return Completed(argv=argv, returncode=0, stdout="", stderr="", duration_ms=3)
+
+    monkeypatch.setattr("coretap.backends.run_command", fake_run_command)
+
+    result = DeviceBackend().set_pasteboard_text("device-udid", "小红书", verify=True)
+
+    assert result["pasteboardSet"] is True
+    assert result["pasteboardVerified"] is True
+    assert result["readbackMatches"] is True
+    assert calls[0][:4] == ["pymobiledevice3", "developer", "core-device", "copy"]
+    assert calls[1][:4] == ["pymobiledevice3", "developer", "core-device", "paste"]
+
+
+def test_device_backend_set_pasteboard_text_rejects_readback_mismatch(monkeypatch: pytest.MonkeyPatch) -> None:
+    def fake_run_command(argv: list[str], **_kwargs: object) -> Completed:
+        stdout = "xiaohongshu" if "paste" in argv else ""
+        return Completed(argv=argv, returncode=0, stdout=stdout, stderr="", duration_ms=2)
+
+    monkeypatch.setattr("coretap.backends.run_command", fake_run_command)
+
+    with pytest.raises(CoretapError) as exc:
+        DeviceBackend().set_pasteboard_text("device-udid", "小红书", verify=True)
+
+    assert exc.value.code == "PASTEBOARD_SET_FAILED"
+
+
+def test_device_backend_terminate_app_sends_signal_and_verifies(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[list[str]] = []
+    process_lookup_count = 0
+
+    def fake_run_command(argv: list[str], **kwargs: object) -> Completed:
+        nonlocal process_lookup_count
+        calls.append(argv)
+        env = kwargs.get("env")
+        assert isinstance(env, dict)
+        assert env["PYMOBILEDEVICE3_UDID"] == "device-udid"
+        if "process-id-for-bundle-id" in argv:
+            process_lookup_count += 1
+            stdout = "2372\n" if process_lookup_count == 1 else "0\n"
+            return Completed(argv=argv, returncode=0, stdout=stdout, stderr="", duration_ms=2)
+        if "send-signal-to-process" in argv:
+            return Completed(argv=argv, returncode=0, stdout='{"pid":2372}\n', stderr="", duration_ms=3)
+        if "is-running-pid" in argv:
+            return Completed(argv=argv, returncode=0, stdout="false\n", stderr="", duration_ms=1)
+        raise AssertionError(f"unexpected command: {argv}")
+
+    monkeypatch.setattr("coretap.backends.run_command", fake_run_command)
+
+    result = DeviceBackend().terminate_app("device-udid", "com.apple.AppStore")
+
+    assert result["status"] == "terminated"
+    assert result["pidBefore"] == 2372
+    assert result["pidAfter"] == 0
+    assert result["runningAfter"] is False
+    assert calls[0][:5] == ["pymobiledevice3", "developer", "dvt", "process-id-for-bundle-id", "--userspace"]
+    assert calls[1][:5] == ["pymobiledevice3", "developer", "core-device", "send-signal-to-process", "--userspace"]
+    assert calls[1][-2:] == ["2372", "9"]
+
+
+def test_device_backend_terminate_app_does_not_treat_stale_pid_as_running(monkeypatch: pytest.MonkeyPatch) -> None:
+    process_lookup_count = 0
+    checked_pids: list[str] = []
+
+    def fake_run_command(argv: list[str], **kwargs: object) -> Completed:
+        nonlocal process_lookup_count
+        env = kwargs.get("env")
+        assert isinstance(env, dict)
+        assert env["PYMOBILEDEVICE3_UDID"] == "device-udid"
+        if "process-id-for-bundle-id" in argv:
+            process_lookup_count += 1
+            stdout = "2372\n" if process_lookup_count == 1 else "4287\n"
+            return Completed(argv=argv, returncode=0, stdout=stdout, stderr="", duration_ms=2)
+        if "send-signal-to-process" in argv:
+            return Completed(argv=argv, returncode=0, stdout='{"pid":2372}\n', stderr="", duration_ms=3)
+        if "is-running-pid" in argv:
+            checked_pids.append(argv[-1])
+            return Completed(argv=argv, returncode=0, stdout="false\n", stderr="", duration_ms=1)
+        raise AssertionError(f"unexpected command: {argv}")
+
+    monkeypatch.setattr("coretap.backends.run_command", fake_run_command)
+
+    result = DeviceBackend().terminate_app("device-udid", "com.xingin.discover")
+
+    assert result["status"] == "terminated"
+    assert result["pidBefore"] == 2372
+    assert result["pidAfter"] == 4287
+    assert result["runningAfter"] is False
+    assert result["pidAfterRunning"] is False
+    assert checked_pids == ["2372", "4287"]
+
+
+def test_device_backend_terminate_app_is_idempotent_when_not_running(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[list[str]] = []
+
+    def fake_run_command(argv: list[str], **_kwargs: object) -> Completed:
+        calls.append(argv)
+        return Completed(argv=argv, returncode=0, stdout="0\n", stderr="", duration_ms=2)
+
+    monkeypatch.setattr("coretap.backends.run_command", fake_run_command)
+
+    result = DeviceBackend().terminate_app("device-udid", "com.apple.AppStore")
+
+    assert result["status"] == "not_running"
+    assert result["attempted"] is False
+    assert calls == [["pymobiledevice3", "developer", "dvt", "process-id-for-bundle-id", "--userspace", "com.apple.AppStore"]]
+
+
+def test_device_backend_uninstall_app_uses_pymobiledevice3_apps_uninstall(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[list[str]] = []
+
+    def fake_run_command(argv: list[str], **kwargs: object) -> Completed:
+        calls.append(argv)
+        env = kwargs.get("env")
+        assert isinstance(env, dict)
+        assert env["PYMOBILEDEVICE3_UDID"] == "device-udid"
+        return Completed(argv=argv, returncode=0, stdout="Uninstalled\n", stderr="", duration_ms=17)
+
+    monkeypatch.setattr("coretap.backends.run_command", fake_run_command)
+
+    result = DeviceBackend().uninstall_app("device-udid", "com.xingin.discover")
+
+    assert calls == [["pymobiledevice3", "apps", "uninstall", "--userspace", "com.xingin.discover"]]
+    assert result["status"] == "uninstalled"
+    assert result["attempted"] is True
+    assert result["stdout"] == "Uninstalled"
+
+
+def test_device_backend_uninstall_app_is_idempotent_when_missing(monkeypatch: pytest.MonkeyPatch) -> None:
+    def fake_run_command(argv: list[str], **_kwargs: object) -> Completed:
+        return Completed(argv=argv, returncode=1, stdout="", stderr="Application is not installed", duration_ms=9)
+
+    monkeypatch.setattr("coretap.backends.run_command", fake_run_command)
+
+    result = DeviceBackend().uninstall_app("device-udid", "com.xingin.discover")
+
+    assert result["status"] == "not_installed"
+    assert result["attempted"] is False
+
+
+def test_simulator_backend_open_url_uses_simctl_openurl(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[list[str]] = []
+
+    def fake_run_command(argv: list[str], **_kwargs: object) -> Completed:
+        calls.append(argv)
+        return Completed(argv=argv, returncode=0, stdout="", stderr="", duration_ms=11)
+
+    monkeypatch.setattr("coretap.backends.run_command", fake_run_command)
+
+    result = SimulatorBackend().open_url("booted", "https://example.com/search?q=openai", timeout_sec=4)
+
+    assert calls == [["xcrun", "simctl", "openurl", "booted", "https://example.com/search?q=openai"]]
+    assert result["strategy"] == "simctl-openurl"
+    assert result["attempted"] is True
+
+
+def test_device_backend_open_url_uses_webinspector_launch_userspace(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[list[str]] = []
+
+    def fake_run_command(argv: list[str], **kwargs: object) -> Completed:
+        calls.append(argv)
+        env = kwargs.get("env")
+        assert isinstance(env, dict)
+        assert env["PYMOBILEDEVICE3_UDID"] == "device-udid"
+        return Completed(argv=argv, returncode=0, stdout="launched\n", stderr="", duration_ms=23)
+
+    monkeypatch.setattr("coretap.backends.run_command", fake_run_command)
+
+    result = DeviceBackend().open_url("device-udid", "https://www.google.com/search?q=openai", timeout_sec=7)
+
+    assert calls == [
+        [
+            "pymobiledevice3",
+            "webinspector",
+            "launch",
+            "--userspace",
+            "--timeout",
+            "7",
+            "https://www.google.com/search?q=openai",
+        ]
+    ]
+    assert result["strategy"] == "webinspector-launch"
+    assert result["coredeviceTunnelMode"] == "userspace"
+    assert result["stdout"] == "launched"
+
+
+def test_device_backend_open_url_reports_webinspector_setup(monkeypatch: pytest.MonkeyPatch) -> None:
+    def fake_run_command(argv: list[str], **_kwargs: object) -> Completed:
+        return Completed(argv=argv, returncode=1, stdout="", stderr="Remote Automation is disabled", duration_ms=19)
+
+    monkeypatch.setattr("coretap.backends.run_command", fake_run_command)
+
+    with pytest.raises(CoretapError) as exc:
+        DeviceBackend().open_url("device-udid", "https://example.com")
+
+    assert exc.value.code == "WEBINSPECTOR_OPEN_URL_FAILED"
+    assert exc.value.category == "environment"
+    assert "Remote Automation" in "\n".join(exc.value.details["requiredSettings"])
 
 
 def test_simulator_backend_rejects_coredevice_press() -> None:
@@ -888,6 +1049,81 @@ def test_device_backend_drag_does_not_fallback_after_display_service_error(
     assert calls == []
 
 
+def test_device_backend_drag_falls_back_to_helper_after_worker_tunnel_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FailingPool:
+        def drag_userspace(self, *_args: object, **_kwargs: object) -> dict[str, object]:
+            raise CoretapError(
+                "COREDEVICE_DRAG_FAILED",
+                "a userspace tunnel is already active in this process",
+                stage="drag",
+                retryable=True,
+            )
+
+    helper_calls: list[dict[str, object]] = []
+
+    def fake_helper(self: DeviceBackend, device: str, **kwargs: object) -> dict[str, object]:
+        helper_calls.append({"device": device, **kwargs})
+        return {
+            "attempted": True,
+            "dryRun": False,
+            "dispatchStatus": "sent",
+            "confirmationStatus": "not_requested",
+        }
+
+    set_default_device_worker_pool(FailingPool())  # type: ignore[arg-type]
+    monkeypatch.setattr(DeviceBackend, "_drag_userspace_helper", fake_helper)
+    try:
+        result = DeviceBackend().drag_normalized(
+            "device-udid",
+            0.2,
+            0.3,
+            0.4,
+            0.5,
+            dry_run=False,
+            steps=12,
+            duration_ms=1600,
+        )
+    finally:
+        set_default_device_worker_pool(None)
+
+    assert result["dispatchStatus"] == "sent"
+    assert result["workerFallback"] == "coretap-device-hid-helper"
+    assert result["previousError"]["code"] == "COREDEVICE_DRAG_FAILED"
+    assert helper_calls == [
+        {
+            "device": "device-udid",
+            "start_x": 0.2,
+            "start_y": 0.3,
+            "end_x": 0.4,
+            "end_y": 0.5,
+            "start_hx": round(0.2 * 65535),
+            "start_hy": round(0.3 * 65535),
+            "end_hx": round(0.4 * 65535),
+            "end_hy": round(0.5 * 65535),
+            "steps": 12,
+            "duration_ms": 1600,
+        }
+    ]
+
+
+def test_device_backend_drag_uses_helper_without_registered_worker(monkeypatch: pytest.MonkeyPatch) -> None:
+    helper_calls: list[dict[str, object]] = []
+
+    def fake_helper(self: DeviceBackend, device: str, **kwargs: object) -> dict[str, object]:
+        helper_calls.append({"device": device, **kwargs})
+        return {"dispatchStatus": "sent", "attempted": True, "dryRun": False}
+
+    set_default_device_worker_pool(None)
+    monkeypatch.setattr(DeviceBackend, "_drag_userspace_helper", fake_helper)
+
+    result = DeviceBackend().drag_normalized("device-udid", 0.1, 0.2, 0.3, 0.4, dry_run=False)
+
+    assert result["dispatchStatus"] == "sent"
+    assert helper_calls[0]["device"] == "device-udid"
+
+
 def test_coredevice_worker_types_ascii_with_virtual_keyboard(monkeypatch: pytest.MonkeyPatch) -> None:
     async def run() -> dict:
         pool = CoreDeviceWorkerPool()
@@ -913,21 +1149,32 @@ def test_coredevice_worker_types_ascii_with_virtual_keyboard(monkeypatch: pytest
         ) -> None:
             calls.append(("send-text", (target, text, char_delay_ms, inter_delay_ms)))
 
-        async def fake_clear_focused_text(target: object) -> int:
-            calls.append(("clear", target))
-            return 80
+        async def fake_clear_focused_text(target: object, *, count: int = 80) -> int:
+            calls.append(("clear", (target, count)))
+            return count
+
+        async def fake_select_all_focused_text(_target: object) -> dict:
+            raise AssertionError("replace=true should not use command+a on iOS")
+
+        async def fake_clear_focused_text_for_replace(target: object) -> dict:
+            clear_count = await fake_clear_focused_text(target, count=80)
+            return {
+                "replaceStrategy": "backspace-clear",
+                "clearKeypresses": clear_count,
+            }
 
         async def fake_paste_text(*_args: object, **_kwargs: object) -> dict:
             raise AssertionError("ASCII input should not use pasteboard")
 
         monkeypatch.setattr(pool, "_get_or_open_keyboard_session", fake_get_or_open_keyboard_session)
         monkeypatch.setattr(pool, "_send_text", fake_send_text)
-        monkeypatch.setattr(pool, "_clear_focused_text", fake_clear_focused_text)
+        monkeypatch.setattr(pool, "_select_all_focused_text", fake_select_all_focused_text)
+        monkeypatch.setattr(pool, "_clear_focused_text_for_replace", fake_clear_focused_text_for_replace)
         monkeypatch.setattr(pool, "_paste_text", fake_paste_text)
 
         result = await pool._type_text_userspace(
             "device-udid",
-            text="xiaohongshu",
+            text="sampleapp",
             char_delay_ms=1,
             inter_delay_ms=2,
             paste_at=None,
@@ -942,56 +1189,182 @@ def test_coredevice_worker_types_ascii_with_virtual_keyboard(monkeypatch: pytest
     assert result["inputMethod"] == "coredevice-virtual-keyboard"
     assert result["pasteboardSet"] is False
     assert result["clearKeypresses"] == 80
-    assert result["sessionTypedCharacterCount"] == len("xiaohongshu")
+    assert result["replaceStrategy"] == "backspace-clear"
+    assert result["sessionTypedCharacterCount"] == len("sampleapp")
     assert result["calls"][0] == ("open", "device-udid")
     assert result["calls"][1][0] == "clear"
     assert result["calls"][2][0] == "send-text"
 
 
-def test_coredevice_worker_types_cjk_with_pinyin_keyboard(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_coredevice_worker_treats_shifted_ascii_as_paste_text() -> None:
+    assert _supports_unshifted_virtual_keyboard_text("sampleapp") is True
+    assert _supports_unshifted_virtual_keyboard_text("example.com/path") is True
+    assert _supports_unshifted_virtual_keyboard_text("openai") is True
+    assert _supports_unshifted_virtual_keyboard_text("Safari") is True
+    assert _supports_unshifted_virtual_keyboard_text("OpenAI") is True
+    assert _supports_unshifted_virtual_keyboard_text("openai codex") is False
+    assert _supports_unshifted_virtual_keyboard_text("https://example.com") is False
+    assert _supports_unshifted_virtual_keyboard_text("Hello!") is False
+
+
+def test_coredevice_worker_pastes_shifted_ascii_with_last_tap_anchor(monkeypatch: pytest.MonkeyPatch) -> None:
     async def run() -> dict:
         pool = CoreDeviceWorkerPool()
         pool._lock = asyncio.Lock()
         calls: list[tuple[str, object]] = []
-
-        class FakeService:
-            async def create_keyboard_service(self) -> int:
-                calls.append(("create-keyboard", 123))
-                return 123
-
-            async def send_keyboard(self, keyboard_service_id: int, usages: tuple[int, ...]) -> None:
-                calls.append(("send-keyboard", (keyboard_service_id, usages)))
-
-            async def send_touchscreen(self, state: int, x: int, y: int) -> None:
-                calls.append(("send-touchscreen", (state, x, y)))
-
-        session = SimpleNamespace(
+        touch_session = SimpleNamespace(
             device="device-udid",
-            keyboard_service_id=None,
-            service=FakeService(),
             typed_characters=0,
+            keyboard_service_id=None,
             last_used_at=0,
+            last_tap_normalized={"x": 0.5, "y": 0.54},
         )
+        pool._sessions["device-udid"] = touch_session
 
-        async def fake_get_or_open_keyboard_session(device: str) -> tuple[object, str]:
-            calls.append(("open", device))
-            return session, "created"
+        async def fake_get_or_open_session(device: str) -> tuple[object, str]:
+            calls.append(("open-touch", device))
+            return touch_session, "reused"
 
-        async def fake_send_text(
+        async def fake_paste_text(
             target: object,
             *,
             text: str,
             char_delay_ms: int,
             inter_delay_ms: int,
-        ) -> None:
-            calls.append(("send-text", (target, text, char_delay_ms, inter_delay_ms)))
+            paste_at: dict[str, float] | None,
+            paste_hold_ms: int,
+            clear_existing: bool,
+        ) -> dict:
+            calls.append(("paste", (target, text, paste_at, paste_hold_ms, clear_existing)))
+            return {"inputMethod": "coredevice-pasteboard-edit-menu", "pasteboardSet": True, "pasteAnchor": paste_at}
 
+        async def fake_get_or_open_keyboard_session(_device: str) -> tuple[object, str]:
+            raise AssertionError("shifted ASCII should not use virtual keyboard")
+
+        monkeypatch.setattr(pool, "_get_or_open_session", fake_get_or_open_session)
+        monkeypatch.setattr(pool, "_paste_text", fake_paste_text)
         monkeypatch.setattr(pool, "_get_or_open_keyboard_session", fake_get_or_open_keyboard_session)
-        monkeypatch.setattr(pool, "_send_text", fake_send_text)
 
         result = await pool._type_text_userspace(
             "device-udid",
-            text="小红书",
+            text="https://example.com",
+            char_delay_ms=1,
+            inter_delay_ms=2,
+            paste_at=None,
+            paste_hold_ms=1300,
+            clear_existing=False,
+        )
+        result["calls"] = calls
+        return result
+
+    result = asyncio.run(run())
+
+    assert result["inputMethod"] == "coredevice-pasteboard-edit-menu"
+    assert result["pasteboardSet"] is True
+    assert result["pasteAnchor"] == {"x": 0.5, "y": 0.54, "source": "last-tap"}
+    assert result["sessionTypedCharacterCount"] == len("https://example.com")
+    assert result["calls"][0] == ("open-touch", "device-udid")
+    assert result["calls"][1][0] == "paste"
+
+
+def test_coredevice_worker_types_cjk_with_last_tap_paste_anchor(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def run() -> dict:
+        pool = CoreDeviceWorkerPool()
+        pool._lock = asyncio.Lock()
+        calls: list[tuple[str, object]] = []
+        touch_session = SimpleNamespace(
+            device="device-udid",
+            typed_characters=0,
+            keyboard_service_id=None,
+            last_used_at=0,
+            last_tap_normalized={"x": 0.25, "y": 0.09},
+        )
+        pool._sessions["device-udid"] = touch_session
+
+        async def fake_get_or_open_session(device: str) -> tuple[object, str]:
+            calls.append(("open-touch", device))
+            return touch_session, "reused"
+
+        async def fake_paste_text(
+            target: object,
+            *,
+            text: str,
+            char_delay_ms: int,
+            inter_delay_ms: int,
+            paste_at: dict[str, float] | None,
+            paste_hold_ms: int,
+            clear_existing: bool,
+        ) -> dict:
+            calls.append(("paste", (target, text, paste_at, paste_hold_ms, clear_existing)))
+            return {
+                "inputMethod": "coredevice-pasteboard-edit-menu",
+                "pasteboardSet": True,
+                "pasteAnchor": paste_at,
+                "clearExisting": clear_existing,
+            }
+
+        async def fake_get_or_open_keyboard_session(_device: str) -> tuple[object, str]:
+            raise AssertionError("CJK step input with an anchor should prefer pasteboard over pinyin")
+
+        monkeypatch.setattr(pool, "_get_or_open_session", fake_get_or_open_session)
+        monkeypatch.setattr(pool, "_paste_text", fake_paste_text)
+        monkeypatch.setattr(pool, "_get_or_open_keyboard_session", fake_get_or_open_keyboard_session)
+
+        result = await pool._type_text_userspace(
+            "device-udid",
+            text="测试",
+            char_delay_ms=1,
+            inter_delay_ms=2,
+            paste_at=None,
+            paste_hold_ms=1300,
+            clear_existing=False,
+        )
+        result["calls"] = calls
+        return result
+
+    result = asyncio.run(run())
+
+    assert result["inputMethod"] == "coredevice-pasteboard-edit-menu"
+    assert result["pasteboardSet"] is True
+    assert result["pasteAnchor"] == {"x": 0.25, "y": 0.09, "source": "last-tap"}
+    assert result["sessionTypedCharacterCount"] == len("测试")
+    assert result["calls"][0] == ("open-touch", "device-udid")
+    assert result["calls"][1][0] == "paste"
+
+
+def test_coredevice_worker_types_cjk_without_paste_anchor_using_current_focus(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def run() -> dict:
+        pool = CoreDeviceWorkerPool()
+        pool._lock = asyncio.Lock()
+        calls: list[tuple[str, object]] = []
+        session = SimpleNamespace(
+            device="device-udid",
+            typed_characters=0,
+            keyboard_service_id=None,
+            last_used_at=0,
+        )
+
+        async def fake_get_or_open_keyboard_session(device: str) -> tuple[object, str]:
+            calls.append(("open-keyboard", device))
+            return session, "created"
+
+        async def fake_input_pinyin_keyboard_text(
+            target: object,
+            *,
+            text: str,
+            char_delay_ms: int,
+            inter_delay_ms: int,
+            clear_existing: bool,
+        ) -> dict:
+            calls.append(("input-pinyin", (target, text, char_delay_ms, inter_delay_ms, clear_existing)))
+            return {"inputMethod": "coredevice-pinyin-keyboard", "pasteboardSet": False, "convertedText": "ceshi"}
+
+        monkeypatch.setattr(pool, "_get_or_open_keyboard_session", fake_get_or_open_keyboard_session)
+        monkeypatch.setattr(pool, "_input_pinyin_keyboard_text", fake_input_pinyin_keyboard_text)
+
+        result = await pool._type_text_userspace(
+            "device-udid",
+            text="测试",
             char_delay_ms=1,
             inter_delay_ms=2,
             paste_at=None,
@@ -1004,35 +1377,9 @@ def test_coredevice_worker_types_cjk_with_pinyin_keyboard(monkeypatch: pytest.Mo
     result = asyncio.run(run())
 
     assert result["inputMethod"] == "coredevice-pinyin-keyboard"
-    assert result["convertedText"] == "xiaohongshu"
-    assert result["candidateCommitAction"] == "tap-first-candidate"
-    assert result["candidateSettleMs"] == 500
-    assert result["candidateCommitPoint"]["normalized"] == {"x": 0.2, "y": 0.878}
-    assert result["sessionTypedCharacterCount"] == len("小红书")
-    assert result["calls"][0] == ("open", "device-udid")
-    assert result["calls"][1][0] == "send-text"
-    assert result["calls"][1][1][1] == "xiaohongshu"
-    assert any(call[0] == "send-touchscreen" for call in result["calls"])
-
-
-def test_coredevice_worker_rejects_non_cjk_without_paste_anchor() -> None:
-    async def run() -> None:
-        pool = CoreDeviceWorkerPool()
-        pool._lock = asyncio.Lock()
-        await pool._type_text_userspace(
-            "device-udid",
-            text="こんにちは",
-            char_delay_ms=1,
-            inter_delay_ms=2,
-            paste_at=None,
-            paste_hold_ms=1300,
-            clear_existing=False,
-        )
-
-    with pytest.raises(CoretapError) as exc:
-        asyncio.run(run())
-
-    assert exc.value.code == "TEXT_INPUT_TARGET_UNKNOWN"
+    assert result["pasteboardSet"] is False
+    assert result["calls"][0] == ("open-keyboard", "device-udid")
+    assert result["calls"][1][0] == "input-pinyin"
 
 
 def test_coredevice_worker_touch_retry_keeps_existing_rsd(monkeypatch: pytest.MonkeyPatch) -> None:

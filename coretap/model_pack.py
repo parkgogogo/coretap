@@ -22,7 +22,9 @@ PUBLIC_MODEL_PACK_VERSION = "0.1.0"
 PUBLIC_MODEL_REPO = "mlx-community/MAI-UI-2B-6bit-v2"
 PUBLIC_MODEL_REVISION = "cb57cf2fc99f28cb7691459f712d2a276342f804"
 PUBLIC_PROMPT_VERSION = "grounding-v1"
+PUBLIC_VISUAL_OBSERVE_PROMPT_VERSION = "visual-observe-v1"
 PUBLIC_RUNTIME_ID = "mlx-vlm-process-worker-v1"
+VISUAL_OBSERVE_ROLES = {"appIcon", "button", "tab", "input", "toggle", "image", "navigation", "unknown"}
 
 INTERNAL_FIXTURE_PROFILE = "internal:test-fixture-grounder"
 
@@ -483,6 +485,22 @@ def grounding_prompt(target: str, width: int, height: int) -> str:
     return f'Locate {target}. Output only {{"coordinate":[x,y]}} in 0-1000 coordinates.'
 
 
+def visual_observe_prompt(width: int, height: int, *, max_elements: int = 40) -> str:
+    return (
+        "Inspect this mobile UI screenshot and list the important visible interactive visual elements, "
+        "especially icons or controls that may not have OCR text. "
+        "Return only one JSON object with keys summary and elements. "
+        f"elements must contain at most {max_elements} items. "
+        "Each item must use: label, role, center, bbox, confidence. "
+        "role must be one of appIcon, button, tab, input, toggle, image, navigation, unknown. "
+        "center must be [x,y] in 0-1000 coordinates. "
+        "bbox, when known, must be [x1,y1,x2,y2] in 0-1000 coordinates. "
+        "confidence is a number from 0 to 1. "
+        "Focus on actionable icons/buttons/tabs/inputs and major visual cards; skip decorative backgrounds. "
+        f"The screenshot size is {width}x{height}px."
+    )
+
+
 def _extract_json_object(raw: str) -> dict[str, Any] | None:
     try:
         data = json.loads(raw)
@@ -584,6 +602,156 @@ def parse_grounding_output(raw: str, *, width: int, height: int) -> dict[str, An
     }
 
 
+def _as_float(value: Any) -> float | None:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _coordinate_pair(value: Any) -> tuple[float, float] | None:
+    if isinstance(value, dict):
+        x = _as_float(value.get("x"))
+        y = _as_float(value.get("y"))
+    elif isinstance(value, list | tuple) and len(value) == 2:
+        x = _as_float(value[0])
+        y = _as_float(value[1])
+    else:
+        return None
+    if x is None or y is None or not (0 <= x <= 1000 and 0 <= y <= 1000):
+        return None
+    return x, y
+
+
+def _bbox_quad(value: Any) -> tuple[float, float, float, float] | None:
+    if isinstance(value, dict):
+        x = _as_float(value.get("x"))
+        y = _as_float(value.get("y"))
+        width = _as_float(value.get("width"))
+        height = _as_float(value.get("height"))
+        if x is None or y is None or width is None or height is None:
+            return None
+        x1, y1, x2, y2 = x, y, x + width, y + height
+    elif isinstance(value, list | tuple) and len(value) == 4:
+        x1 = _as_float(value[0])
+        y1 = _as_float(value[1])
+        x2 = _as_float(value[2])
+        y2 = _as_float(value[3])
+        if x1 is None or y1 is None or x2 is None or y2 is None:
+            return None
+    else:
+        return None
+    left = min(x1, x2)
+    top = min(y1, y2)
+    right = max(x1, x2)
+    bottom = max(y1, y2)
+    if left < 0 or top < 0 or right > 1000 or bottom > 1000 or right <= left or bottom <= top:
+        return None
+    return left, top, right, bottom
+
+
+def _confidence(value: Any) -> float | None:
+    confidence = _as_float(value)
+    if confidence is None:
+        return None
+    return max(0.0, min(1.0, confidence))
+
+
+def parse_visual_observe_output(raw: str, *, width: int, height: int, max_elements: int = 40) -> dict[str, Any]:
+    data = _extract_json_object(raw)
+    if not isinstance(data, dict):
+        return {
+            "schema": "coretap.visual.observe.v1",
+            "enabled": True,
+            "status": "invalid",
+            "summary": "",
+            "elements": [],
+            "rawOutput": raw,
+            "reason": "no json object",
+            "model": {
+                "profile": PUBLIC_MODEL_PROFILE,
+                "packVersion": PUBLIC_MODEL_PACK_VERSION,
+                "promptVersion": PUBLIC_VISUAL_OBSERVE_PROMPT_VERSION,
+                "runtimeVersion": PUBLIC_RUNTIME_ID,
+            },
+        }
+    raw_elements = data.get("elements")
+    if not isinstance(raw_elements, list):
+        raw_elements = []
+    elements: list[dict[str, Any]] = []
+    seen: set[tuple[str, str, int, int]] = set()
+    for item in raw_elements:
+        if not isinstance(item, dict):
+            continue
+        label = str(item.get("label") or "").strip()
+        if not label:
+            continue
+        role = str(item.get("role") or "unknown").strip() or "unknown"
+        if role not in VISUAL_OBSERVE_ROLES:
+            role = "unknown"
+        bbox_model = _bbox_quad(item.get("bbox") if "bbox" in item else item.get("bbox_2d"))
+        center_model = _coordinate_pair(item.get("center") if "center" in item else item.get("coordinate"))
+        if center_model is None and bbox_model is not None:
+            center_model = ((bbox_model[0] + bbox_model[2]) / 2, (bbox_model[1] + bbox_model[3]) / 2)
+        if center_model is None:
+            continue
+        cx, cy = center_model
+        bbox_normalized = None
+        bbox_px = None
+        if bbox_model is not None:
+            x1, y1, x2, y2 = bbox_model
+            bbox_normalized = {
+                "x": x1 / 1000,
+                "y": y1 / 1000,
+                "width": (x2 - x1) / 1000,
+                "height": (y2 - y1) / 1000,
+            }
+            bbox_px = {
+                "x": (x1 / 1000) * width,
+                "y": (y1 / 1000) * height,
+                "width": ((x2 - x1) / 1000) * width,
+                "height": ((y2 - y1) / 1000) * height,
+            }
+        normalized = {"x": cx / 1000, "y": cy / 1000}
+        dedupe_key = (label.casefold(), role, round(normalized["x"] * 1000), round(normalized["y"] * 1000))
+        if dedupe_key in seen:
+            continue
+        seen.add(dedupe_key)
+        elements.append(
+            {
+                "type": "visual",
+                "source": "vlm",
+                "label": label,
+                "role": role,
+                "confidence": _confidence(item.get("confidence")),
+                "center": normalized,
+                "centerPx": {"x": normalized["x"] * width, "y": normalized["y"] * height},
+                "bbox": bbox_normalized,
+                "bboxPx": bbox_px,
+            }
+        )
+        if len(elements) >= max_elements:
+            break
+    return {
+        "schema": "coretap.visual.observe.v1",
+        "enabled": True,
+        "status": "ready",
+        "profile": PUBLIC_MODEL_PROFILE,
+        "promptVersion": PUBLIC_VISUAL_OBSERVE_PROMPT_VERSION,
+        "summary": str(data.get("summary") or "").strip(),
+        "elements": elements,
+        "rawElementCount": len(raw_elements),
+        "rawOutput": raw,
+        "frame": {"widthPx": width, "heightPx": height},
+        "model": {
+            "profile": PUBLIC_MODEL_PROFILE,
+            "packVersion": PUBLIC_MODEL_PACK_VERSION,
+            "promptVersion": PUBLIC_VISUAL_OBSERVE_PROMPT_VERSION,
+            "runtimeVersion": PUBLIC_RUNTIME_ID,
+        },
+    }
+
+
 def _run_model_prompt(image: Path, prompt: str, *, profile: str, max_tokens: int) -> str:
     _require_public_profile(profile)
     _load_model()
@@ -616,6 +784,15 @@ def run_grounding_model(image: Path, target: str, *, profile: str = PUBLIC_MODEL
     return _run_grounding_model_inprocess(image, target, profile=profile)
 
 
+def run_visual_observe_model(image: Path, *, profile: str = PUBLIC_MODEL_PROFILE, max_elements: int = 40) -> dict[str, Any]:
+    if not _is_model_worker_process():
+        return _MODEL_PROCESS_CLIENT.request(
+            {"action": "observe", "profile": profile, "image": str(image), "maxElements": max_elements},
+            timeout=60.0,
+        )
+    return _run_visual_observe_model_inprocess(image, profile=profile, max_elements=max_elements)
+
+
 def _run_grounding_model_inprocess(image: Path, target: str, *, profile: str = PUBLIC_MODEL_PROFILE) -> dict[str, Any]:
     _require_public_profile(profile)
     width, height = png_size(image)
@@ -627,6 +804,22 @@ def _run_grounding_model_inprocess(image: Path, target: str, *, profile: str = P
         {
             "schema": "coretap.ground.result.v1",
             "target": {"description": target},
+            "durationMs": round((time.monotonic() - started) * 1000),
+            "rawOutput": raw,
+        }
+    )
+    return parsed
+
+
+def _run_visual_observe_model_inprocess(image: Path, *, profile: str = PUBLIC_MODEL_PROFILE, max_elements: int = 40) -> dict[str, Any]:
+    _require_public_profile(profile)
+    width, height = png_size(image)
+    prompt = visual_observe_prompt(width, height, max_elements=max_elements)
+    started = time.monotonic()
+    raw = _run_model_prompt(image, prompt, profile=profile, max_tokens=768)
+    parsed = parse_visual_observe_output(raw, width=width, height=height, max_elements=max_elements)
+    parsed.update(
+        {
             "durationMs": round((time.monotonic() - started) * 1000),
             "rawOutput": raw,
         }
@@ -653,6 +846,10 @@ def _model_worker_loop() -> int:
                 image = Path(str(request.get("image") or ""))
                 target = str(request.get("target") or "")
                 result = _run_grounding_model_inprocess(image, target, profile=profile)
+            elif action == "observe":
+                image = Path(str(request.get("image") or ""))
+                max_elements = int(request.get("maxElements") or 40)
+                result = _run_visual_observe_model_inprocess(image, profile=profile, max_elements=max_elements)
             else:
                 raise CoretapError(
                     "MODEL_WORKER_INVALID_REQUEST",

@@ -157,6 +157,21 @@ def _pinyin_keyboard_text(text: str) -> str | None:
     return keyboard_text
 
 
+def _supports_unshifted_virtual_keyboard_text(text: str) -> bool:
+    if any(ch.isspace() for ch in text):
+        return False
+    from pymobiledevice3.remote.core_device.hid_service import ASCII_TO_HID
+
+    for ch in text:
+        mapping = ASCII_TO_HID.get(ch)
+        if mapping is None:
+            return False
+        _usage, needs_shift = mapping
+        if needs_shift and not ch.isalpha():
+            return False
+    return True
+
+
 def _paste_menu_point_for_anchor(anchor_x: float, anchor_y: float) -> tuple[float, float]:
     paste_x = _clamp(anchor_x - 0.07, 0.08, 0.92)
     vertical_offset = 0.059 if anchor_y < 0.18 else -0.059
@@ -453,6 +468,26 @@ class CoreDeviceWorkerPool:
                 "typedCharacters": len(text),
                 "charDelayMs": char_delay_ms,
                 "interDelayMs": inter_delay_ms,
+                "coredeviceTunnelMode": "userspace",
+                "workerKind": "coredevice-userspace-persistent",
+                "durationMs": round((time.monotonic() - started) * 1000),
+            }
+        )
+        return result
+
+    def set_pasteboard_text_userspace(self, device: str, *, text: str, verify: bool = True) -> dict[str, Any]:
+        started = time.monotonic()
+        result = self._run(
+            self._set_pasteboard_text_userspace(device, text=text, verify=verify),
+            stage="pasteboard",
+            device=device,
+        )
+        result.update(
+            {
+                "attempted": True,
+                "dryRun": False,
+                "textLength": len(text),
+                "byteLength": len(text.encode("utf-8")),
                 "coredeviceTunnelMode": "userspace",
                 "workerKind": "coredevice-userspace-persistent",
                 "durationMs": round((time.monotonic() - started) * 1000),
@@ -883,7 +918,14 @@ class CoreDeviceWorkerPool:
                     inter_delay_ms=inter_delay_ms,
                     clear_existing=clear_existing,
                 )
-            if paste_at is None and _pinyin_keyboard_text(text):
+            if paste_at is None:
+                existing_touch_session = self._sessions.get(device)
+                if existing_touch_session is not None and existing_touch_session.last_tap_normalized is not None:
+                    paste_at = {
+                        **existing_touch_session.last_tap_normalized,
+                        "source": "last-tap",
+                    }
+            if paste_at is None and _pinyin_keyboard_text(text) is not None:
                 return await self._type_text_with_pinyin_keyboard_session(
                     device,
                     text=text,
@@ -894,7 +936,7 @@ class CoreDeviceWorkerPool:
             if paste_at is None:
                 raise CoretapError(
                     "TEXT_INPUT_TARGET_UNKNOWN",
-                    "Non-ASCII text input requires a paste anchor resolved from a visible text field",
+                    "Paste-backed text input requires a paste anchor resolved from a visible text field",
                     category="usage",
                     stage="type",
                     details={"device": device, "textLength": len(text)},
@@ -959,6 +1001,48 @@ class CoreDeviceWorkerPool:
                 **input_result,
                 **({"retryCloseScope": retry_close_scope} if retry_close_scope else {}),
                 **({"displayServiceRecovery": display_service_recovery} if display_service_recovery else {}),
+            }
+
+    async def _set_pasteboard_text_userspace(self, device: str, *, text: str, verify: bool) -> dict[str, Any]:
+        assert self._lock is not None
+        async with self._lock:
+            from pymobiledevice3.remote.core_device.pasteboard_service import PasteboardService
+
+            try:
+                rsd_session, status = await self._get_or_open_rsd(device)
+                async with PasteboardService(rsd_session.rsd) as pasteboard:
+                    await pasteboard.set_text(text)
+                    readback = await pasteboard.get_text() if verify else None
+                rsd_session.last_used_at = time.monotonic()
+                rsd_session.requests += 1
+            except Exception as exc:
+                raise CoretapError(
+                    "PASTEBOARD_SET_FAILED",
+                    f"Could not set CoreDevice pasteboard text: {exc}",
+                    stage="pasteboard",
+                    category="infrastructure",
+                    retryable=is_recoverable_userspace_tunnel_error(exc),
+                    details={"device": device, "errorType": type(exc).__name__},
+                ) from exc
+            if verify and readback != text:
+                raise CoretapError(
+                    "PASTEBOARD_SET_FAILED",
+                    "CoreDevice pasteboard readback did not match requested text",
+                    stage="pasteboard",
+                    category="infrastructure",
+                    details={
+                        "device": device,
+                        "expectedLength": len(text),
+                        "readbackLength": len(readback or ""),
+                        "readbackMatches": False,
+                    },
+                )
+            return {
+                "operation": "set-pasteboard-text",
+                "pasteboardSet": True,
+                "pasteboardVerified": bool(verify),
+                "readbackMatches": True if verify else None,
+                "sessionStatus": status,
             }
 
     async def _capture_screenshot_userspace(self, device: str) -> dict[str, Any]:
@@ -1416,9 +1500,7 @@ class CoreDeviceWorkerPool:
         }
 
     def _supports_virtual_keyboard_text(self, text: str) -> bool:
-        from pymobiledevice3.remote.core_device.hid_service import ASCII_TO_HID
-
-        return all(ch in ASCII_TO_HID for ch in text)
+        return _supports_unshifted_virtual_keyboard_text(text)
 
     async def _input_keyboard_text(
         self,
@@ -1429,9 +1511,9 @@ class CoreDeviceWorkerPool:
         inter_delay_ms: int,
         clear_existing: bool,
     ) -> dict[str, Any]:
-        clear_count = 0
+        replace_result: dict[str, Any] = {"replaceStrategy": None, "clearKeypresses": 0}
         if clear_existing:
-            clear_count = await self._clear_focused_text(session)
+            replace_result = await self._clear_focused_text_for_replace(session)
         if inter_delay_ms:
             await asyncio.sleep(inter_delay_ms / 1000)
         await self._send_text(
@@ -1444,7 +1526,7 @@ class CoreDeviceWorkerPool:
             "inputMethod": "coredevice-virtual-keyboard",
             "pasteboardSet": False,
             "clearExisting": clear_existing,
-            "clearKeypresses": clear_count,
+            **replace_result,
         }
 
     async def _input_pinyin_keyboard_text(
@@ -1456,14 +1538,12 @@ class CoreDeviceWorkerPool:
         inter_delay_ms: int,
         clear_existing: bool,
     ) -> dict[str, Any]:
-        from pymobiledevice3.remote.core_device.hid_service import TOUCHSCREEN_STATE_CONTACT, TOUCHSCREEN_STATE_RELEASE
-
         keyboard_text = _pinyin_keyboard_text(text)
         if keyboard_text is None:
             raise ValueError(f"text cannot be converted to pinyin keyboard input: {text!r}")
-        clear_count = 0
+        replace_result: dict[str, Any] = {"replaceStrategy": None, "clearKeypresses": 0}
         if clear_existing:
-            clear_count = await self._clear_focused_text(session)
+            replace_result = await self._clear_focused_text_for_replace(session)
         if inter_delay_ms:
             await asyncio.sleep(inter_delay_ms / 1000)
         await self._send_text(
@@ -1476,26 +1556,17 @@ class CoreDeviceWorkerPool:
             session.keyboard_service_id = await session.service.create_keyboard_service()
         candidate_settle_ms = 500
         await asyncio.sleep(candidate_settle_ms / 1000)
-        candidate_x = 0.2
-        candidate_y = 0.878
-        candidate_hx = int(round(candidate_x * 65535))
-        candidate_hy = int(round(candidate_y * 65535))
-        await session.service.send_touchscreen(TOUCHSCREEN_STATE_CONTACT, candidate_hx, candidate_hy)
-        await asyncio.sleep(0.05)
-        await session.service.send_touchscreen(TOUCHSCREEN_STATE_RELEASE, candidate_hx, candidate_hy)
+        await self._send_keyboard_key(session, key="space", count=1, inter_delay_ms=0)
         await asyncio.sleep(0.25)
         return {
             "inputMethod": "coredevice-pinyin-keyboard",
             "pasteboardSet": False,
             "convertedText": keyboard_text,
             "candidateSettleMs": candidate_settle_ms,
-            "candidateCommitAction": "tap-first-candidate",
-            "candidateCommitPoint": {
-                "normalized": {"x": candidate_x, "y": candidate_y},
-                "hidU16": {"x": candidate_hx, "y": candidate_hy},
-            },
+            "candidateCommitAction": "space-first-candidate",
+            "candidateCommitKey": "space",
             "clearExisting": clear_existing,
-            "clearKeypresses": clear_count,
+            **replace_result,
         }
 
     async def _input_text(
@@ -1509,12 +1580,10 @@ class CoreDeviceWorkerPool:
         paste_hold_ms: int,
         clear_existing: bool,
     ) -> dict[str, Any]:
-        from pymobiledevice3.remote.core_device.hid_service import ASCII_TO_HID
-
-        if all(ch in ASCII_TO_HID for ch in text):
-            clear_count = 0
+        if _supports_unshifted_virtual_keyboard_text(text):
+            replace_result: dict[str, Any] = {"replaceStrategy": None, "clearKeypresses": 0}
             if clear_existing:
-                clear_count = await self._clear_focused_text(session)
+                replace_result = await self._clear_focused_text_for_replace(session)
             if inter_delay_ms:
                 await asyncio.sleep(inter_delay_ms / 1000)
             await self._send_text(
@@ -1527,7 +1596,7 @@ class CoreDeviceWorkerPool:
                 "inputMethod": "coredevice-virtual-keyboard",
                 "pasteboardSet": False,
                 "clearExisting": clear_existing,
-                "clearKeypresses": clear_count,
+                **replace_result,
             }
         return await self._paste_text(
             session,
@@ -1552,10 +1621,6 @@ class CoreDeviceWorkerPool:
     ) -> dict[str, Any]:
         from pymobiledevice3.remote.core_device.pasteboard_service import PasteboardService
 
-        clear_count = 0
-        if clear_existing:
-            clear_count = await self._clear_focused_text(session)
-
         rsd_session = self._rsd_sessions[session.device]
         async with PasteboardService(rsd_session.rsd) as pasteboard:
             await pasteboard.set_text(text)
@@ -1563,7 +1628,12 @@ class CoreDeviceWorkerPool:
         anchor, anchor_source, paste_mode = self._resolve_paste_anchor(session, paste_at)
         await asyncio.sleep(inter_delay_ms / 1000)
         menu_point: dict[str, Any] | None = None
-        if paste_mode == "menu":
+        replace_result: dict[str, Any] = {"replaceStrategy": None, "clearKeypresses": 0}
+        if clear_existing:
+            replace_result = await self._clear_focused_text_for_replace(session)
+        if paste_mode == "shortcut":
+            menu_point = await self._paste_focused_text(session)
+        elif paste_mode == "menu":
             assert anchor is not None
             menu_point = await self._tap_visible_paste_menu(session, paste_x=anchor["x"], paste_y=anchor["y"])
         else:
@@ -1576,14 +1646,15 @@ class CoreDeviceWorkerPool:
             )
         if char_delay_ms:
             await asyncio.sleep(char_delay_ms / 1000)
+        input_method = "coredevice-pasteboard-keyboard-shortcut" if paste_mode == "shortcut" else "coredevice-pasteboard-edit-menu"
         return {
-            "inputMethod": "coredevice-pasteboard-edit-menu",
+            "inputMethod": input_method,
             "pasteAnchor": {"source": anchor_source, **anchor} if anchor is not None else {"source": anchor_source},
             "pasteMenuTap": menu_point,
             "pasteMode": paste_mode,
             "pasteHoldMs": paste_hold_ms,
             "clearExisting": clear_existing,
-            "clearKeypresses": clear_count,
+            **replace_result,
         }
 
     def _resolve_paste_anchor(
@@ -1593,15 +1664,15 @@ class CoreDeviceWorkerPool:
     ) -> tuple[dict[str, float] | None, str, str]:
         if paste_at is not None:
             mode = str(paste_at.get("mode") or "anchor")
-            if mode == "shortcut":
+            if mode not in {"anchor", "menu", "shortcut"}:
                 raise CoretapError(
                     "TEXT_INPUT_UNSUPPORTED",
-                    "CoreDevice keyboard shortcut paste is not supported for iOS text input",
+                    "pasteAt.mode must be anchor, menu, or shortcut",
                     category="usage",
                     stage="type",
                     details={"mode": mode},
                 )
-            source = "visible-edit-menu" if mode == "menu" else "explicit"
+            source = str(paste_at.get("source") or ("visible-edit-menu" if mode == "menu" else "explicit"))
             return {"x": float(paste_at["x"]), "y": float(paste_at["y"])}, source, mode
         raise CoretapError(
             "TEXT_INPUT_TARGET_UNKNOWN",
@@ -1637,6 +1708,40 @@ class CoreDeviceWorkerPool:
             await session.service.send_keyboard(session.keyboard_service_id, ())
         await asyncio.sleep(0.15)
         return count
+
+    async def _select_all_focused_text(self, session: Any) -> dict[str, Any]:
+        from pymobiledevice3.remote.core_device.hid_service import KEY_A, KEY_LEFT_GUI
+
+        if session.keyboard_service_id is None:
+            session.keyboard_service_id = await session.service.create_keyboard_service()
+        await session.service.send_keyboard(session.keyboard_service_id, (KEY_LEFT_GUI, KEY_A))
+        await session.service.send_keyboard(session.keyboard_service_id, ())
+        await asyncio.sleep(0.12)
+        return {
+            "replaceStrategy": "select-all",
+            "selectAllShortcut": {"modifier": "left-gui", "key": "a"},
+            "clearKeypresses": 0,
+        }
+
+    async def _clear_focused_text_for_replace(self, session: Any) -> dict[str, Any]:
+        clear_count = await self._clear_focused_text(session, count=80)
+        return {
+            "replaceStrategy": "backspace-clear",
+            "clearKeypresses": clear_count,
+        }
+
+    async def _paste_focused_text(self, session: Any) -> dict[str, Any]:
+        from pymobiledevice3.remote.core_device.hid_service import KEY_LEFT_GUI, KEY_V
+
+        if session.keyboard_service_id is None:
+            session.keyboard_service_id = await session.service.create_keyboard_service()
+        await session.service.send_keyboard(session.keyboard_service_id, (KEY_LEFT_GUI, KEY_V))
+        await session.service.send_keyboard(session.keyboard_service_id, ())
+        await asyncio.sleep(0.25)
+        return {
+            "strategy": "keyboard-shortcut",
+            "shortcut": {"modifier": "left-gui", "key": "v"},
+        }
 
     async def _paste_via_edit_menu(
         self,

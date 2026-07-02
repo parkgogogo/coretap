@@ -133,7 +133,7 @@ def ensure_state() -> dict[str, Path]:
         "receipts": state_root() / "install-receipts",
         "cache": cache_root(),
         "downloads": cache_root() / "downloads",
-        "artifacts": Path("artifacts") / "coretap",
+        "artifacts": cache_root() / "artifacts",
     }
     for path in roots.values():
         path.mkdir(parents=True, exist_ok=True)
@@ -147,7 +147,7 @@ def run_id(prefix: str = "run") -> str:
 
 
 def artifact_dir(root: Path | None = None) -> Path:
-    base = root or (Path("artifacts") / "coretap")
+    base = root or (cache_root() / "artifacts")
     path = base / run_id()
     path.mkdir(parents=True, exist_ok=False)
     return path

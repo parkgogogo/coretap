@@ -79,6 +79,59 @@ async def tap_userspace(device: str, x: int, y: int) -> None:
                 await close()
 
 
+async def drag_userspace(
+    device: str,
+    *,
+    start_x: int,
+    start_y: int,
+    end_x: int,
+    end_y: int,
+    steps: int,
+    duration_ms: int,
+) -> None:
+    from pymobiledevice3.remote import userspace_tunnel
+    from pymobiledevice3.remote.core_device.hid_service import (
+        TOUCHSCREEN_STATE_CONTACT,
+        TOUCHSCREEN_STATE_RELEASE,
+    )
+
+    stage = "establish-rsd"
+    rsd = await userspace_tunnel.establish_userspace_rsd(serial=device)
+    try:
+        stage = "touch-session"
+        async with bounded_touch_session(rsd) as service:
+            stage = "send-drag"
+            step_count = max(1, steps)
+            sleep_s = max(0, duration_ms) / 1000 / step_count
+            for index in range(step_count + 1):
+                ratio = index / step_count
+                hx = int(round(start_x + (end_x - start_x) * ratio))
+                hy = int(round(start_y + (end_y - start_y) * ratio))
+                await service.send_touchscreen(TOUCHSCREEN_STATE_CONTACT, hx, hy)
+                if index < step_count and sleep_s:
+                    await asyncio.sleep(sleep_s)
+            stage = "send-release"
+            await service.send_touchscreen(TOUCHSCREEN_STATE_RELEASE, end_x, end_y)
+        stage = "emit-result"
+        emit(
+            {
+                "event": "dispatch_sent",
+                "start": {"x": start_x, "y": start_y},
+                "end": {"x": end_x, "y": end_y},
+                "steps": steps,
+                "durationMs": duration_ms,
+            }
+        )
+    except BaseException as exc:
+        emit({"event": "error", "errorType": type(exc).__name__, "message": str(exc), "stage": stage})
+        raise
+    finally:
+        close = getattr(rsd, "close", None)
+        if close is not None:
+            with suppress(BaseException):
+                await close()
+
+
 async def type_text_userspace(
     device: str,
     *,
@@ -103,6 +156,16 @@ async def type_text_userspace(
 
     rsd = await userspace_tunnel.establish_userspace_rsd(serial=device)
     keyboard_service_id: int | None = None
+
+    def supports_unshifted_virtual_keyboard_text(value: str) -> bool:
+        for ch in value:
+            mapping = ASCII_TO_HID.get(ch)
+            if mapping is None:
+                return False
+            _usage, needs_shift = mapping
+            if needs_shift:
+                return False
+        return True
 
     async def send_tap(service: object, x: float, y: float) -> dict[str, object]:
         hx = int(round(x * 65535))
@@ -177,8 +240,7 @@ async def type_text_userspace(
 
     stage = "set-pasteboard"
     try:
-        ascii_only = all(ch in ASCII_TO_HID for ch in text)
-        if ascii_only:
+        if supports_unshifted_virtual_keyboard_text(text):
             stage = "keyboard-session"
             result: dict[str, object]
             async with UniversalHIDServiceService(rsd) as service:
@@ -203,34 +265,13 @@ async def type_text_userspace(
             emit({"event": "result", "result": result})
             return
 
-        pinyin_text = pinyin_keyboard_text(text)
-        if pinyin_text is not None and paste_at is None:
-            stage = "pinyin-keyboard-session"
-            result = {}
-            async with UniversalHIDServiceService(rsd) as service:
-                clear_count = 0
-                if clear_existing:
-                    stage = "clear-existing"
-                    clear_count = await clear_text(service)
-                stage = "type-pinyin"
-                commit_point = await type_pinyin(service, pinyin_text)
-                stage = "emit-result"
-                result = {
-                    "dispatchStatus": "sent",
-                    "confirmationStatus": "dispatched_unverified",
-                    "sessionStatus": "helper-direct",
-                    "sessionTypedCharacterCount": len(text),
-                    "keyboardServiceRegistered": keyboard_service_id is not None,
-                    "pasteboardSet": False,
-                    "inputMethod": "coredevice-pinyin-keyboard",
-                    "convertedText": pinyin_text,
-                    "candidateCommitAction": "tap-first-candidate",
-                    "candidateCommitPoint": commit_point,
-                    "clearExisting": clear_existing,
-                    "clearKeypresses": clear_count,
-                }
-            emit({"event": "result", "result": result})
-            return
+        if paste_at is None:
+            raise CoretapError(
+                "TEXT_INPUT_TARGET_UNKNOWN",
+                "Non-ASCII text input requires a paste anchor resolved from a visible text field",
+                category="usage",
+                stage="type",
+            )
 
         async with PasteboardService(rsd) as pasteboard:
             await pasteboard.set_text(text)
@@ -243,13 +284,6 @@ async def type_text_userspace(
                 stage = "clear-existing"
                 clear_count = await clear_text(service)
 
-            if paste_at is None:
-                raise CoretapError(
-                    "TEXT_INPUT_TARGET_UNKNOWN",
-                    "Non-ASCII text input requires a paste anchor resolved from a visible text field",
-                    category="usage",
-                    stage="type",
-                )
             if paste_mode == "shortcut":
                 raise CoretapError(
                     "TEXT_INPUT_UNSUPPORTED",
@@ -412,6 +446,19 @@ async def run(args: argparse.Namespace) -> None:
             raise ValueError("tap requires --x and --y")
         await tap_userspace(args.device, args.x, args.y)
         return
+    if args.action == "drag":
+        if args.start_x is None or args.start_y is None or args.end_x is None or args.end_y is None:
+            raise ValueError("drag requires --start-x, --start-y, --end-x, and --end-y")
+        await drag_userspace(
+            args.device,
+            start_x=args.start_x,
+            start_y=args.start_y,
+            end_x=args.end_x,
+            end_y=args.end_y,
+            steps=args.steps,
+            duration_ms=args.duration_ms,
+        )
+        return
     if args.action == "type":
         await type_text_userspace(
             args.device,
@@ -446,10 +493,16 @@ async def run(args: argparse.Namespace) -> None:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="python -m coretap.device_hid_helper")
     parser.add_argument("--mode", choices=["userspace"], required=True)
-    parser.add_argument("--action", choices=["tap", "type", "key", "clear"], default="tap")
+    parser.add_argument("--action", choices=["tap", "drag", "type", "key", "clear"], default="tap")
     parser.add_argument("--device", required=True)
     parser.add_argument("--x", type=int, default=None)
     parser.add_argument("--y", type=int, default=None)
+    parser.add_argument("--start-x", type=int, default=None)
+    parser.add_argument("--start-y", type=int, default=None)
+    parser.add_argument("--end-x", type=int, default=None)
+    parser.add_argument("--end-y", type=int, default=None)
+    parser.add_argument("--steps", type=int, default=30)
+    parser.add_argument("--duration-ms", type=int, default=600)
     parser.add_argument("--text", default=None)
     parser.add_argument("--char-delay-ms", type=int, default=40)
     parser.add_argument("--inter-delay-ms", type=int, default=20)

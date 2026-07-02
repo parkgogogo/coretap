@@ -1,8 +1,6 @@
 from __future__ import annotations
 
-import csv
 import hashlib
-import io
 import json
 import re
 import unicodedata
@@ -13,7 +11,8 @@ from typing import Any
 from coretap.runtime import CoretapError, cache_root, command_env, require_success, run_command, which
 
 
-DEFAULT_OCR_LANG = "chi_sim+eng"
+DEFAULT_OCR_LANG = "zh-Hans+en-US"
+DEFAULT_OCR_ENGINE = "vision"
 
 _OCR_EQUIVALENCE_TRANSLATION = str.maketrans(
     {
@@ -46,7 +45,7 @@ class OcrToken:
     top: int
     width: int
     height: int
-    engine: str = "tesseract"
+    engine: str = DEFAULT_OCR_ENGINE
 
     @property
     def center(self) -> tuple[float, float]:
@@ -58,96 +57,36 @@ def normalize_text(text: str) -> str:
     return " ".join(normalized.split())
 
 
-def parse_tesseract_languages(output: str) -> list[str]:
-    languages: list[str] = []
-    for line in output.splitlines():
-        item = line.strip()
-        if not item or item.startswith("List of available languages"):
-            continue
-        languages.append(item)
-    return languages
-
-
-def required_tesseract_languages(lang: str = DEFAULT_OCR_LANG) -> list[str]:
-    return [part for part in lang.split("+") if part]
-
-
-def missing_tesseract_languages(languages: list[str], lang: str = DEFAULT_OCR_LANG) -> list[str]:
-    available = set(languages)
-    return [part for part in required_tesseract_languages(lang) if part not in available]
-
-
-def tesseract_status() -> dict[str, Any]:
-    exe = which("tesseract")
-    if not exe:
-        return {
-            "ready": False,
-            "executable": None,
-            "version": None,
-            "defaultLang": DEFAULT_OCR_LANG,
-            "languages": [],
-            "defaultLangAvailable": False,
-            "missingLanguages": required_tesseract_languages(),
-        }
-    done = run_command([exe, "--version"], timeout=5)
-    first = done.stdout.splitlines()[0] if done.stdout else ""
-    languages_done = run_command([exe, "--list-langs"], timeout=5)
-    languages = parse_tesseract_languages(languages_done.stdout) if languages_done.returncode == 0 else []
-    missing = missing_tesseract_languages(languages)
+def vision_ocr_status() -> dict[str, Any]:
+    xcrun = which("xcrun")
     return {
-        "ready": done.returncode == 0,
-        "executable": exe,
-        "version": first,
+        "ready": bool(xcrun),
+        "engine": DEFAULT_OCR_ENGINE,
+        "executable": xcrun,
+        "languages": ["zh-Hans", "en-US"],
         "defaultLang": DEFAULT_OCR_LANG,
-        "languages": languages,
-        "defaultLangAvailable": done.returncode == 0 and languages_done.returncode == 0 and not missing,
-        "missingLanguages": missing,
+        "defaultLangAvailable": bool(xcrun),
     }
 
 
-def run_tesseract(image: Path, *, lang: str = DEFAULT_OCR_LANG, psm: int = 11) -> tuple[list[OcrToken], str]:
-    exe = which("tesseract")
-    if not exe:
-        raise CoretapError("OCR_UNAVAILABLE", "tesseract not found in PATH", stage="ocr")
-    done = require_success(
-        run_command([exe, str(image), "stdout", "-l", lang, "--oem", "1", "--psm", str(psm), "tsv"], timeout=10),
-        code="OCR_PROCESS_FAILED",
-        stage="ocr",
-    )
-    return parse_tsv(done.stdout), done.stdout
-
-
-def run_ocr(image: Path, *, lang: str = DEFAULT_OCR_LANG, psm: int = 11) -> tuple[list[OcrToken], dict[str, Any]]:
-    tokens: list[OcrToken] = []
+def run_ocr(image: Path) -> tuple[list[OcrToken], dict[str, Any]]:
     raw: dict[str, Any] = {"engines": [], "errors": []}
-
-    try:
-        tesseract_tokens, tsv = run_tesseract(image, lang=lang, psm=psm)
-        tokens.extend(tesseract_tokens)
-        raw["engines"].append("tesseract")
-        raw["tesseractTsv"] = tsv
-    except CoretapError as exc:
-        raw["errors"].append({"engine": "tesseract", "code": exc.code, "message": str(exc), "details": exc.details})
-
     try:
         vision_tokens, vision_stdout = run_vision_ocr(image)
-        tokens.extend(vision_tokens)
         raw["engines"].append("vision")
         raw["visionJson"] = vision_stdout
+        return vision_tokens, raw
     except CoretapError as exc:
         raw["errors"].append({"engine": "vision", "code": exc.code, "message": str(exc), "details": exc.details})
 
-    if not raw["engines"]:
-        errors = raw.get("errors") or []
-        first = errors[0] if errors else {}
-        raise CoretapError(
-            first.get("code") or "OCR_UNAVAILABLE",
-            first.get("message") or "No OCR engine is available",
-            stage="ocr",
-            category="environment",
-            details={"image": str(image), "errors": errors},
-        )
-    return tokens, raw
+    first = raw["errors"][0] if raw["errors"] else {}
+    raise CoretapError(
+        first.get("code") or "OCR_UNAVAILABLE",
+        first.get("message") or "Vision OCR is unavailable",
+        stage="ocr",
+        category="environment",
+        details={"image": str(image), "errors": raw["errors"]},
+    )
 
 
 def run_vision_ocr(image: Path) -> tuple[list[OcrToken], str]:
@@ -158,27 +97,6 @@ def run_vision_ocr(image: Path) -> tuple[list[OcrToken], str]:
         stage="ocr",
     )
     return parse_vision_json(done.stdout), done.stdout
-
-
-def parse_tsv(tsv: str) -> list[OcrToken]:
-    tokens: list[OcrToken] = []
-    reader = csv.DictReader(io.StringIO(tsv), delimiter="\t", quoting=csv.QUOTE_NONE)
-    for row in reader:
-        text = (row.get("text") or "").strip()
-        if not text:
-            continue
-        try:
-            conf = float(row.get("conf") or -1)
-            left = int(float(row.get("left") or 0))
-            top = int(float(row.get("top") or 0))
-            width = int(float(row.get("width") or 0))
-            height = int(float(row.get("height") or 0))
-        except ValueError:
-            continue
-        if conf < 0:
-            continue
-        tokens.append(OcrToken(text, conf, left, top, width, height, "tesseract"))
-    return tokens
 
 
 def parse_vision_json(raw: str) -> list[OcrToken]:
@@ -271,11 +189,8 @@ def find_exact_text_candidates(
                 break
             if len(acc) > len(needle) + 40:
                 break
-    if candidates:
-        return candidates
-
     for idx, hay in enumerate(normalized):
-        if _token_is_exact_with_ui_prefix(hay, needle):
+        if _token_is_exact_with_ui_prefix(hay, needle, engine=tokens[idx].engine):
             match = token_match([tokens[idx]], idx, idx + 1)
             match["matchedKind"] = "exact"
             match["exactMatchStrategy"] = "ui-prefix-stripped"
@@ -299,7 +214,7 @@ def find_exact_text_candidates(
     return candidates
 
 
-def _token_is_exact_with_ui_prefix(hay: str, needle: str) -> bool:
+def _token_is_exact_with_ui_prefix(hay: str, needle: str, *, engine: str | None = None) -> bool:
     if not hay or not needle or hay == needle:
         return False
     if not hay.endswith(needle):
@@ -307,14 +222,18 @@ def _token_is_exact_with_ui_prefix(hay: str, needle: str) -> bool:
     prefix = hay[: -len(needle)].strip()
     if not prefix:
         return False
-    return _is_ocr_ui_prefix(prefix)
+    return _is_ocr_ui_prefix(prefix, engine=engine)
 
 
-def _is_ocr_ui_prefix(prefix: str) -> bool:
+def _is_ocr_ui_prefix(prefix: str, *, engine: str | None = None) -> bool:
     compact = re.sub(r"\s+", "", prefix.casefold())
     if compact in {"q", "搜索", "search"}:
         return True
     if re.fullmatch(r"[0-9]+", compact):
+        return True
+    if engine == "vision" and re.fullmatch(r"[a-z]", compact):
+        # Apple Vision sometimes folds small adjacent app/developer icons into
+        # a single-letter prefix in the same token, for example "g Xingin".
         return True
     # OCR often folds search icons, bullets, or counters into the same token.
     return bool(re.fullmatch(r"[q0-9#•·.,:;!?~_+*/|()（）\\[\\]【】<>《》-]+", compact))
@@ -361,7 +280,7 @@ def _vision_helper_binary() -> Path:
     if not swiftc:
         raise CoretapError(
             "VISION_OCR_UNAVAILABLE",
-            "xcrun is required for macOS Vision OCR fallback",
+            "xcrun is required for macOS Vision OCR",
             stage="ocr",
             category="environment",
         )

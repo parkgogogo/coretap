@@ -22,8 +22,12 @@ class Coretap {
     this.developerDir = options.developerDir || process.env.DEVELOPER_DIR || undefined;
     this.coredeviceTunnelMode = options.coredeviceTunnelMode || process.env.CORETAP_COREDEVICE_TUNNEL_MODE || undefined;
     this.artifactRoot = options.artifactRoot || process.env.CORETAP_ARTIFACT_ROOT || undefined;
+    this.keepArtifacts = hasOption(options, "keepArtifacts") ? Boolean(options.keepArtifacts) : truthyEnv("CORETAP_KEEP_ARTIFACTS");
+    this.noArtifacts = hasOption(options, "noArtifacts") ? Boolean(options.noArtifacts) : truthyEnv("CORETAP_NO_ARTIFACTS");
     this.profile = options.profile || process.env.CORETAP_PROFILE || undefined;
     this.daemonMode = options.daemon || process.env.CORETAP_DAEMON || undefined;
+    this.traceId = options.traceId || process.env.CORETAP_TRACE_ID || undefined;
+    this.traceTitle = options.traceTitle || process.env.CORETAP_TRACE_TITLE || undefined;
     this.cwd = options.cwd || process.env.CORETAP_CWD || undefined;
   }
 
@@ -40,14 +44,14 @@ class Coretap {
     return new CoretapRun(new Coretap({}));
   }
 
-  async openRun() {
-    return new CoretapRun(this);
+  async openRun(options = {}) {
+    return new CoretapRun(this, options);
   }
 
   async withSession(options, body) {
     const run = await this.openRun(options);
     try {
-      return await body(new IosVisualUi(this));
+      return await body(new IosVisualUi(this, run.commandOptions()));
     } finally {
       await run.close();
     }
@@ -156,61 +160,103 @@ class Coretap {
     const developerDir = options.developerDir || this.developerDir;
     const coredeviceTunnelMode = options.coredeviceTunnelMode || this.coredeviceTunnelMode;
     const artifactRoot = options.artifactRoot || this.artifactRoot;
+    const keepArtifacts = hasOption(options, "keepArtifacts") ? Boolean(options.keepArtifacts) : this.keepArtifacts;
+    const noArtifacts = hasOption(options, "noArtifacts") ? Boolean(options.noArtifacts) : this.noArtifacts;
     const profile = options.profile || this.profile;
     const daemon = options.daemon || this.daemonMode;
+    const traceId = options.traceId || this.traceId;
+    const traceTitle = options.traceTitle || this.traceTitle;
     const full = ["--backend", backend, "--device", device];
     if (developerDir) full.push("--developer-dir", developerDir);
     if (coredeviceTunnelMode) full.push("--coredevice-tunnel-mode", coredeviceTunnelMode);
     if (artifactRoot) full.push("--artifact-root", artifactRoot);
+    if (keepArtifacts) full.push("--keep-artifacts");
+    if (noArtifacts) full.push("--no-artifacts");
     if (profile) full.push("--profile", profile);
     if (daemon) full.push("--daemon", daemon);
+    if (traceId) full.push("--trace-id", traceId);
+    if (traceTitle) full.push("--trace-title", traceTitle);
     return full;
   }
 }
 
 class CoretapRun {
-  constructor(client) {
+  constructor(client, options = {}) {
     this.client = client;
-    this.runId = process.env.CORETAP_RUN_ID || "local";
+    const explicitTraceId = options.traceId || process.env.CORETAP_TRACE_ID || client.traceId;
+    const name = options.name || options.traceTitle || process.env.CORETAP_TRACE_TITLE || client.traceTitle || "node-run";
+    this.runId = explicitTraceId || makeTraceId(name);
+    this.traceId = this.runId;
+    this.traceTitle = options.traceTitle || options.name || process.env.CORETAP_TRACE_TITLE || client.traceTitle || null;
     this.artifactDir = process.env.CORETAP_ARTIFACT_DIR || null;
   }
 
   async test(_name, body) {
-    return body(new IosVisualUi(this.client));
+    return body(new IosVisualUi(this.client, this.commandOptions()));
   }
 
   async close() {
-    return { runId: this.runId, status: "closed" };
+    return { runId: this.runId, traceId: this.traceId, status: "closed" };
   }
 
   async detach() {
-    return { runId: this.runId, status: "detached" };
+    return { runId: this.runId, traceId: this.traceId, status: "detached" };
+  }
+
+  commandOptions() {
+    return {
+      traceId: this.traceId,
+      traceTitle: this.traceTitle || undefined,
+    };
   }
 }
 
 class IosVisualUi {
-  constructor(client) {
+  constructor(client, defaults = {}) {
     this.client = client;
+    this.defaults = defaults || {};
+  }
+
+  _options(options = {}) {
+    return { ...this.defaults, ...options };
   }
 
   async observe(options = {}) {
-    return this.client._run(observeArgs(options), options);
+    return this.client._run(observeArgs(options), this._options(options));
   }
 
   async step(action, options = {}) {
-    return this.client.step(action, options);
+    return this.client.step(action, this._options(options));
   }
 
   async tap(target, options = {}) {
-    return this.step({ schema: "coretap.action.v2", type: "tap", target }, options);
+    return this.step({ type: "tap", target }, options);
+  }
+
+  async tapPoint(point, options = {}) {
+    return this.step({ type: "tapPoint", point: pointPayload(point, options) }, options);
+  }
+
+  async longPress(point, options = {}) {
+    return this.step(
+      {
+        type: "longPress",
+        point: pointPayload(point, options),
+        durationMs: options.durationMs,
+        steps: options.steps,
+      },
+      options,
+    );
   }
 
   async openApp(name, options = {}) {
     return this.step(
       {
-        schema: "coretap.action.v2",
         type: "openApp",
         name,
+        bundleId: options.bundleId,
+        strategy: options.strategy,
+        killExisting: options.killExisting,
         searchTarget: options.searchTarget,
         resultTarget: options.resultTarget,
       },
@@ -221,7 +267,6 @@ class IosVisualUi {
   async press(button, options = {}) {
     return this.step(
       {
-        schema: "coretap.action.v2",
         type: "press",
         button,
         state: options.state,
@@ -238,7 +283,6 @@ class IosVisualUi {
   async typeText(text, options = {}) {
     return this.step(
       {
-        schema: "coretap.action.v2",
         type: "typeText",
         text,
         charDelayMs: options.charDelayMs,
@@ -256,7 +300,6 @@ class IosVisualUi {
   async key(key, options = {}) {
     return this.step(
       {
-        schema: "coretap.action.v2",
         type: "key",
         key,
         count: options.count,
@@ -269,7 +312,6 @@ class IosVisualUi {
   async clearText(options = {}) {
     return this.step(
       {
-        schema: "coretap.action.v2",
         type: "clear",
         count: options.count,
         interDelayMs: options.interDelayMs,
@@ -293,7 +335,6 @@ class IosVisualUi {
   async scroll(direction, options = {}) {
     return this.step(
       {
-        schema: "coretap.action.v2",
         type: "scroll",
         direction,
         distance: options.distance,
@@ -306,15 +347,55 @@ class IosVisualUi {
     );
   }
 
+  async appSwitcher(options = {}) {
+    return this.step(
+      {
+        type: "appSwitcher",
+        start: options.start,
+        end: options.end,
+        startX: options.startX,
+        startY: options.startY,
+        endX: options.endX,
+        endY: options.endY,
+        steps: options.steps,
+        durationMs: options.durationMs,
+      },
+      options,
+    );
+  }
+
+  async terminateApp(bundleId, options = {}) {
+    return this.step(
+      {
+        type: "terminateApp",
+        bundleId,
+        signal: options.signal,
+      },
+      options,
+    );
+  }
+
+  async uninstallApp(app, options = {}) {
+    const action = {
+      type: "uninstallApp",
+      ignoreMissing: options.ignoreMissing,
+    };
+    if (options.bundleId || looksLikeBundleId(app)) {
+      action.bundleId = options.bundleId || app;
+      if (options.name) action.name = options.name;
+    } else {
+      action.name = app;
+    }
+    return this.step(action, options);
+  }
+
   async expectText(expected, options = {}) {
     const args = ["assert", "text", "--text", expected];
     if (options.image) args.push("--image", options.image);
     if (hasOption(options, "timeoutMs")) args.push("--timeout-ms", String(options.timeoutMs));
     if (hasOption(options, "pollIntervalMs")) args.push("--poll-interval-ms", String(options.pollIntervalMs));
-    if (options.lang) args.push("--lang", options.lang);
-    if (hasOption(options, "psm")) args.push("--psm", String(options.psm));
     if (options.caseSensitive) args.push("--case-sensitive");
-    return this.client._run(args, options);
+    return this.client._run(args, this._options(options));
   }
 
   async waitForText(expected, options = {}) {
@@ -322,14 +403,12 @@ class IosVisualUi {
     if (options.image) args.push("--image", options.image);
     if (hasOption(options, "timeoutMs")) args.push("--timeout-ms", String(options.timeoutMs));
     if (hasOption(options, "pollIntervalMs")) args.push("--poll-interval-ms", String(options.pollIntervalMs));
-    if (options.lang) args.push("--lang", options.lang);
-    if (hasOption(options, "psm")) args.push("--psm", String(options.psm));
     if (options.caseSensitive) args.push("--case-sensitive");
-    return this.client._run(args, options);
+    return this.client._run(args, this._options(options));
   }
 
   async wait(ms, options = {}) {
-    return this.step({ schema: "coretap.action.v2", type: "wait", ms }, options);
+    return this.step({ type: "wait", ms }, options);
   }
 }
 
@@ -346,11 +425,9 @@ function observeArgs(options = {}) {
   if (options.out) args.push("--out", options.out);
   if (hasOption(options, "maxLongSide")) args.push("--max-long-side", String(options.maxLongSide));
   if (options.fullSize) args.push("--full-size");
-  if (options.lang) args.push("--lang", options.lang);
-  if (hasOption(options, "psm")) args.push("--psm", String(options.psm));
-  if (options.ocrEngine) args.push("--ocr-engine", options.ocrEngine);
   if (hasOption(options, "minConfidence")) args.push("--min-confidence", String(options.minConfidence));
   if (options.noOcr) args.push("--no-ocr");
+  if (options.noVlm) args.push("--no-vlm");
   return args;
 }
 
@@ -365,22 +442,27 @@ function stepArgs(action, options = {}) {
     const payload = typeof action === "string" ? action : JSON.stringify(action);
     args.push("--action", payload);
   }
-  if (hasOption(options, "postWaitMs")) args.push("--post-wait-ms", String(options.postWaitMs));
-  if (hasOption(options, "postTimeoutMs")) args.push("--post-timeout-ms", String(options.postTimeoutMs));
-  if (hasOption(options, "pollIntervalMs")) args.push("--poll-interval-ms", String(options.pollIntervalMs));
-  for (const text of listOption(options.expectText)) args.push("--expect-text", text);
-  for (const text of listOption(options.expectNoText)) args.push("--expect-no-text", text);
-  if (options.expectChange) args.push("--expect-change");
-  if (options.failOnPostcondition) args.push("--fail-on-postcondition");
   if (options.dryRun) args.push("--dry-run");
-  if (options.lang) args.push("--lang", options.lang);
-  if (hasOption(options, "psm")) args.push("--psm", String(options.psm));
-  if (options.ocrEngine) args.push("--ocr-engine", options.ocrEngine);
+  if (hasOption(options, "pageWaitMs")) args.push("--page-wait-ms", String(options.pageWaitMs));
+  if (options.noPage) args.push("--no-page");
   if (hasOption(options, "minConfidence")) args.push("--min-confidence", String(options.minConfidence));
   if (hasOption(options, "maxLongSide")) args.push("--max-long-side", String(options.maxLongSide));
   if (options.fullSize) args.push("--full-size");
   if (options.noOcr) args.push("--no-ocr");
+  if (options.noVlm) args.push("--no-vlm");
   return args;
+}
+
+function pointPayload(point, options = {}) {
+  if (!point || typeof point !== "object") {
+    throw new TypeError("Coretap point must be an object with x and y.");
+  }
+  return {
+    x: point.x,
+    y: point.y,
+    space: point.space || options.space,
+    reference: point.reference || options.reference,
+  };
 }
 
 function coretapNotInstalledError(command, args, cause, extraDetails = {}) {
@@ -448,13 +530,28 @@ function looksLikeMissingPythonModule(output) {
   return /No module named coretap/.test(output || "");
 }
 
+function makeTraceId(name) {
+  const base = String(name || "node-run")
+    .trim()
+    .replace(/[^a-zA-Z0-9._-]+/g, "-")
+    .replace(/^[-._]+|[-._]+$/g, "")
+    .slice(0, 80) || "node-run";
+  const stamp = new Date().toISOString().replace(/[-:.]/g, "").slice(0, 15);
+  const suffix = Math.random().toString(16).slice(2, 8);
+  return `${base}-${stamp}-${suffix}`;
+}
+
 function hasOption(options, key) {
   return Object.prototype.hasOwnProperty.call(options, key) && options[key] !== undefined && options[key] !== null;
 }
 
-function listOption(value) {
-  if (value === undefined || value === null) return [];
-  return Array.isArray(value) ? value : [value];
+function truthyEnv(name) {
+  const value = process.env[name];
+  return typeof value === "string" && ["1", "true", "yes", "on"].includes(value.trim().toLowerCase());
+}
+
+function looksLikeBundleId(value) {
+  return /^[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)+$/.test(String(value || ""));
 }
 
 module.exports = {

@@ -33,6 +33,22 @@ class Device:
     details: dict[str, Any] | None = None
 
 
+_APP_NOT_INSTALLED_MARKERS = (
+    "not installed",
+    "not found",
+    "no such app",
+    "application is missing",
+    "couldn't find",
+    "could not find",
+    "does not exist",
+)
+
+
+def _looks_like_app_not_installed(done: Completed) -> bool:
+    text = f"{done.stdout}\n{done.stderr}".casefold()
+    return any(marker in text for marker in _APP_NOT_INSTALLED_MARKERS)
+
+
 @dataclass(frozen=True)
 class Frame:
     frame_id: str
@@ -188,6 +204,15 @@ class SimulatorBackend:
             details={"backend": self.name},
         )
 
+    def set_pasteboard_text(self, device: str, text: str, *, verify: bool = True, dry_run: bool = False) -> dict[str, Any]:
+        raise CoretapError(
+            "SIMULATOR_TYPE_UNSUPPORTED",
+            "CoreDevice pasteboard text input is only supported for real devices",
+            category="usage",
+            stage="pasteboard",
+            details={"backend": self.name},
+        )
+
     def keyboard_key(
         self,
         device: str,
@@ -242,6 +267,134 @@ class SimulatorBackend:
             stage="drag",
             details={"backend": self.name},
         )
+
+    def terminate_app(
+        self,
+        device: str,
+        bundle_id: str,
+        *,
+        signal: int = 9,
+        dry_run: bool = False,
+    ) -> dict[str, Any]:
+        base = {
+            "bundleId": bundle_id,
+            "signal": signal,
+            "backend": self.name,
+        }
+        if dry_run:
+            return {**base, "attempted": False, "dryRun": True, "reason": "dry-run requested"}
+        done = run_command(["xcrun", "simctl", "terminate", device, bundle_id], env=self.env, timeout=20)
+        if done.returncode != 0 and "not running" in f"{done.stdout}\n{done.stderr}".lower():
+            return {
+                **base,
+                "attempted": False,
+                "dryRun": False,
+                "status": "not_running",
+                "durationMs": done.duration_ms,
+            }
+        require_success(done, code="SIMCTL_TERMINATE_APP_FAILED", stage="terminate-app")
+        return {
+            **base,
+            "attempted": True,
+            "dryRun": False,
+            "status": "terminated",
+            "durationMs": done.duration_ms,
+        }
+
+    def uninstall_app(
+        self,
+        device: str,
+        bundle_id: str,
+        *,
+        ignore_missing: bool = True,
+        dry_run: bool = False,
+    ) -> dict[str, Any]:
+        base = {
+            "bundleId": bundle_id,
+            "backend": self.name,
+            "ignoreMissing": ignore_missing,
+        }
+        if dry_run:
+            return {**base, "attempted": False, "dryRun": True, "reason": "dry-run requested"}
+        done = run_command(["xcrun", "simctl", "uninstall", device, bundle_id], env=self.env, timeout=60)
+        if done.returncode != 0 and ignore_missing and _looks_like_app_not_installed(done):
+            return {
+                **base,
+                "attempted": False,
+                "dryRun": False,
+                "status": "not_installed",
+                "durationMs": done.duration_ms,
+            }
+        require_success(done, code="SIMCTL_UNINSTALL_APP_FAILED", stage="uninstall-app")
+        return {
+            **base,
+            "attempted": True,
+            "dryRun": False,
+            "status": "uninstalled",
+            "durationMs": done.duration_ms,
+        }
+
+    def launch_app(
+        self,
+        device: str,
+        bundle_id: str,
+        *,
+        kill_existing: bool = True,
+        dry_run: bool = False,
+    ) -> dict[str, Any]:
+        base = {
+            "bundleId": bundle_id,
+            "backend": self.name,
+            "killExisting": kill_existing,
+        }
+        if dry_run:
+            return {**base, "attempted": False, "dryRun": True, "reason": "dry-run requested"}
+        argv = ["xcrun", "simctl", "launch"]
+        if kill_existing:
+            argv.append("--terminate-running-process")
+        argv.extend([device, bundle_id])
+        done = require_success(
+            run_command(argv, env=self.env, timeout=20),
+            code="SIMCTL_LAUNCH_APP_FAILED",
+            stage="launch-app",
+        )
+        return {
+            **base,
+            "attempted": True,
+            "dryRun": False,
+            "strategy": "simctl-launch",
+            "stdout": done.stdout.strip(),
+            "durationMs": done.duration_ms,
+        }
+
+    def open_url(
+        self,
+        device: str,
+        url: str,
+        *,
+        timeout_sec: float = 8.0,
+        dry_run: bool = False,
+    ) -> dict[str, Any]:
+        base = {
+            "url": url,
+            "backend": self.name,
+            "strategy": "simctl-openurl",
+            "timeoutSec": timeout_sec,
+        }
+        if dry_run:
+            return {**base, "attempted": False, "dryRun": True, "reason": "dry-run requested"}
+        done = require_success(
+            run_command(["xcrun", "simctl", "openurl", device, url], env=self.env, timeout=max(10.0, timeout_sec + 2.0)),
+            code="SIMCTL_OPEN_URL_FAILED",
+            stage="open-url",
+        )
+        return {
+            **base,
+            "attempted": True,
+            "dryRun": False,
+            "stdout": done.stdout.strip(),
+            "durationMs": done.duration_ms,
+        }
 
     def _idb_base_command(self) -> list[str]:
         companion = self._idb_companion_path()
@@ -830,6 +983,8 @@ class DeviceBackend:
             raise CoretapError("INVALID_ARGUMENT", "type --inter-delay-ms must be >= 0", category="usage", stage="type")
         if paste_hold_ms < 300:
             raise CoretapError("INVALID_ARGUMENT", "type --paste-hold-ms must be >= 300", category="usage", stage="type")
+        paste_mode = str((paste_at or {}).get("mode") or "anchor") if isinstance(paste_at, dict) else "anchor"
+        input_method = "coredevice-pasteboard-keyboard-shortcut" if paste_mode == "shortcut" else "coredevice-pasteboard-edit-menu"
         base = {
             "text": text_input_summary(text),
             "charDelayMs": char_delay_ms,
@@ -837,7 +992,7 @@ class DeviceBackend:
             "pasteHoldMs": paste_hold_ms,
             "pasteAt": paste_at,
             "clearExisting": clear_existing,
-            "inputMethod": "coredevice-pasteboard-edit-menu",
+            "inputMethod": input_method,
             "coredeviceTunnelMode": self.coredevice_tunnel_mode,
         }
         if dry_run:
@@ -906,6 +1061,75 @@ class DeviceBackend:
             stage="type",
             details={"coredeviceTunnelMode": self.coredevice_tunnel_mode},
         )
+
+    def set_pasteboard_text(self, device: str, text: str, *, verify: bool = True, dry_run: bool = False) -> dict[str, Any]:
+        base = {
+            "operation": "set-pasteboard-text",
+            "text": text_input_summary(text),
+            "verify": verify,
+            "coredeviceTunnelMode": self.coredevice_tunnel_mode,
+        }
+        if dry_run:
+            return {**base, "attempted": False, "dryRun": True, "reason": "dry-run requested"}
+        # PasteboardService creates a userspace RSD path that conflicts with pymobiledevice3's
+        # process-global userspace tunnel when reused inside coretapd. Keep pasteboard updates in
+        # their own pymobiledevice3 process so the persistent HID worker remains clean.
+        argv = [
+            "pymobiledevice3",
+            "developer",
+            "core-device",
+            "copy",
+            *self.coredevice_device_options(device),
+            text,
+        ]
+        done = require_success(
+            run_command(argv, env=self.coredevice_env(device), timeout=20, max_output=2_000_000),
+            code="PASTEBOARD_SET_FAILED",
+            stage="pasteboard",
+        )
+        readback_matches: bool | None = None
+        if verify:
+            readback_done = require_success(
+                run_command(
+                    [
+                        "pymobiledevice3",
+                        "developer",
+                        "core-device",
+                        "paste",
+                        *self.coredevice_device_options(device),
+                    ],
+                    env=self.coredevice_env(device),
+                    timeout=20,
+                    max_output=2_000_000,
+                ),
+                code="PASTEBOARD_SET_FAILED",
+                stage="pasteboard",
+            )
+            readback_matches = readback_done.stdout == text
+            if not readback_matches:
+                raise CoretapError(
+                    "PASTEBOARD_SET_FAILED",
+                    "CoreDevice pasteboard readback did not match requested text",
+                    stage="pasteboard",
+                    category="infrastructure",
+                    details={
+                        "expectedLength": len(text),
+                        "readbackLength": len(readback_done.stdout),
+                        "readbackMatches": False,
+                    },
+                )
+        result: dict[str, Any] = {
+            **base,
+            "attempted": True,
+            "dryRun": False,
+            "pasteboardSet": True,
+            "pasteboardVerified": bool(verify),
+            "readbackMatches": readback_matches,
+            "completionStatus": "exited",
+            "transport": "pymobiledevice3-core-device-copy",
+            "durationMs": done.duration_ms,
+        }
+        return result
 
     def keyboard_key(
         self,
@@ -1014,6 +1238,286 @@ class DeviceBackend:
         )
         return {**result, "operation": "clear", "clearKeypresses": count}
 
+    def terminate_app(
+        self,
+        device: str,
+        bundle_id: str,
+        *,
+        signal: int = 9,
+        dry_run: bool = False,
+    ) -> dict[str, Any]:
+        if signal <= 0:
+            raise CoretapError("INVALID_ARGUMENT", "terminateApp signal must be > 0", category="usage", stage="terminate-app")
+        base = {
+            "bundleId": bundle_id,
+            "signal": signal,
+            "backend": self.name,
+            "coredeviceTunnelMode": self.coredevice_tunnel_mode,
+        }
+        if dry_run:
+            return {**base, "attempted": False, "dryRun": True, "reason": "dry-run requested"}
+
+        pid_before = self._process_id_for_bundle_id(device, bundle_id)
+        if pid_before <= 0:
+            return {
+                **base,
+                "attempted": False,
+                "dryRun": False,
+                "status": "not_running",
+                "pidBefore": pid_before,
+            }
+
+        sent = _check_coredevice_result(
+            run_command(
+                [
+                    "pymobiledevice3",
+                    "developer",
+                    "core-device",
+                    "send-signal-to-process",
+                    *self.coredevice_device_options(device),
+                    str(pid_before),
+                    str(signal),
+                ],
+                env=self.coredevice_env(device),
+                timeout=20,
+            ),
+            code="COREDEVICE_TERMINATE_APP_FAILED",
+            stage="terminate-app",
+        )
+        require_success(sent, code="COREDEVICE_TERMINATE_APP_FAILED", stage="terminate-app")
+        pid_after = self._process_id_for_bundle_id(device, bundle_id)
+        old_pid_running_after = self._is_running_pid(device, pid_before)
+        if pid_after > 0 and pid_after != pid_before:
+            pid_after_running = self._is_running_pid(device, pid_after)
+        else:
+            pid_after_running = old_pid_running_after
+        running_after = old_pid_running_after or pid_after_running
+        status = "still_running" if running_after else "terminated"
+        return {
+            **base,
+            "attempted": True,
+            "dryRun": False,
+            "status": status,
+            "pidBefore": pid_before,
+            "pidAfter": pid_after,
+            "runningAfter": running_after,
+            "pidAfterRunning": pid_after_running,
+            "durationMs": sent.duration_ms,
+        }
+
+    def launch_app(
+        self,
+        device: str,
+        bundle_id: str,
+        *,
+        kill_existing: bool = True,
+        dry_run: bool = False,
+    ) -> dict[str, Any]:
+        base = {
+            "bundleId": bundle_id,
+            "backend": self.name,
+            "killExisting": kill_existing,
+            "coredeviceTunnelMode": self.coredevice_tunnel_mode,
+        }
+        if dry_run:
+            return {**base, "attempted": False, "dryRun": True, "reason": "dry-run requested"}
+        argv = [
+            "pymobiledevice3",
+            "developer",
+            "dvt",
+            "launch",
+            *self.coredevice_device_options(device),
+        ]
+        argv.append("--kill-existing" if kill_existing else "--no-kill-existing")
+        argv.append(bundle_id)
+        done = _check_coredevice_result(
+            run_command(argv, env=self.coredevice_env(device), timeout=30),
+            code="COREDEVICE_LAUNCH_APP_FAILED",
+            stage="launch-app",
+        )
+        require_success(done, code="COREDEVICE_LAUNCH_APP_FAILED", stage="launch-app")
+        pid = None
+        for token in done.stdout.replace("\n", " ").split():
+            if token.strip().isdigit():
+                pid = int(token.strip())
+        return {
+            **base,
+            "attempted": True,
+            "dryRun": False,
+            "strategy": "coredevice-dvt-launch",
+            "pid": pid,
+            "stdout": done.stdout.strip(),
+            "durationMs": done.duration_ms,
+        }
+
+    def uninstall_app(
+        self,
+        device: str,
+        bundle_id: str,
+        *,
+        ignore_missing: bool = True,
+        dry_run: bool = False,
+    ) -> dict[str, Any]:
+        base = {
+            "bundleId": bundle_id,
+            "backend": self.name,
+            "ignoreMissing": ignore_missing,
+            "coredeviceTunnelMode": self.coredevice_tunnel_mode,
+        }
+        if dry_run:
+            return {**base, "attempted": False, "dryRun": True, "reason": "dry-run requested"}
+        done = run_command(
+            [
+                "pymobiledevice3",
+                "apps",
+                "uninstall",
+                *self.coredevice_device_options(device),
+                bundle_id,
+            ],
+            env=self.coredevice_env(device),
+            timeout=60,
+            max_output=2_000_000,
+        )
+        if done.returncode != 0 and ignore_missing and _looks_like_app_not_installed(done):
+            return {
+                **base,
+                "attempted": False,
+                "dryRun": False,
+                "status": "not_installed",
+                "durationMs": done.duration_ms,
+                "stderr": done.stderr[-1000:],
+            }
+        require_success(done, code="COREDEVICE_UNINSTALL_APP_FAILED", stage="uninstall-app")
+        return {
+            **base,
+            "attempted": True,
+            "dryRun": False,
+            "status": "uninstalled",
+            "stdout": done.stdout.strip(),
+            "durationMs": done.duration_ms,
+        }
+
+    def open_url(
+        self,
+        device: str,
+        url: str,
+        *,
+        timeout_sec: float = 8.0,
+        dry_run: bool = False,
+    ) -> dict[str, Any]:
+        base = {
+            "url": url,
+            "backend": self.name,
+            "strategy": "webinspector-launch",
+            "timeoutSec": timeout_sec,
+            "coredeviceTunnelMode": self.coredevice_tunnel_mode,
+        }
+        if dry_run:
+            return {**base, "attempted": False, "dryRun": True, "reason": "dry-run requested"}
+        argv = [
+            "pymobiledevice3",
+            "webinspector",
+            "launch",
+            *self.coredevice_device_options(device),
+            "--timeout",
+            str(timeout_sec),
+            url,
+        ]
+        done = _check_coredevice_result(
+            run_command(
+                argv,
+                env=self.coredevice_env(device),
+                timeout=max(10.0, timeout_sec + 5.0),
+                max_output=2_000_000,
+            ),
+            code="WEBINSPECTOR_OPEN_URL_FAILED",
+            stage="open-url",
+        )
+        if done.returncode != 0:
+            raise CoretapError(
+                "WEBINSPECTOR_OPEN_URL_FAILED",
+                "Could not launch URL in Safari through WebInspector",
+                category="environment",
+                stage="open-url",
+                details={
+                    "argv": done.argv,
+                    "returncode": done.returncode,
+                    "stdout": done.stdout,
+                    "stderr": done.stderr,
+                    "durationMs": done.duration_ms,
+                    "requiredSettings": [
+                        "Settings -> Apps -> Safari -> Advanced -> Web Inspector",
+                        "Settings -> Apps -> Safari -> Advanced -> Remote Automation",
+                    ],
+                },
+            )
+        return {
+            **base,
+            "attempted": True,
+            "dryRun": False,
+            "stdout": done.stdout.strip(),
+            "durationMs": done.duration_ms,
+        }
+
+    def _process_id_for_bundle_id(self, device: str, bundle_id: str) -> int:
+        done = _check_coredevice_result(
+            run_command(
+                [
+                    "pymobiledevice3",
+                    "developer",
+                    "dvt",
+                    "process-id-for-bundle-id",
+                    *self.coredevice_device_options(device),
+                    bundle_id,
+                ],
+                env=self.coredevice_env(device),
+                timeout=20,
+            ),
+            code="COREDEVICE_PROCESS_LOOKUP_FAILED",
+            stage="terminate-app",
+        )
+        require_success(done, code="COREDEVICE_PROCESS_LOOKUP_FAILED", stage="terminate-app")
+        for token in done.stdout.replace("\n", " ").split():
+            stripped = token.strip()
+            if stripped.lstrip("-").isdigit():
+                return int(stripped)
+        raise CoretapError(
+            "COREDEVICE_PROCESS_LOOKUP_INVALID",
+            "Could not parse process id from pymobiledevice3 DVT output",
+            stage="terminate-app",
+            details={"stdout": done.stdout[:1000], "stderr": done.stderr[:1000], "bundleId": bundle_id},
+        )
+
+    def _is_running_pid(self, device: str, pid: int) -> bool:
+        done = _check_coredevice_result(
+            run_command(
+                [
+                    "pymobiledevice3",
+                    "developer",
+                    "dvt",
+                    "is-running-pid",
+                    *self.coredevice_device_options(device),
+                    str(pid),
+                ],
+                env=self.coredevice_env(device),
+                timeout=20,
+            ),
+            code="COREDEVICE_PROCESS_STATUS_FAILED",
+            stage="terminate-app",
+        )
+        require_success(done, code="COREDEVICE_PROCESS_STATUS_FAILED", stage="terminate-app")
+        value = done.stdout.strip().lower()
+        if value in {"true", "1", "yes"}:
+            return True
+        if value in {"false", "0", "no", ""}:
+            return False
+        raise CoretapError(
+            "COREDEVICE_PROCESS_STATUS_INVALID",
+            "Could not parse process running state from pymobiledevice3 DVT output",
+            stage="terminate-app",
+            details={"stdout": done.stdout[:1000], "stderr": done.stderr[:1000], "pid": pid},
+        )
+
     def drag_normalized(
         self,
         device: str,
@@ -1078,9 +1582,41 @@ class DeviceBackend:
                         raise
                     if not (exc.retryable or is_recoverable_userspace_tunnel_error(exc)):
                         raise
-                    previous_error = exc
-            else:
-                previous_error = None
+                    result = self._drag_userspace_helper(
+                        device,
+                        start_x=start_x,
+                        start_y=start_y,
+                        end_x=end_x,
+                        end_y=end_y,
+                        start_hx=start_hx,
+                        start_hy=start_hy,
+                        end_hx=end_hx,
+                        end_hy=end_hy,
+                        steps=steps,
+                        duration_ms=duration_ms,
+                    )
+                    return {
+                        **base,
+                        **result,
+                        "workerFallback": "coretap-device-hid-helper",
+                        "previousError": _previous_error_metadata(exc),
+                    }
+            return {
+                **base,
+                **self._drag_userspace_helper(
+                    device,
+                    start_x=start_x,
+                    start_y=start_y,
+                    end_x=end_x,
+                    end_y=end_y,
+                    start_hx=start_hx,
+                    start_hy=start_hy,
+                    end_hx=end_hx,
+                    end_hy=end_hy,
+                    steps=steps,
+                    duration_ms=duration_ms,
+                ),
+            }
         else:
             previous_error = None
         done = _check_coredevice_result(
@@ -1125,6 +1661,113 @@ class DeviceBackend:
                 else {}
             ),
         }
+
+    def _drag_userspace_helper(
+        self,
+        device: str,
+        *,
+        start_x: float,
+        start_y: float,
+        end_x: float,
+        end_y: float,
+        start_hx: int,
+        start_hy: int,
+        end_hx: int,
+        end_hy: int,
+        steps: int,
+        duration_ms: int,
+    ) -> dict[str, Any]:
+        timeout = max(25.0, (duration_ms / 1000) + 10.0)
+        cleanup_grace = 1.0
+        started = time.monotonic()
+        proc = subprocess.Popen(
+            [
+                sys.executable,
+                "-m",
+                "coretap.device_hid_helper",
+                "--mode",
+                "userspace",
+                "--action",
+                "drag",
+                "--device",
+                device,
+                "--start-x",
+                str(start_hx),
+                "--start-y",
+                str(start_hy),
+                "--end-x",
+                str(end_hx),
+                "--end-y",
+                str(end_hy),
+                "--steps",
+                str(steps),
+                "--duration-ms",
+                str(duration_ms),
+            ],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=self.coredevice_env(device),
+        )
+        assert proc.stdout is not None
+        selector = selectors.DefaultSelector()
+        selector.register(proc.stdout, selectors.EVENT_READ)
+        dispatch: dict[str, Any] | None = None
+        try:
+            while time.monotonic() - started < timeout:
+                remaining = max(0.0, timeout - (time.monotonic() - started))
+                events = selector.select(timeout=remaining)
+                if not events:
+                    break
+                line = proc.stdout.readline()
+                if not line:
+                    break
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if event.get("event") == "dispatch_sent":
+                    dispatch = event
+                    break
+                if event.get("event") == "error":
+                    stderr = _terminate_process(proc)
+                    raise CoretapError(
+                        "COREDEVICE_DRAG_FAILED",
+                        "Direct CoreDevice drag helper failed before dispatch",
+                        stage="drag",
+                        retryable=True,
+                        details={"helperEvent": event, "stderr": stderr},
+                    )
+            if dispatch is None:
+                stderr = _terminate_process(proc)
+                raise CoretapError(
+                    "COREDEVICE_DRAG_FAILED",
+                    "Timed out waiting for direct CoreDevice drag dispatch",
+                    stage="drag",
+                    retryable=True,
+                    details={"timeoutMs": round(timeout * 1000), "stderr": stderr},
+                )
+            session_status = "exited"
+            try:
+                proc.wait(timeout=cleanup_grace)
+            except subprocess.TimeoutExpired:
+                _terminate_process(proc)
+                session_status = "terminated_after_dispatch"
+            return {
+                "attempted": True,
+                "dryRun": False,
+                "from": {"normalized": {"x": start_x, "y": start_y}, "hidU16": {"x": start_hx, "y": start_hy}},
+                "to": {"normalized": {"x": end_x, "y": end_y}, "hidU16": {"x": end_hx, "y": end_hy}},
+                "steps": steps,
+                "requestedDurationMs": duration_ms,
+                "coredeviceTunnelMode": self.coredevice_tunnel_mode,
+                "dispatchStatus": "sent",
+                "confirmationStatus": "not_requested",
+                "sessionStatus": session_status,
+                "durationMs": round((time.monotonic() - started) * 1000),
+            }
+        finally:
+            selector.close()
 
     def _type_text_userspace_helper(
         self,
